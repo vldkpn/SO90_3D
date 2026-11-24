@@ -7,6 +7,8 @@ import {
   PLAYER_Z,
   PLAYER_CENTER_OFFSET_Z,
   BASE_MAX_KMH,
+  MAX_SPEED,
+  OFF_ROAD_THRESHOLD_X,
   SPEED_PENALTY_PER_COLLISION_KMH,
   MIN_ALLOWED_MAX_KMH,
   MAX_HARDCORE_COLLISIONS
@@ -171,9 +173,15 @@ export function initStars() {
   }
 }
 
+export function getBestScoreStorageKey() {
+  return `${GAME_CONFIG.storage.bestScoreKey}_${state.gameMode}_${state.difficulty}`;
+}
+
 export function loadSavedRecords() {
   try {
-    state.bestScore = parseInt(localStorage.getItem(GAME_CONFIG.storage.bestScoreKey) || '0', 10) || 0;
+    const modeKey = getBestScoreStorageKey();
+    const saved = localStorage.getItem(modeKey);
+    state.bestScore = parseInt(saved || '0', 10) || 0;
   } catch (e) {
     state.bestScore = 0;
   }
@@ -186,6 +194,15 @@ export function loadSavedRecords() {
   } catch (e) {
     state.bestLapRecordKmh = null;
   }
+}
+
+export function isOncomingBonusActive() {
+  return (
+    state.gameMode === 'oncoming' &&
+    state.playerX < -0.06 &&
+    Math.abs(state.playerX) <= OFF_ROAD_THRESHOLD_X &&
+    state.speed / MAX_SPEED > 0.45
+  );
 }
 
 export function getSunX() {

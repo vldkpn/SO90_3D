@@ -4,6 +4,7 @@ import {
   LOGICAL_HEIGHT,
   SEGMENT_LENGTH,
   PLAYER_Z,
+  PLAYER_CENTER_OFFSET_Z,
   INITIAL_TRAFFIC_COUNT
 } from './config.js';
 import { initCanvasPolyfills, formatRaceTime } from './utils.js';
@@ -12,13 +13,14 @@ import {
   state,
   initStars,
   loadSavedRecords,
+  getBestScoreStorageKey,
   resetRunState,
   showBanner,
   clearSkidMarks,
   queryTouchDevice,
   getActiveAspectRatio
 } from './state.js';
-import { buildTrack, buildCircuitTrack } from './track.js';
+import { buildTrack, buildCircuitTrack, applySharpTurnGuardrails } from './track.js';
 import { resetTraffic, resetCircuitRivals } from './traffic.js';
 import { updateSimulation } from './physics.js';
 import { renderFrame } from './renderer.js';
@@ -181,13 +183,14 @@ function startGame() {
   blurActiveElement();
   audio.init();
   clearInputs();
+  loadSavedRecords();
   resetRunState();
 
   if (state.gameMode === 'circuit') {
     buildCircuitTrack();
     const startBackOffset = 9.8 * SEGMENT_LENGTH;
     state.position = (((state.trackLength - PLAYER_Z - startBackOffset) % state.trackLength) + state.trackLength) % state.trackLength;
-    state.playerProgressZ = -startBackOffset;
+    state.playerProgressZ = -startBackOffset + PLAYER_CENTER_OFFSET_Z;
     resetCircuitRivals();
     state.playerRank = state.rivals.length + 1;
     state.playerX = state.rivals.length % 2 === 0 ? -0.38 : 0.38;
@@ -279,13 +282,14 @@ function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
       newRecordTag.classList.add('hidden');
     }
   } else {
+    loadSavedRecords();
     const finalScoreInt = Math.floor(state.score);
     let isNewRecord = false;
     if (finalScoreInt > state.bestScore) {
       state.bestScore = finalScoreInt;
       isNewRecord = true;
       try {
-        localStorage.setItem(GAME_CONFIG.storage.bestScoreKey, String(state.bestScore));
+        localStorage.setItem(getBestScoreStorageKey(), String(state.bestScore));
       } catch (e) {}
     }
 
@@ -353,6 +357,7 @@ document.querySelectorAll('#track-mode-group .mode-pill').forEach((btn) => {
     document.querySelectorAll('#track-mode-group .mode-pill').forEach((b) => b.classList.remove('active'));
     btn.classList.add('active');
     state.gameMode = btn.dataset.mode;
+    loadSavedRecords();
     state.position = 0;
     clearSkidMarks();
     if (state.gameMode === 'circuit') {
@@ -372,9 +377,9 @@ document.querySelectorAll('#difficulty-group .mode-pill').forEach((btn) => {
     document.querySelectorAll('#difficulty-group .mode-pill').forEach((b) => b.classList.remove('active'));
     btn.classList.add('active');
     state.difficulty = btn.dataset.diff;
+    loadSavedRecords();
     if (state.gameMode === 'circuit') {
-      buildCircuitTrack();
-      resetCircuitRivals();
+      applySharpTurnGuardrails(GAME_CONFIG.circuit.guardrailCurveThreshold);
     }
   });
 });

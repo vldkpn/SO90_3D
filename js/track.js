@@ -205,12 +205,16 @@ export function buildTrack() {
 
   state.trackLength = segments.length * SEGMENT_LENGTH;
 
-  for (let n = 0; n < segments.length; n++) {
-    if (n > 0 && n % CHECKPOINT_INTERVAL === 0) {
-      segments[n].isCheckpoint = true;
-      addSprite(n, 'checkpoint_arch', 0);
-    }
+  // Равномерная расстановка чекпоинтов кратно полной длине трассы
+  const cpCount = Math.max(1, Math.round(segments.length / CHECKPOINT_INTERVAL));
+  const exactStep = Math.floor(segments.length / cpCount);
+  for (let c = 1; c <= cpCount; c++) {
+    const cpIdx = (c * exactStep) % segments.length;
+    segments[cpIdx].isCheckpoint = true;
+    addSprite(cpIdx, 'checkpoint_arch', 0);
+  }
 
+  for (let n = 0; n < segments.length; n++) {
     if (n % 7 === 0) {
       addSprite(n, 'palm', -1.42 - Math.random() * 0.45);
       addSprite(n, 'palm', 1.42 + Math.random() * 0.45);
@@ -383,10 +387,10 @@ export function buildCircuitTrack() {
   const numSegments = minSegs + Math.floor(Math.random() * (maxSegs - minSegs + 1));
   let loopPts = resampleClosedLoop(rawPoints, numSegments);
 
-  const maxAllowedTurnRad = 12.2 / SEGMENT_LENGTH;
+  const maxAllowedTurnRad = 12.0 / SEGMENT_LENGTH;
   let turnData = computeClosedLoopTurnAngles(loopPts);
   let smoothPasses = 0;
-  while (turnData.maxAbsTurn > maxAllowedTurnRad && smoothPasses < 18) {
+  while (turnData.maxAbsTurn > maxAllowedTurnRad && smoothPasses < 45) {
     smoothPasses++;
     const smoothed = new Array(numSegments);
     for (let i = 0; i < numSegments; i++) {
@@ -404,7 +408,7 @@ export function buildCircuitTrack() {
 
   const finalCurves = new Array(numSegments);
   for (let i = 0; i < numSegments; i++) {
-    finalCurves[i] = turnData.dThetas[i] * SEGMENT_LENGTH;
+    finalCurves[i] = MathUtil.clamp(turnData.dThetas[i] * SEGMENT_LENGTH, -12.0, 12.0);
   }
 
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;

@@ -115,9 +115,10 @@ export function spawnSingleCar(targetZ, avoidPlayerZone = false, preferredLaneId
   }
 
   const progressionBoost = Math.min(0.14, (state.distanceMeters / 5000) * 0.14);
+  const oncomingTypeMult = 0.85 + 0.15 * archetype.speedMult;
   const baseSpeed = lane.dir === 1
     ? MAX_SPEED * (0.28 + Math.random() * (0.30 + progressionBoost)) * archetype.speedMult
-    : MAX_SPEED * (0.32 + Math.random() * (0.24 + progressionBoost));
+    : MAX_SPEED * (0.32 + Math.random() * (0.24 + progressionBoost)) * oncomingTypeMult;
 
   const car = {
     isRival: false,
@@ -480,7 +481,7 @@ export function updateCircuitRivals(dt, isDemo = false) {
         }
       }
 
-      if (!isDemo) {
+      if (!isDemo || state.gameState === STATE.TITLE) {
         const pDz = getShortestTrackDz(r.z, playerWorldZ, trackLength);
         if (pDz > 45 && pDz < closestBlockDist) {
           const latDiff = Math.abs((r.x / ROAD_WIDTH) - state.playerX);
@@ -650,7 +651,7 @@ export function updateCircuitRivals(dt, isDemo = false) {
 
 export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
   if (state.gameMode === 'circuit') {
-    updateCircuitRivals(dt, !checkPlayerObstacle);
+    updateCircuitRivals(dt, !checkPlayerObstacle || state.gameState === STATE.TITLE);
     return;
   }
 

@@ -63,6 +63,9 @@ export const MathUtil = {
     const g = Math.min(255, Math.max(0, Math.round(((num >> 8) & 255) * factor)));
     const b = Math.min(255, Math.max(0, Math.round((num & 255) * factor)));
     const res = `rgb(${r},${g},${b})`;
+    if (shadeCache.size > 512) {
+      shadeCache.clear();
+    }
     shadeCache.set(key, res);
     return res;
   }

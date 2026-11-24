@@ -106,7 +106,7 @@ export const GAME_CONFIG = {
   playerVisuals: {
     hitboxWidthNorm: 0.185,
     rearTireBottomOffsetPx: 25,
-    carCenterBottomOffsetPx: 38,
+    carCenterBottomOffsetPx: 54,
     maxSkidMarks: 640,
     tireSmokeMinKmh: 50
   },

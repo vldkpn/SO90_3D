@@ -8,7 +8,6 @@ import {
   PLAYER_CENTER_OFFSET_Z,
   PLAYER_LEN_Z,
   PLAYER_WIDTH_NORM,
-  REAR_TIRE_CAM_Z,
   BASE_MAX_KMH,
   MAX_SPEED,
   MAX_REVERSE_SPEED,
@@ -34,6 +33,7 @@ import {
   findSegment,
   getPlayerWorldZ,
   getCurrentMaxAllowedKmh,
+  isOncomingBonusActive,
   showBanner,
   spawnParticles
 } from './state.js';
@@ -174,7 +174,7 @@ function updateCameraDynamics(dt, currentSeg) {
   const roadSlope = currentSeg
     ? (currentSeg.p2.world.y - currentSeg.p1.world.y) / SEGMENT_LENGTH
     : 0;
-  const targetPitch = MathUtil.clamp(roadSlope * 185, -46, 46);
+  const targetPitch = MathUtil.clamp(roadSlope * 185, -42, 24);
   state.cameraPitch = MathUtil.lerp(state.cameraPitch, targetPitch, Math.min(1, dt * 6.5));
 
   const targetLagX = state.gameState === STATE.PLAYING ? state.steerVisual * 0.085 : 0;
@@ -252,7 +252,7 @@ export function updateSimulation(dt) {
       state.cityOffset = (state.cityOffset + demoSeg.curve * 0.0085) % 1;
     }
     maintainTrafficDensity();
-    updateTrafficOnly(dt, false);
+    updateTrafficOnly(dt, true);
     updateCameraDynamics(dt, demoSeg);
     audio.update(0, false, false, false);
     return;
@@ -410,10 +410,10 @@ export function updateSimulation(dt) {
   } else if (input.up) {
     if (state.speed < 0) {
       state.speed = Math.min(0, state.speed + MAX_SPEED * 0.45 * dt);
-    } else {
+    } else if (state.speed <= effectiveMaxSpeed) {
       const misfireMult = isEngineMisfiring ? 0.22 : 1.0;
       const accelMult = (state.isOverheated ? 0.55 : (state.isSlipstreaming ? 1.06 : 1.0)) * misfireMult;
-      state.speed += ACCEL * accelMult * dt;
+      state.speed = Math.min(effectiveMaxSpeed, state.speed + ACCEL * accelMult * dt);
       if (isEngineMisfiring && state.speed > MAX_SPEED * 0.35) {
         state.speed -= ACCEL * 0.34 * dt;
       }
@@ -431,6 +431,12 @@ export function updateSimulation(dt) {
     } else if (state.speed < 0) {
       state.speed = Math.min(0, state.speed - DECEL * 1.15 * dt);
     }
+  }
+
+  // Плавный инерционный сброс скорости при превышении лимита (перегрев или выход из слипстрима)
+  if (state.speed > effectiveMaxSpeed) {
+    const excessDecel = state.isOverheated ? MAX_SPEED * 0.42 : MAX_SPEED * 0.18;
+    state.speed = Math.max(effectiveMaxSpeed, state.speed - excessDecel * dt);
   }
 
   if (isOffRoad) {
@@ -466,9 +472,11 @@ export function updateSimulation(dt) {
     }
   }
 
-  state.speed = MathUtil.clamp(state.speed, -MAX_REVERSE_SPEED, effectiveMaxSpeed);
+  const absoluteMaxForwardSpeed = MAX_SPEED * GAME_CONFIG.circuit.slipstreamBoostRatio;
+  state.speed = MathUtil.clamp(state.speed, -MAX_REVERSE_SPEED, absoluteMaxForwardSpeed);
 
   // Руление
+  const prevPlayerX = state.playerX;
   let steerDir = 0;
   if (input.left) steerDir -= 1;
   if (input.right) steerDir += 1;
@@ -508,31 +516,49 @@ export function updateSimulation(dt) {
   // Физика защитных отбойников на крутых поворотах
   if (state.gameMode === 'circuit' && state.difficulty === 'arcade' && currentSeg) {
     const railInnerEdge = 1.15;
+    const railOuterEdge = 1.21;
     const visualHalfCarW = 0.12;
     const carHalfScreenW = anchors.carW * 0.50;
-    if (currentSeg.guardrailLeft && state.playerX - visualHalfCarW < -railInnerEdge) {
-      state.playerX = -railInnerEdge + visualHalfCarW;
-      if (state.playerVX < 0) state.playerVX = Math.abs(state.playerVX) * 0.35;
-      state.speed *= Math.pow(0.84, dt * 6);
-      state.impactShake = Math.max(state.impactShake, 0.22);
-      if (Math.abs(state.speed) > 35) {
-        spawnParticles(anchors.rearCenterX - carHalfScreenW, anchors.rearCenterY, 2, '#ffbe0b', 110, 70, [2, 4], [0.15, 0.32]);
-        if (state.guardrailSoundCooldown <= 0) {
-          state.guardrailSoundCooldown = 0.14;
-          audio.playGuardrailScrape();
+
+    if (currentSeg.guardrailLeft) {
+      const wasInside = prevPlayerX - visualHalfCarW >= -railInnerEdge;
+      if (wasInside && state.playerX - visualHalfCarW < -railInnerEdge) {
+        state.playerX = -railInnerEdge + visualHalfCarW;
+        if (state.playerVX < 0) state.playerVX = Math.abs(state.playerVX) * 0.35;
+        state.speed *= Math.pow(0.84, dt * 6);
+        state.impactShake = Math.max(state.impactShake, 0.22);
+        if (Math.abs(state.speed) > 35) {
+          spawnParticles(anchors.rearCenterX - carHalfScreenW, anchors.rearCenterY, 2, '#ffbe0b', 110, 70, [2, 4], [0.15, 0.32]);
+          if (state.guardrailSoundCooldown <= 0) {
+            state.guardrailSoundCooldown = 0.14;
+            audio.playGuardrailScrape();
+          }
         }
+      } else if (!wasInside && state.playerX + visualHalfCarW > -railOuterEdge) {
+        state.playerX = -railOuterEdge - visualHalfCarW;
+        if (state.playerVX > 0) state.playerVX = -Math.abs(state.playerVX) * 0.35;
+        state.speed *= Math.pow(0.84, dt * 6);
       }
-    } else if (currentSeg.guardrailRight && state.playerX + visualHalfCarW > railInnerEdge) {
-      state.playerX = railInnerEdge - visualHalfCarW;
-      if (state.playerVX > 0) state.playerVX = -Math.abs(state.playerVX) * 0.35;
-      state.speed *= Math.pow(0.84, dt * 6);
-      state.impactShake = Math.max(state.impactShake, 0.22);
-      if (Math.abs(state.speed) > 35) {
-        spawnParticles(anchors.rearCenterX + carHalfScreenW, anchors.rearCenterY, 2, '#ffbe0b', 110, 70, [2, 4], [0.15, 0.32]);
-        if (state.guardrailSoundCooldown <= 0) {
-          state.guardrailSoundCooldown = 0.14;
-          audio.playGuardrailScrape();
+    }
+
+    if (currentSeg.guardrailRight) {
+      const wasInside = prevPlayerX + visualHalfCarW <= railInnerEdge;
+      if (wasInside && state.playerX + visualHalfCarW > railInnerEdge) {
+        state.playerX = railInnerEdge - visualHalfCarW;
+        if (state.playerVX > 0) state.playerVX = -Math.abs(state.playerVX) * 0.35;
+        state.speed *= Math.pow(0.84, dt * 6);
+        state.impactShake = Math.max(state.impactShake, 0.22);
+        if (Math.abs(state.speed) > 35) {
+          spawnParticles(anchors.rearCenterX + carHalfScreenW, anchors.rearCenterY, 2, '#ffbe0b', 110, 70, [2, 4], [0.15, 0.32]);
+          if (state.guardrailSoundCooldown <= 0) {
+            state.guardrailSoundCooldown = 0.14;
+            audio.playGuardrailScrape();
+          }
         }
+      } else if (!wasInside && state.playerX - visualHalfCarW < railOuterEdge) {
+        state.playerX = railOuterEdge + visualHalfCarW;
+        if (state.playerVX < 0) state.playerVX = Math.abs(state.playerVX) * 0.35;
+        state.speed *= Math.pow(0.84, dt * 6);
       }
     }
   }
@@ -550,7 +576,8 @@ export function updateSimulation(dt) {
   const prevNetForwardZ = state.netForwardZ;
   state.netForwardZ += deltaZ;
 
-  const rearTireWorldZ = (((state.position + REAR_TIRE_CAM_Z) % trackLength) + trackLength) % trackLength;
+  const rearAxleCamZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z - PLAYER_LEN_Z * 0.30;
+  const rearTireWorldZ = (((state.position + rearAxleCamZ) % trackLength) + trackLength) % trackLength;
   const isHardBrakingOnRoad = !isOffRoad && input.down && state.speed > MAX_SPEED * 0.035;
   const isLateralSkiddingOnRoad = !isOffRoad && Math.abs(state.playerVX) > 0.35 && state.speed > MAX_SPEED * 0.12;
 
@@ -668,8 +695,7 @@ export function updateSimulation(dt) {
       const metersDelta = newForwardDelta / 25;
       state.distanceMeters += metersDelta;
 
-      const isOncomingLane = state.gameMode === 'oncoming' && state.playerX < -0.14 && forwardSpeedRatio > 0.45;
-      const scoreMultiplier = isOncomingLane ? GAME_CONFIG.gameplay.oncomingScoreMultiplier : 1.0;
+      const scoreMultiplier = isOncomingBonusActive() ? GAME_CONFIG.gameplay.oncomingScoreMultiplier : 1.0;
       state.score += metersDelta * (1 + forwardSpeedRatio * 2.5) * scoreMultiplier;
     }
 

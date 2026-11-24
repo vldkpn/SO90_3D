@@ -14,7 +14,8 @@ import {
   state,
   findSegment,
   getPlayerWorldZ,
-  getCurrentMaxAllowedKmh
+  getCurrentMaxAllowedKmh,
+  isOncomingBonusActive
 } from './state.js';
 
 let minimapCacheCanvas = null;
@@ -316,7 +317,7 @@ export function renderHUD(ctx) {
     ctx.font = '700 12px sans-serif';
     ctx.fillText(`ДИСТАНЦИЯ: ${(state.distanceMeters / 1000).toFixed(2)} км`, 26, 78);
 
-    const showOncomingBadge = state.gameMode === 'oncoming' && state.playerX < -0.14 && state.speed / MAX_SPEED > 0.45;
+    const showOncomingBadge = isOncomingBonusActive();
     if (showOncomingBadge) {
       ctx.fillStyle = 'rgba(255, 190, 11, 0.92)';
       ctx.beginPath();
@@ -518,14 +519,24 @@ export function renderHUD(ctx) {
 
   if (state.bannerTimer > 0 && state.bannerText) {
     const alpha = Math.min(1, state.bannerTimer * 2);
-    const maxBannerW = LOGICAL_WIDTH - 36;
+    const maxBannerW = LOGICAL_WIDTH - 48;
+    const bannerY = 224;
     ctx.globalAlpha = alpha;
-    ctx.font = isCompact ? '900 20px sans-serif' : '900 24px sans-serif';
+    ctx.font = isCompact ? '900 18px sans-serif' : '900 22px sans-serif';
     ctx.textAlign = 'center';
+
+    const measuredW = Math.min(maxBannerW, ctx.measureText(state.bannerText).width);
+    const pillW = measuredW + 28;
+    const pillH = isCompact ? 30 : 34;
+    ctx.fillStyle = 'rgba(13, 2, 33, 0.78)';
+    ctx.beginPath();
+    ctx.roundRect(LOGICAL_WIDTH * 0.5 - pillW * 0.5, bannerY - pillH * 0.68, pillW, pillH, 9);
+    ctx.fill();
+
     ctx.fillStyle = '#140326';
-    ctx.fillText(state.bannerText, LOGICAL_WIDTH * 0.5 + 2, 146, maxBannerW);
+    ctx.fillText(state.bannerText, LOGICAL_WIDTH * 0.5 + 2, bannerY + 2, maxBannerW);
     ctx.fillStyle = state.bannerColor;
-    ctx.fillText(state.bannerText, LOGICAL_WIDTH * 0.5, 144, maxBannerW);
+    ctx.fillText(state.bannerText, LOGICAL_WIDTH * 0.5, bannerY, maxBannerW);
   }
 
   ctx.restore();

@@ -1803,13 +1803,17 @@ export function renderFrame(ctx) {
   const renderedCars = new Set();
   const foregroundThresholdZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
 
-  // 2. Обратный проход: спрайты, отбойники, машины и арки
+  // 2. Обратный проход: отбойники, спрайты, машины и арки
   for (let n = DRAW_DISTANCE - 1; n >= -1; n--) {
     const segIndex = (baseSegment.index + n + segments.length) % segments.length;
     const seg = segments[segIndex];
     const segArchBeams = [];
 
     if (n >= 0 && seg.p1.camera.z > state.activeCameraDepth) {
+      if (state.gameMode === 'circuit') {
+        renderGuardrail(ctx, seg);
+      }
+
       for (let i = 0; i < seg.sprites.length; i++) {
         const sp = seg.sprites[i];
         const spriteScale = seg.p1.screen.scale;
@@ -1827,10 +1831,6 @@ export function renderFrame(ctx) {
             camZ: seg.p1.camera.z
           });
         }
-      }
-
-      if (state.gameMode === 'circuit') {
-        renderGuardrail(ctx, seg);
       }
     }
 
