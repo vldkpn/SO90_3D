@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>SUNSET OVERDRIVE '90 — 3D Аркадная Гонка</title>
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <div id="app-container">
+    <!-- Верхняя панель над игровым экраном (для сенсорных устройств) -->
+    <div id="top-bar">
+      <div class="top-bar-left">
+        <button id="mobile-menu-btn" class="top-bar-btn menu-exit-btn invisible" type="button">⌂ МЕНЮ</button>
+        <button id="mobile-pause-btn" class="top-bar-btn pause-toggle-btn invisible" type="button">⏸ ПАУЗА</button>
+      </div>
+      <button id="mobile-mute-btn" class="top-bar-btn" type="button" title="Включить/выключить звук">🔊 ЗВУК: ВКЛ</button>
+    </div>
+
+    <div id="game-wrapper">
+      <canvas id="gameCanvas" width="960" height="540"></canvas>
+      <div class="crt-overlay"></div>
+
+      <!-- Кнопка звука в углу (для ПК) -->
+      <button id="desktop-mute-btn" type="button" title="Включить/выключить звук (M)">🔊 ЗВУК: ВКЛ</button>
+
+      <!-- Стартовый экран -->
+      <div id="start-screen" class="overlay">
+        <div class="game-badge">★ ARCADE RETRO 3D SERIES 1990 ★</div>
+        <h1 class="game-title">SUNSET OVERDRIVE '90</h1>
+        <p id="start-subtitle" class="game-subtitle">
+          Мчитесь навстречу неоновому закату, обгоняйте трафик и пересекайте чекпоинты до истечения таймера!
+        </p>
+
+        <div class="setup-panel">
+          <div class="setup-row">
+            <span class="setup-label">Режим</span>
+            <div class="setup-options" id="track-mode-group">
+              <button type="button" class="mode-pill active" data-mode="oneway">➡ ПОПУТНЫЙ</button>
+              <button type="button" class="mode-pill" data-mode="oncoming">⇄ ВСТРЕЧКА</button>
+              <button type="button" class="mode-pill circuit-pill" data-mode="circuit">🏁 КОЛЬЦЕВОЙ</button>
+            </div>
+          </div>
+          <div class="setup-row">
+            <span class="setup-label">Сложность</span>
+            <div class="setup-options" id="difficulty-group">
+              <button type="button" class="mode-pill active" data-diff="arcade">★ ЛЕГКО</button>
+              <button type="button" class="mode-pill hardcore-pill" data-diff="hardcore">★ НОРМАЛЬНО</button>
+            </div>
+          </div>
+        </div>
+
+        <button id="start-btn" class="arcade-btn" type="button">▶ СТАРТ</button>
+        <div class="blink-hint">НАЖМИТЕ ENTER ИЛИ ПРОБЕЛ</div>
+        <div class="controls-panel">
+          <div><span class="key-cap">W</span><span class="key-cap">↑</span> Газ</div>
+          <div><span class="key-cap">S</span><span class="key-cap">↓</span> Тормоз / Задний ход</div>
+          <div><span class="key-cap">A</span><span class="key-cap">D</span> / <span class="key-cap">←</span><span class="key-cap">→</span> Руль</div>
+          <div><span class="key-cap">ESC</span><span class="key-cap">P</span> Пауза</div>
+          <div><span class="key-cap">M</span> Звук</div>
+        </div>
+      </div>
+
+      <!-- Экран паузы -->
+      <div id="pause-screen" class="overlay hidden">
+        <div class="game-badge">ЗАЕЗД ПРИОСТАНОВЛЕН</div>
+        <h2 class="game-title">ПАУЗА</h2>
+        <div class="gameover-actions">
+          <button id="resume-btn" class="arcade-btn" type="button">▶ ПРОДОЛЖИТЬ</button>
+          <button id="pause-menu-btn" class="secondary-btn" type="button">⌂ В ГЛАВНОЕ МЕНЮ</button>
+        </div>
+        <div class="blink-hint">ENTER / ПРОБЕЛ / P / ESC — ПРОДОЛЖИТЬ</div>
+      </div>
+
+      <!-- Экран окончания игры -->
+      <div id="gameover-screen" class="overlay hidden">
+        <div id="gameover-mode-tag" class="game-badge">ЗАЕЗД ЗАВЕРШЕН</div>
+        <h2 id="gameover-title" class="game-title">ВРЕМЯ ВЫШЛО!</h2>
+        <div id="new-record-tag" class="new-record-badge hidden">★ НОВЫЙ РЕКОРД! ★</div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div id="stat-label-1" class="stat-label">Итоговый счёт</div>
+            <div id="final-score" class="stat-value highlight">0</div>
+          </div>
+          <div class="stat-card">
+            <div id="stat-label-2" class="stat-label">Лучший рекорд</div>
+            <div id="best-score" class="stat-value">0</div>
+          </div>
+          <div class="stat-card">
+            <div id="stat-label-3" class="stat-label">Дистанция</div>
+            <div id="final-distance" class="stat-value">0.00 км</div>
+          </div>
+          <div class="stat-card">
+            <div id="stat-label-4" class="stat-label">Чекпоинты / Макс. км/ч</div>
+            <div id="final-extra" class="stat-value">0 / 0</div>
+          </div>
+        </div>
+        <div class="gameover-actions">
+          <button id="restart-btn" class="arcade-btn" type="button">↻ ИГРАТЬ СНОВА</button>
+          <button id="menu-btn" class="secondary-btn" type="button">⌂ В ГЛАВНОЕ МЕНЮ</button>
+        </div>
+        <div class="blink-hint">ENTER / ПРОБЕЛ — РЕСТАРТ • ESC — МЕНЮ</div>
+      </div>
+    </div>
+
+    <!-- Внешняя сенсорная панель управления под игровым экраном -->
+    <div id="touch-controls">
+      <div class="touch-group">
+        <button id="btn-left" class="touch-btn" type="button" aria-label="Влево">◀</button>
+        <button id="btn-right" class="touch-btn" type="button" aria-label="Вправо">▶</button>
+      </div>
+      <div class="touch-group">
+        <button id="btn-brake" class="touch-btn pedal-brake" type="button">СТОП / R</button>
+        <button id="btn-gas" class="touch-btn pedal-gas" type="button">ГАЗ</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
