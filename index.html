@@ -57,7 +57,7 @@
         <div class="blink-hint">НАЖМИТЕ ENTER ИЛИ ПРОБЕЛ</div>
 
         <!-- Метка версии размещена до .controls-panel, чтобы сохранить центрирование :last-child -->
-        <div id="game-version" class="game-version" aria-label="Версия игры">v1.1</div>
+        <div id="game-version" class="game-version" aria-label="Версия игры">v1.2</div>
 
         <div class="controls-panel">
           <div><span class="key-cap">W</span><span class="key-cap">↑</span> Газ</div>
@@ -72,31 +72,54 @@
       <div id="settings-screen" class="overlay hidden">
         <div class="game-badge">ПАРАМЕТРЫ ГРАФИКИ И ЗВУКА</div>
         <h2 class="game-title">НАСТРОЙКИ</h2>
+
         <div class="setup-panel settings-panel">
           <div class="setup-row">
             <span class="setup-label">Дым и частицы</span>
             <div class="setup-options" id="settings-particles-group">
-              <button type="button" class="mode-pill active" data-particles="on">ВКЛ</button>
               <button type="button" class="mode-pill" data-particles="off">ВЫКЛ</button>
+              <button type="button" class="mode-pill active" data-particles="on">ВКЛ</button>
             </div>
           </div>
           <div class="setup-row">
-            <span class="setup-label">Свет и ореолы</span>
+            <span class="setup-label">Освещение и частицы</span>
             <div class="setup-options" id="settings-light-group">
-              <button type="button" class="mode-pill active" data-light="hard">ЖЁСТКИЙ</button>
-              <button type="button" class="mode-pill" data-light="soft">МЯГКИЙ</button>
+              <button type="button" class="mode-pill active" data-light="hard">ЖЁСТКИЕ</button>
+              <button type="button" class="mode-pill" data-light="soft">МЯГКИЕ</button>
             </div>
           </div>
           <div class="setup-row">
             <span class="setup-label">Звук</span>
             <div class="setup-options" id="settings-sound-group">
-              <button type="button" class="mode-pill active" data-sound="on">ВКЛ</button>
               <button type="button" class="mode-pill" data-sound="off">ВЫКЛ</button>
+              <button type="button" class="mode-pill active" data-sound="on">ВКЛ</button>
+            </div>
+          </div>
+
+          <div class="dev-settings-section">
+            <button
+              id="dev-settings-toggle"
+              class="dev-settings-toggle"
+              type="button"
+              aria-expanded="false"
+              aria-controls="dev-settings-content"
+            >
+              <span class="dev-settings-arrow">▸</span> Тестовые настройки
+            </button>
+            <div id="dev-settings-content" class="dev-settings-content hidden">
+              <div class="setup-row dev-setup-row">
+                <span class="setup-label">Счётчик кадров</span>
+                <div class="setup-options" id="settings-fps-group">
+                  <button type="button" class="mode-pill active" data-fps="off">ВЫКЛ</button>
+                  <button type="button" class="mode-pill" data-fps="on">ВКЛ</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
-        <div class="gameover-actions">
-          <button id="settings-back-btn" class="arcade-btn" type="button">◀ НАЗАД</button>
+
+        <div class="settings-actions">
+          <button id="settings-back-btn" class="arcade-btn" type="button">← НАЗАД</button>
         </div>
         <div class="blink-hint">ESC / ENTER — НАЗАД В МЕНЮ</div>
       </div>
@@ -105,18 +128,20 @@
       <div id="pause-screen" class="overlay hidden">
         <div class="game-badge">ЗАЕЗД ПРИОСТАНОВЛЕН</div>
         <h2 class="game-title">ПАУЗА</h2>
+
         <div class="gameover-actions">
           <button id="resume-btn" class="arcade-btn" type="button">▶ ПРОДОЛЖИТЬ</button>
           <button id="pause-menu-btn" class="secondary-btn" type="button">⌂ В ГЛАВНОЕ МЕНЮ</button>
         </div>
-        <div class="blink-hint">ENTER / ПРОБЕЛ / P / ESC — ПРОДОЛЖИТЬ</div>
+        <div class="blink-hint">ESC / P / ENTER — ПРОДОЛЖИТЬ</div>
       </div>
 
-      <!-- Экран окончания игры -->
+      <!-- Экран окончания заезда -->
       <div id="gameover-screen" class="overlay hidden">
-        <div id="gameover-mode-tag" class="game-badge">ЗАЕЗД ЗАВЕРШЕН</div>
+        <div id="gameover-mode-tag" class="game-badge">ПОПУТНЫЙ ПОТОК • ЛЕГКО</div>
         <h2 id="gameover-title" class="game-title">ВРЕМЯ ВЫШЛО!</h2>
         <div id="new-record-tag" class="new-record-badge hidden">★ НОВЫЙ РЕКОРД! ★</div>
+
         <div class="stats-grid">
           <div class="stat-card">
             <div id="stat-label-1" class="stat-label">Итоговый счёт</div>
@@ -132,9 +157,10 @@
           </div>
           <div class="stat-card">
             <div id="stat-label-4" class="stat-label">Чекпоинты / Макс. км/ч</div>
-            <div id="final-extra" class="stat-value">0 / 0</div>
+            <div id="final-extra" class="stat-value">0 / 0 км/ч</div>
           </div>
         </div>
+
         <div class="gameover-actions">
           <button id="restart-btn" class="arcade-btn" type="button">↻ ИГРАТЬ СНОВА</button>
           <button id="menu-btn" class="secondary-btn" type="button">⌂ В ГЛАВНОЕ МЕНЮ</button>

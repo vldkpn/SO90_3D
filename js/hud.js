@@ -184,9 +184,44 @@ function renderCircuitMinimap(ctx) {
 }
 
 /**
+ * Компактный счётчик кадров (FPS) в левом нижнем углу экрана
+ */
+function renderFpsCounter(ctx) {
+  if (!state.settings.showFps) return;
+
+  const fps = Math.max(0, state.fpsValue || 0);
+  const fpsColor = fps >= 50 ? '#39ff14' : (fps >= 30 ? '#ffbe0b' : '#ff2a85');
+  const boxX = 14;
+  const boxY = LOGICAL_HEIGHT - 36;
+  const boxW = 78;
+  const boxH = 22;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(13, 2, 33, 0.72)';
+  ctx.strokeStyle = 'rgba(184, 163, 224, 0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(boxX, boxY, boxW, boxH, 6);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.font = '800 11px monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#b8a3e0';
+  ctx.fillText('FPS', boxX + 8, boxY + boxH * 0.5 + 0.5);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = fpsColor;
+  ctx.fillText(`${fps}`, boxX + boxW - 8, boxY + boxH * 0.5 + 0.5);
+  ctx.restore();
+}
+
+/**
  * Основная отрисовка HUD поверх игровой сцены
  */
 export function renderHUD(ctx) {
+  renderFpsCounter(ctx);
   if (state.gameState !== STATE.PLAYING) return;
 
   const LOGICAL_WIDTH = state.logicalWidth;

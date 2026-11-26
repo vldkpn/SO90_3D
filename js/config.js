@@ -119,7 +119,8 @@ export const GAME_CONFIG = {
   settings: {
     particlesEnabled: true,
     lightStyle: 'hard',
-    soundEnabled: true
+    soundEnabled: true,
+    showFps: false
   },
 
   storage: {

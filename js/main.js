@@ -51,6 +51,8 @@ const mobilePauseBtn = document.getElementById('mobile-pause-btn');
 const mobileMuteBtn = document.getElementById('mobile-mute-btn');
 const desktopMuteBtn = document.getElementById('desktop-mute-btn');
 const startSubtitle = document.getElementById('start-subtitle');
+const devSettingsToggle = document.getElementById('dev-settings-toggle');
+const devSettingsContent = document.getElementById('dev-settings-content');
 
 const touchButtonMap = [
   { id: 'btn-left', key: 'left', el: document.getElementById('btn-left') },
@@ -60,6 +62,8 @@ const touchButtonMap = [
 ];
 
 let lastTimestamp = performance.now();
+let fpsFrameCount = 0;
+let fpsSampleStart = lastTimestamp;
 
 function clearInputs() {
   state.input.up = false;
@@ -94,6 +98,7 @@ function isSettingsOpen() {
 function syncSettingsUI() {
   const particlesVal = state.settings.particlesEnabled ? 'on' : 'off';
   const soundVal = audio.muted ? 'off' : 'on';
+  const fpsVal = state.settings.showFps ? 'on' : 'off';
 
   document.querySelectorAll('#settings-particles-group .mode-pill').forEach((b) => {
     b.classList.toggle('active', b.dataset.particles === particlesVal);
@@ -104,10 +109,20 @@ function syncSettingsUI() {
   document.querySelectorAll('#settings-sound-group .mode-pill').forEach((b) => {
     b.classList.toggle('active', b.dataset.sound === soundVal);
   });
+  document.querySelectorAll('#settings-fps-group .mode-pill').forEach((b) => {
+    b.classList.toggle('active', b.dataset.fps === fpsVal);
+  });
 
   const label = audio.muted ? '🔇 ЗВУК: ВЫКЛ' : '🔊 ЗВУК: ВКЛ';
   if (desktopMuteBtn) desktopMuteBtn.textContent = label;
   if (mobileMuteBtn) mobileMuteBtn.textContent = label;
+}
+
+function setDevSettingsOpen(isOpen) {
+  if (!devSettingsToggle || !devSettingsContent) return;
+  devSettingsToggle.classList.toggle('open', isOpen);
+  devSettingsToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  devSettingsContent.classList.toggle('hidden', !isOpen);
 }
 
 function setSoundEnabled(enabled, allowAudioInit = true) {
@@ -130,6 +145,7 @@ function openSettings() {
   if (state.gameState !== STATE.TITLE || !settingsScreen) return;
   blurActiveElement();
   syncSettingsUI();
+  setDevSettingsOpen(false);
   startScreen.classList.add('hidden');
   settingsScreen.classList.remove('hidden');
 }
@@ -137,6 +153,7 @@ function openSettings() {
 function closeSettings() {
   if (!settingsScreen) return;
   blurActiveElement();
+  setDevSettingsOpen(false);
   settingsScreen.classList.add('hidden');
   if (state.gameState === STATE.TITLE) {
     startScreen.classList.remove('hidden');
@@ -504,6 +521,21 @@ document.querySelectorAll('#settings-sound-group .mode-pill').forEach((btn) => {
     setSoundEnabled(btn.dataset.sound === 'on', true);
   });
 });
+if (devSettingsToggle) {
+  devSettingsToggle.addEventListener('click', (e) => {
+    e.currentTarget.blur();
+    const currentlyOpen = devSettingsToggle.classList.contains('open');
+    setDevSettingsOpen(!currentlyOpen);
+  });
+}
+document.querySelectorAll('#settings-fps-group .mode-pill').forEach((btn) => {
+  btn.addEventListener('click', (e) => {
+    e.currentTarget.blur();
+    state.settings.showFps = btn.dataset.fps === 'on';
+    saveSettings();
+    syncSettingsUI();
+  });
+});
 document.getElementById('restart-btn').addEventListener('click', (e) => {
   e.currentTarget.blur();
   startGame();
@@ -719,6 +751,14 @@ for (let i = 0; i < touchButtonMap.length; i++) {
 function gameLoop(now) {
   const dt = Math.min(GAME_CONFIG.screen.maxFrameDeltaSec, Math.max(0.001, (now - lastTimestamp) / 1000));
   lastTimestamp = now;
+
+  fpsFrameCount++;
+  const fpsElapsed = now - fpsSampleStart;
+  if (fpsElapsed >= 250) {
+    state.fpsValue = Math.round((fpsFrameCount * 1000) / fpsElapsed);
+    fpsFrameCount = 0;
+    fpsSampleStart = now;
+  }
 
   updateSimulation(dt);
   renderFrame(ctx);

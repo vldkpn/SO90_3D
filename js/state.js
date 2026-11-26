@@ -47,12 +47,14 @@ export const state = {
   difficulty: GAME_CONFIG.gameplay.defaultDifficulty,
   animClockMs: 0,
   frameCounter: 0,
+  fpsValue: 0,
 
   // Пользовательские настройки (графика и звук)
   settings: {
     particlesEnabled: GAME_CONFIG.settings.particlesEnabled,
     lightStyle: GAME_CONFIG.settings.lightStyle,
-    soundEnabled: GAME_CONFIG.settings.soundEnabled
+    soundEnabled: GAME_CONFIG.settings.soundEnabled,
+    showFps: GAME_CONFIG.settings.showFps
   },
 
   // Мир и сущности
@@ -235,6 +237,9 @@ export function loadSettings() {
     }
     if (typeof parsed.soundEnabled === 'boolean') {
       state.settings.soundEnabled = parsed.soundEnabled;
+    }
+    if (typeof parsed.showFps === 'boolean') {
+      state.settings.showFps = parsed.showFps;
     }
   } catch (e) {}
 }
