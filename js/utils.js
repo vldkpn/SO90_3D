@@ -20,6 +20,7 @@ export function initCanvasPolyfills() {
   }
 }
 
+const MAX_SHADE_CACHE_SIZE = 512;
 const shadeCache = new Map();
 
 export const MathUtil = {
@@ -30,7 +31,8 @@ export const MathUtil = {
     return a + (b - a) * t;
   },
   percentRemaining(n, total) {
-    return (n % total) / total;
+    if (!total) return 0;
+    return (((n % total) + total) % total) / total;
   },
   randomChoice(arr) {
     return arr[Math.floor(Math.random() * arr.length)];
@@ -53,18 +55,29 @@ export const MathUtil = {
     return 1 - (1 / Math.pow(Math.E, distance * distance * density));
   },
   shadeHex(hex, factor) {
-    const key = `${hex}_${factor}`;
+    if (typeof hex !== 'string') return hex;
+    // Квантуем коэффициент до сотых, чтобы кэш не переполнялся и не сбрасывался от дробных float
+    const qFactor = Math.round(factor * 100) / 100;
+    const key = `${hex}_${qFactor}`;
     const cached = shadeCache.get(key);
     if (cached) return cached;
+
     const clean = hex.replace('#', '');
     if (clean.length !== 6) return hex;
     const num = parseInt(clean, 16);
-    const r = Math.min(255, Math.max(0, Math.round(((num >> 16) & 255) * factor)));
-    const g = Math.min(255, Math.max(0, Math.round(((num >> 8) & 255) * factor)));
-    const b = Math.min(255, Math.max(0, Math.round((num & 255) * factor)));
+    if (Number.isNaN(num)) return hex;
+
+    const r = Math.min(255, Math.max(0, Math.round(((num >> 16) & 255) * qFactor)));
+    const g = Math.min(255, Math.max(0, Math.round(((num >> 8) & 255) * qFactor)));
+    const b = Math.min(255, Math.max(0, Math.round((num & 255) * qFactor)));
     const res = `rgb(${r},${g},${b})`;
-    if (shadeCache.size > 512) {
-      shadeCache.clear();
+
+    // Мягкое вытеснение самой старой записи вместо полной очистки кэша
+    if (shadeCache.size >= MAX_SHADE_CACHE_SIZE) {
+      const oldestKey = shadeCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        shadeCache.delete(oldestKey);
+      }
     }
     shadeCache.set(key, res);
     return res;
@@ -72,6 +85,7 @@ export const MathUtil = {
 };
 
 export function formatRaceTime(sec) {
+  if (!Number.isFinite(sec)) return '00:00.00';
   const clamped = Math.max(0, sec);
   const mins = Math.floor(clamped / 60);
   const secs = Math.floor(clamped % 60);
@@ -83,8 +97,8 @@ export function formatRaceTime(sec) {
 }
 
 export function getShortestTrackDz(fromZ, toZ, totalLen) {
-  let dz = toZ - fromZ;
-  if (dz > totalLen / 2) dz -= totalLen;
-  if (dz < -totalLen / 2) dz += totalLen;
+  if (!totalLen || totalLen <= 0) return 0;
+  let dz = (((toZ - fromZ) % totalLen) + totalLen) % totalLen;
+  if (dz > totalLen * 0.5) dz -= totalLen;
   return dz;
 }

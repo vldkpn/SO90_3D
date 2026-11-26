@@ -22,6 +22,95 @@ import { MathUtil, getShortestTrackDz } from './utils.js';
 import { state, findSegment, getSunX } from './state.js';
 import { renderHUD } from './hud.js';
 
+// Базовое смещение опор арок от центра дороги (синхронизируется с хитбоксами в physics.js)
+const ARCH_TOWER_OFFSET_NORM = 1.28;
+// Коэффициент сохранения визуального размера придорожных спрайтов без искажения от динамического FOV
+const SPRITE_SCALE_RATIO = 0.84;
+
+// Кэш повторяемых слоёв фона (горы и город) для снижения нагрузки на CPU
+const MOUNTAIN_TILE_W = 480;
+const MOUNTAIN_TILE_H = 104;
+const CITY_TILE_W = 640;
+const CITY_TILE_H = 104;
+
+let mountainTileCanvas = null;
+let cityTileCanvas = null;
+
+/**
+ * Однократная генерация тайла гор в offscreen-канвасе
+ */
+function ensureBackgroundCaches() {
+  if (mountainTileCanvas && cityTileCanvas) return;
+
+  try {
+    if (!mountainTileCanvas) {
+      const mc = document.createElement('canvas');
+      mc.width = MOUNTAIN_TILE_W;
+      mc.height = MOUNTAIN_TILE_H;
+      const mctx = mc.getContext('2d');
+      if (mctx) {
+        const baseY = MOUNTAIN_TILE_H - 2;
+        mctx.fillStyle = '#180636';
+        mctx.beginPath();
+        mctx.moveTo(0, baseY);
+        mctx.lineTo(90, baseY - 64);
+        mctx.lineTo(175, baseY - 30);
+        mctx.lineTo(280, baseY - 86);
+        mctx.lineTo(390, baseY - 36);
+        mctx.lineTo(480, baseY);
+        mctx.closePath();
+        mctx.fill();
+
+        mctx.strokeStyle = 'rgba(0, 240, 255, 0.35)';
+        mctx.lineWidth = 1.5;
+        mctx.stroke();
+      }
+      mountainTileCanvas = mc;
+    }
+
+    if (!cityTileCanvas) {
+      const cc = document.createElement('canvas');
+      cc.width = CITY_TILE_W;
+      cc.height = CITY_TILE_H;
+      const cctx = cc.getContext('2d');
+      if (cctx) {
+        const baseY = CITY_TILE_H - 2;
+        const buildings = [
+          { x: 10, w: 38, h: 46 }, { x: 54, w: 28, h: 68 }, { x: 88, w: 46, h: 36 },
+          { x: 142, w: 34, h: 78 }, { x: 184, w: 50, h: 52 }, { x: 242, w: 30, h: 62 },
+          { x: 280, w: 44, h: 40 }, { x: 332, w: 36, h: 84 }, { x: 376, w: 48, h: 48 },
+          { x: 432, w: 32, h: 64 }, { x: 472, w: 46, h: 42 }, { x: 526, w: 38, h: 72 },
+          { x: 572, w: 52, h: 44 }
+        ];
+
+        for (let i = 0; i < buildings.length; i++) {
+          const b = buildings[i];
+          const bx = b.x;
+          const by = baseY - b.h;
+          cctx.fillStyle = '#0d0322';
+          cctx.fillRect(bx, by, b.w, b.h);
+
+          // Детерминированная сетка окон по целым индексам (без мерцания при движении)
+          cctx.fillStyle = (i % 2 === 0) ? 'rgba(0, 240, 255, 0.45)' : 'rgba(255, 190, 11, 0.45)';
+          let row = 0;
+          for (let wy = by + 6; wy < baseY - 8; wy += 9, row++) {
+            let col = 0;
+            for (let wx = bx + 5; wx < bx + b.w - 6; wx += 8, col++) {
+              if ((row + col + i) % 3 !== 0) {
+                cctx.fillRect(wx, wy, 3, 4);
+              }
+            }
+          }
+        }
+      }
+      cityTileCanvas = cc;
+    }
+  } catch (e) {
+    mountainTileCanvas = null;
+    cityTileCanvas = null;
+  }
+}
+
 function project(p, cameraX, cameraY, cameraZ, cameraDepth, width, height, roadWidth, pitchOffset = 0) {
   p.camera.x = (p.world.x || 0) - cameraX;
   p.camera.y = (p.world.y || 0) - cameraY;
@@ -56,6 +145,8 @@ function sampleRoadAtZ(worldZ) {
 }
 
 function renderBackground(ctx) {
+  ensureBackgroundCaches();
+
   const LOGICAL_WIDTH = state.logicalWidth;
   const horizonY = LOGICAL_HEIGHT * 0.50 + state.cameraPitch;
 
@@ -69,14 +160,15 @@ function renderBackground(ctx) {
 
   const now = state.animClockMs * 0.002;
   const starSpanY = Math.max(40, horizonY);
+  ctx.fillStyle = '#ffffff';
   for (let i = 0; i < state.stars.length; i++) {
     const s = state.stars[i];
     const sx = (((s.x - state.skyOffset * 0.5) % 1) + 1) % 1 * LOGICAL_WIDTH;
     const sy = s.y * starSpanY;
-    const alpha = 0.45 + 0.55 * Math.sin(now + s.phase);
-    ctx.fillStyle = `rgba(255, 255, 255, ${alpha.toFixed(2)})`;
+    ctx.globalAlpha = 0.45 + 0.55 * Math.sin(now + s.phase);
     ctx.fillRect(sx, sy, s.r * 1.6, s.r * 1.6);
   }
+  ctx.globalAlpha = 1;
 
   const sunX = getSunX();
   const sunY = horizonY - 26;
@@ -111,51 +203,21 @@ function renderBackground(ctx) {
   }
   ctx.restore();
 
-  const mountainW = 480;
-  const mShift = (((state.hillOffset * mountainW) % mountainW) + mountainW) % mountainW;
-  ctx.fillStyle = '#180636';
-  for (let x = -mShift - mountainW; x < LOGICAL_WIDTH + mountainW; x += mountainW) {
-    ctx.beginPath();
-    ctx.moveTo(x, horizonY + 2);
-    ctx.lineTo(x + 90, horizonY - 62);
-    ctx.lineTo(x + 175, horizonY - 28);
-    ctx.lineTo(x + 280, horizonY - 84);
-    ctx.lineTo(x + 390, horizonY - 34);
-    ctx.lineTo(x + 480, horizonY + 2);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.strokeStyle = 'rgba(0, 240, 255, 0.35)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+  // Параллакс гор из кэшированного тайла
+  const mShift = (((state.hillOffset * MOUNTAIN_TILE_W) % MOUNTAIN_TILE_W) + MOUNTAIN_TILE_W) % MOUNTAIN_TILE_W;
+  const mountainTopY = horizonY - MOUNTAIN_TILE_H + 4;
+  if (mountainTileCanvas) {
+    for (let x = -mShift - MOUNTAIN_TILE_W; x < LOGICAL_WIDTH + MOUNTAIN_TILE_W; x += MOUNTAIN_TILE_W) {
+      ctx.drawImage(mountainTileCanvas, x, mountainTopY);
+    }
   }
 
-  const cityPatternW = 640;
-  const cShift = (((state.cityOffset * cityPatternW) % cityPatternW) + cityPatternW) % cityPatternW;
-  const buildings = [
-    { x: 10, w: 38, h: 46 }, { x: 54, w: 28, h: 68 }, { x: 88, w: 46, h: 36 },
-    { x: 142, w: 34, h: 78 }, { x: 184, w: 50, h: 52 }, { x: 242, w: 30, h: 62 },
-    { x: 280, w: 44, h: 40 }, { x: 332, w: 36, h: 84 }, { x: 376, w: 48, h: 48 },
-    { x: 432, w: 32, h: 64 }, { x: 472, w: 46, h: 42 }, { x: 526, w: 38, h: 72 },
-    { x: 572, w: 52, h: 44 }
-  ];
-
-  for (let baseX = -cShift - cityPatternW; baseX < LOGICAL_WIDTH + cityPatternW; baseX += cityPatternW) {
-    for (let i = 0; i < buildings.length; i++) {
-      const b = buildings[i];
-      const bx = baseX + b.x;
-      const by = horizonY - b.h + 2;
-      ctx.fillStyle = '#0d0322';
-      ctx.fillRect(bx, by, b.w, b.h);
-
-      ctx.fillStyle = (i % 2 === 0) ? 'rgba(0, 240, 255, 0.45)' : 'rgba(255, 190, 11, 0.45)';
-      for (let wy = by + 6; wy < horizonY - 6; wy += 9) {
-        for (let wx = bx + 5; wx < bx + b.w - 6; wx += 8) {
-          if ((wx + wy) % 3 !== 0) {
-            ctx.fillRect(wx, wy, 3, 4);
-          }
-        }
-      }
+  // Параллакс неонового города из кэшированного тайла
+  const cShift = (((state.cityOffset * CITY_TILE_W) % CITY_TILE_W) + CITY_TILE_W) % CITY_TILE_W;
+  const cityTopY = horizonY - CITY_TILE_H + 4;
+  if (cityTileCanvas) {
+    for (let baseX = -cShift - CITY_TILE_W; baseX < LOGICAL_WIDTH + CITY_TILE_W; baseX += CITY_TILE_W) {
+      ctx.drawImage(cityTileCanvas, baseX, cityTopY);
     }
   }
 
@@ -245,11 +307,6 @@ function renderSegment(ctx, seg, fogAlpha = 0) {
     );
   }
 
-  if (fogAlpha > 0.01) {
-    ctx.fillStyle = `rgba(26, 9, 52, ${fogAlpha.toFixed(3)})`;
-    ctx.fillRect(-40, y2, LOGICAL_WIDTH + 80, Math.max(1, y1 - y2 + 1.2));
-  }
-
   const edgeW1 = Math.max(1.5, w1 * 0.026);
   const edgeW2 = Math.max(1.4, w2 * 0.026);
   renderPolygon(ctx, x1 - w1, y1, x1 - w1 + edgeW1, y1, x2 - w2 + edgeW2, y2, x2 - w2, y2, seg.color.edge);
@@ -322,6 +379,12 @@ function renderSegment(ctx, seg, fogAlpha = 0) {
 
   if (seg.isCheckpoint) {
     renderPolygon(ctx, x1 - w1, y1, x1 + w1, y1, x2 + w2, y2, x2 - w2, y2, '#ffbe0b');
+  }
+
+  // Дымка горизонта накладывается поверх всех элементов полотна, включая разметку и чекпоинты
+  if (fogAlpha > 0.01) {
+    ctx.fillStyle = `rgba(26, 9, 52, ${fogAlpha.toFixed(3)})`;
+    ctx.fillRect(-40, y2, LOGICAL_WIDTH + 80, Math.max(1, y1 - y2 + 1.2));
   }
 }
 
@@ -481,10 +544,10 @@ function renderGuardrail(ctx, seg) {
   ctx.restore();
 }
 
-function computeArchLayout(destX, destY, unit, isStartFinish) {
-  const archH = unit * 0.80;
-  const towerCenterOffset = unit * 1.21;
-  const towerW = Math.max(4, unit * 0.11);
+function computeArchLayout(destX, destY, roadHalfPx, isStartFinish) {
+  const archH = roadHalfPx * 0.72;
+  const towerCenterOffset = roadHalfPx * ARCH_TOWER_OFFSET_NORM;
+  const towerW = Math.max(4, roadHalfPx * 0.11);
   const sideDepthW = towerW * 0.36;
   const bannerH = archH * 0.25;
   const topY = destY - archH;
@@ -518,11 +581,11 @@ function computeArchLayout(destX, destY, unit, isStartFinish) {
   };
 }
 
-function renderOverheadArchPillars(ctx, destX, destY, unit, isStartFinish) {
-  const L = computeArchLayout(destX, destY, unit, isStartFinish);
+function renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish) {
+  const L = computeArchLayout(destX, destY, roadHalfPx, isStartFinish);
   if (L.archH < 5) return;
 
-  const shadowLen = unit * 0.22;
+  const shadowLen = roadHalfPx * 0.20;
   fillQuad(ctx, L.leftOuterX, destY, L.leftInnerX + L.sideDepthW, destY, L.leftInnerX + L.sideDepthW + L.towerW * 0.25, destY + shadowLen, L.leftOuterX - L.towerW * 0.15, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
   fillQuad(ctx, L.rightInnerX - L.sideDepthW, destY, L.rightOuterX, destY, L.rightOuterX + L.towerW * 0.15, destY + shadowLen, L.rightInnerX - L.sideDepthW - L.towerW * 0.25, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
 
@@ -568,7 +631,7 @@ function renderOverheadArchPillars(ctx, destX, destY, unit, isStartFinish) {
     }
   }
 
-  const gussetSpan = Math.min(unit * 0.22, L.bannerH * 1.15);
+  const gussetSpan = Math.min(roadHalfPx * 0.20, L.bannerH * 1.15);
   const gussetDrop = L.bannerH * 0.85;
   if (gussetSpan > 4) {
     ctx.fillStyle = L.darkFrameColor;
@@ -593,16 +656,36 @@ function renderOverheadArchPillars(ctx, destX, destY, unit, isStartFinish) {
   }
 }
 
-function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) {
+function renderOverheadArchPillarsClipped(ctx, scale, destX, destY, clipY, isStartFinish) {
   if (scale <= 0) return;
   const LOGICAL_WIDTH = state.logicalWidth;
-  const unit = scale * ROAD_WIDTH * state.activeCameraDepth * PROJ_HALF_WIDTH;
-  const horizontalBound = unit * 1.45;
-  if (unit < 1.2 || destX + horizontalBound < -40 || destX - horizontalBound > LOGICAL_WIDTH + 40) {
+  const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
+  const horizontalBound = roadHalfPx * 1.55;
+  if (roadHalfPx < 1.2 || destX + horizontalBound < -40 || destX - horizontalBound > LOGICAL_WIDTH + 40) {
     return;
   }
 
-  const L = computeArchLayout(destX, destY, unit, isStartFinish);
+  ctx.save();
+  if (clipY !== null && clipY !== undefined) {
+    ctx.beginPath();
+    ctx.rect(-40, 0, LOGICAL_WIDTH + 80, clipY);
+    ctx.clip();
+  }
+  renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish);
+  ctx.restore();
+}
+
+function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) {
+  if (scale <= 0) return;
+  const LOGICAL_WIDTH = state.logicalWidth;
+  // Используем истинную проекционную полуширину дороги без повторного умножения на activeCameraDepth
+  const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
+  const horizontalBound = roadHalfPx * 1.55;
+  if (roadHalfPx < 1.2 || destX + horizontalBound < -40 || destX - horizontalBound > LOGICAL_WIDTH + 40) {
+    return;
+  }
+
+  const L = computeArchLayout(destX, destY, roadHalfPx, isStartFinish);
   if (L.archH < 5) return;
 
   ctx.save();
@@ -666,11 +749,13 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
   if (scale <= 0) return;
 
   const LOGICAL_WIDTH = state.logicalWidth;
-  const unit = scale * ROAD_WIDTH * state.activeCameraDepth * PROJ_HALF_WIDTH;
+  // Истинная полуширина дороги на экране без лишнего множителя activeCameraDepth
+  const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
+  const unit = roadHalfPx * SPRITE_SCALE_RATIO;
   const isFullArch = sprite.type === 'start_arch' || sprite.type === 'checkpoint_arch';
-  const horizontalBound = isFullArch ? unit * 1.45 : unit * 1.25;
+  const horizontalBound = isFullArch ? roadHalfPx * 1.55 : unit * 1.25;
 
-  if (unit < 1.2 || destX + horizontalBound < -40 || destX - horizontalBound > LOGICAL_WIDTH + 40) {
+  if (roadHalfPx < 1.2 || destX + horizontalBound < -40 || destX - horizontalBound > LOGICAL_WIDTH + 40) {
     return;
   }
 
@@ -685,7 +770,7 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
   const shadowDirX = (destX - sunX) * 0.0005;
 
   if (isFullArch) {
-    renderOverheadArchPillars(ctx, destX, destY, unit, sprite.type === 'start_arch');
+    renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, sprite.type === 'start_arch');
   } else if (sprite.type === 'palm') {
     const trunkW = Math.max(2, unit * 0.055);
     const trunkH = unit * 0.85;
@@ -977,7 +1062,20 @@ function render3DCar(ctx, opts) {
     roofHalfFrac = 0.315;
   }
 
-  const showRearPanel = nearFrac < 0.35;
+  // Зеркалируем продольные пропорции кузова для встречных машин (капот и лобовое обращены к камере)
+  if (dir === -1) {
+    const origCR = tCR;
+    const origRR = tRR;
+    const origRF = tRF;
+    const origCF = tCF;
+    tCR = 1 - origCF;
+    tRR = 1 - origRF;
+    tRF = 1 - origRR;
+    tCF = 1 - origCR;
+  }
+
+  // Торец кузова рисуется только пока машина не срезана ближней плоскостью камеры
+  const showRearPanel = nearFrac < 0.03;
 
   const s0 = sec(Math.max(0.0, nearFrac));
   const sCabinRear = sec(Math.max(tCR, nearFrac));
@@ -1005,6 +1103,7 @@ function render3DCar(ctx, opts) {
     a.exhaustY = s0.cy - s0.h * 0.18;
   }
 
+  // 1. Тени на асфальте
   fillQuad(ctx, s0.cx - s0.w * 0.55, s0.cy + 1, s0.cx + s0.w * 0.55, s0.cy + 1, s1.cx + s1.w * 0.55, s1.cy + 1, s1.cx - s1.w * 0.55, s1.cy + 1, isPlayer ? 'rgba(0, 0, 0, 0.52)' : 'rgba(0, 0, 0, 0.50)');
 
   if (showRearPanel && hNear > 6) {
@@ -1016,48 +1115,50 @@ function render3DCar(ctx, opts) {
 
   const lateralDeltaX = s1.cx - s0.cx;
   const flankOrder = lateralDeltaX >= 0 ? [-1, 1] : [1, -1];
-
-  if (wNear >= 10) {
-    const axleTs = [0.20, 0.80];
-    for (let f = 0; f < 2; f++) {
-      const sideSign = flankOrder[f];
-      for (let a = 0; a < axleTs.length; a++) {
-        if (axleTs[a] < nearFrac) continue;
-        const sa = sec(axleTs[a]);
-        const wheelR = Math.max(2, sa.h * 0.21);
-        const wheelThick = Math.max(1.5, sa.w * 0.055);
-        const wx = sa.cx + sideSign * sa.w * 0.465;
-        const wy = sa.cy - wheelR * 0.92;
-
-        ctx.fillStyle = '#090712';
-        ctx.beginPath();
-        ctx.ellipse(wx, wy, wheelThick, wheelR, 0, 0, Math.PI * 2);
-        ctx.fill();
-
-        if (wheelR >= 3.5) {
-          ctx.fillStyle = '#9aa5b1';
-          ctx.beginPath();
-          ctx.ellipse(wx + sideSign * wheelThick * 0.16, wy, wheelThick * 0.46, wheelR * 0.48, 0, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-    }
-  }
-
-  if (showRearPanel) {
-    const nearWheelW = s0.w * 0.17;
-    const nearWheelH = s0.h * 0.20;
-    ctx.fillStyle = '#090712';
-    ctx.fillRect(s0.cx - s0.w * 0.46, s0.cy - nearWheelH, nearWheelW, nearWheelH);
-    ctx.fillRect(s0.cx + s0.w * 0.46 - nearWheelW, s0.cy - nearWheelH, nearWheelW, nearWheelH);
-  }
+  const axleTs = [0.20, 0.80];
 
   const flankLowerColor = MathUtil.shadeHex(secondary, 0.76);
   const flankUpperColor = MathUtil.shadeHex(primary, 0.86);
+  const roofColor = MathUtil.shadeHex(primary, 1.18);
+  const deckColor = MathUtil.shadeHex(primary, 1.04);
+  const pillarFrameColor = MathUtil.shadeHex(primary, 0.94);
+  const innerGlassRoofFrac = roofHalfFrac * 0.80;
 
-  for (let f = 0; f < 2; f++) {
-    const sideSign = flankOrder[f];
+  // Вспомогательная отрисовка боковых колёс и дисков для одной стороны кузова
+  const drawSideWheels = (sideSign, drawRims = true) => {
+    if (wNear < 10) return;
+    for (let a = 0; a < axleTs.length; a++) {
+      if (axleTs[a] < nearFrac) continue;
+      const sa = sec(axleTs[a]);
+      const wheelR = Math.max(2, sa.h * 0.21);
+      const wheelThick = Math.max(1.6, sa.w * 0.056);
+      const wx = sa.cx + sideSign * sa.w * 0.475;
+      const wy = sa.cy - wheelR * 0.90;
 
+      // Тёмная колёсная арка для выразительного контраста на борту
+      if (drawRims && wheelR >= 3.2) {
+        ctx.fillStyle = '#05030a';
+        ctx.beginPath();
+        ctx.ellipse(wx - sideSign * wheelThick * 0.12, wy - wheelR * 0.08, wheelThick * 1.18, wheelR * 1.12, 0, Math.PI, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.fillStyle = '#090712';
+      ctx.beginPath();
+      ctx.ellipse(wx, wy, wheelThick, wheelR, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (drawRims && wheelR >= 3.5) {
+        ctx.fillStyle = '#9aa5b1';
+        ctx.beginPath();
+        ctx.ellipse(wx + sideSign * wheelThick * 0.16, wy, wheelThick * 0.46, wheelR * 0.48, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  };
+
+  // Вспомогательная отрисовка нижней части боковины (двери и крылья)
+  const drawLowerFlank = (sideSign) => {
     fillQuad(ctx, s0.cx + sideSign * s0.w * 0.49, s0.cy - s0.h * 0.15, s1.cx + sideSign * s1.w * 0.49, s1.cy - s1.h * 0.15, s1.cx + sideSign * s1.w * 0.48, s1.cy - s1.h * 0.36, s0.cx + sideSign * s0.w * 0.48, s0.cy - s0.h * 0.36, flankLowerColor);
     fillQuad(ctx, s0.cx + sideSign * s0.w * 0.48, s0.cy - s0.h * 0.36, s1.cx + sideSign * s1.w * 0.48, s1.cy - s1.h * 0.36, s1.cx + sideSign * s1.w * 0.45, s1.cy - s1.h * 0.56, s0.cx + sideSign * s0.w * 0.45, s0.cy - s0.h * 0.56, flankUpperColor);
 
@@ -1067,107 +1168,110 @@ function render3DCar(ctx, opts) {
     ctx.moveTo(s0.cx + sideSign * s0.w * 0.45, s0.cy - s0.h * 0.56);
     ctx.lineTo(s1.cx + sideSign * s1.w * 0.45, s1.cy - s1.h * 0.56);
     ctx.stroke();
+  };
 
-    if (nearFrac < tCF) {
-      const cAx = sCabinRear.cx + sideSign * sCabinRear.w * 0.45;
-      const cAy = sCabinRear.cy - sCabinRear.h * 0.56;
-      const cBx = sCabinFront.cx + sideSign * sCabinFront.w * 0.45;
-      const cBy = sCabinFront.cy - sCabinFront.h * 0.56;
-      const cCx = sRoofFront.cx + sideSign * sRoofFront.w * roofHalfFrac;
-      const cCy = sRoofFront.cy - sRoofFront.h * 0.96;
-      const cDx = sRoofRear.cx + sideSign * sRoofRear.w * roofHalfFrac;
-      const cDy = sRoofRear.cy - sRoofRear.h * 0.96;
+  // Вспомогательная отрисовка верхней боковины кабины и боковых стёкол (поверх капота и дальнего стекла)
+  const drawCabinFlankAndWindow = (sideSign) => {
+    if (nearFrac >= tCF) return;
 
-      const cross = (cBx - cAx) * (cDy - cAy) - (cBy - cAy) * (cDx - cAx);
-      if (sideSign * cross < -0.5) {
-        fillQuad(ctx, cAx, cAy, cBx, cBy, cCx, cCy, cDx, cDy, flankUpperColor);
+    const cAx = sCabinRear.cx + sideSign * sCabinRear.w * 0.45;
+    const cAy = sCabinRear.cy - sCabinRear.h * 0.56;
+    const cBx = sCabinFront.cx + sideSign * sCabinFront.w * 0.45;
+    const cBy = sCabinFront.cy - sCabinFront.h * 0.56;
+    const cCx = sRoofFront.cx + sideSign * sRoofFront.w * roofHalfFrac;
+    const cCy = sRoofFront.cy - sRoofFront.h * 0.96;
+    const cDx = sRoofRear.cx + sideSign * sRoofRear.w * roofHalfFrac;
+    const cDy = sRoofRear.cy - sRoofRear.h * 0.96;
 
-        const cabinPt = (u, v) => {
-          const tRearU = MathUtil.lerp(tCR, tRR, u);
-          const tFrontU = MathUtil.lerp(tCF, tRF, u);
-          const spanU = Math.max(0.001, tFrontU - tRearU);
-          const vClamped = Math.max(v, (nearFrac - tRearU) / spanU);
-          const t = MathUtil.lerp(tRearU, tFrontU, MathUtil.clamp(vClamped, 0, 1));
-          const s = sec(t);
-          const hFrac = MathUtil.lerp(0.56, 0.96, u);
-          const wFrac = MathUtil.lerp(0.45, roofHalfFrac, u);
-          return { x: s.cx + sideSign * s.w * wFrac, y: s.cy - s.h * hFrac, t: t };
-        };
+    const cross = (cBx - cAx) * (cDy - cAy) - (cBy - cAy) * (cDx - cAx);
+    if (sideSign * cross >= -0.5) return;
 
-        const uBot = 0.16;
-        const uTop = 0.84;
-        const vRear = isVan ? 0.09 : 0.16;
-        const vFront = isVan ? 0.91 : 0.83;
+    fillQuad(ctx, cAx, cAy, cBx, cBy, cCx, cCy, cDx, cDy, flankUpperColor);
 
-        const pBL = cabinPt(uBot, vRear);
-        const pBR = cabinPt(uBot, vFront);
-        const pTR = cabinPt(uTop, vFront);
-        const pTL = cabinPt(uTop, vRear);
+    const cabinPt = (u, v) => {
+      const tRearU = MathUtil.lerp(tCR, tRR, u);
+      const tFrontU = MathUtil.lerp(tCF, tRF, u);
+      const spanU = Math.max(0.001, tFrontU - tRearU);
+      const vClamped = Math.max(v, (nearFrac - tRearU) / spanU);
+      const t = MathUtil.lerp(tRearU, tFrontU, MathUtil.clamp(vClamped, 0, 1));
+      const s = sec(t);
+      const hFrac = MathUtil.lerp(0.56, 0.96, u);
+      const wFrac = MathUtil.lerp(0.45, roofHalfFrac, u);
+      return { x: s.cx + sideSign * s.w * wFrac, y: s.cy - s.h * hFrac, t: t };
+    };
 
-        if (pBR.t > pBL.t + 0.025 && pTR.t > pTL.t + 0.025) {
-          const glassTopY = Math.min(pTL.y, pTR.y);
-          const glassBotY = Math.max(pBL.y, pBR.y);
-          const glassGrad = ctx.createLinearGradient(0, glassTopY, 0, glassBotY);
-          if (dir === -1) {
-            glassGrad.addColorStop(0.0, '#48cae4');
-            glassGrad.addColorStop(0.45, '#1b4965');
-            glassGrad.addColorStop(1.0, '#0b132b');
-          } else {
-            glassGrad.addColorStop(0.0, '#2c7da0');
-            glassGrad.addColorStop(0.45, '#162647');
-            glassGrad.addColorStop(1.0, '#091124');
-          }
+    const uBot = 0.16;
+    const uTop = 0.84;
+    const vRear = isVan ? 0.09 : 0.16;
+    const vFront = isVan ? 0.91 : 0.83;
 
-          fillQuad(ctx, pBL.x, pBL.y, pBR.x, pBR.y, pTR.x, pTR.y, pTL.x, pTL.y, glassGrad);
+    const pBL = cabinPt(uBot, vRear);
+    const pBR = cabinPt(uBot, vFront);
+    const pTR = cabinPt(uTop, vFront);
+    const pTL = cabinPt(uTop, vRear);
 
-          if (wNear >= 12) {
-            const rBL = cabinPt(uBot, MathUtil.lerp(vRear, vFront, 0.24));
-            const rBR = cabinPt(uBot, MathUtil.lerp(vRear, vFront, 0.44));
-            const rTR = cabinPt(uTop, MathUtil.lerp(vRear, vFront, 0.55));
-            const rTL = cabinPt(uTop, MathUtil.lerp(vRear, vFront, 0.35));
-            if (rBR.t > rBL.t + 0.008 && rTR.t > rTL.t + 0.008) {
-              fillQuad(ctx, rBL.x, rBL.y, rBR.x, rBR.y, rTR.x, rTR.y, rTL.x, rTL.y, 'rgba(210, 244, 255, 0.36)');
-            }
-          }
+    if (pBR.t > pBL.t + 0.025 && pTR.t > pTL.t + 0.025) {
+      const glassTopY = Math.min(pTL.y, pTR.y);
+      const glassBotY = Math.max(pBL.y, pBR.y);
+      const glassGrad = ctx.createLinearGradient(0, glassTopY, 0, glassBotY);
+      if (dir === -1) {
+        glassGrad.addColorStop(0.0, '#48cae4');
+        glassGrad.addColorStop(0.45, '#1b4965');
+        glassGrad.addColorStop(1.0, '#0b132b');
+      } else {
+        glassGrad.addColorStop(0.0, '#2c7da0');
+        glassGrad.addColorStop(0.45, '#162647');
+        glassGrad.addColorStop(1.0, '#091124');
+      }
 
-          if (wNear >= 13 && type !== 'coupe') {
-            const pillarFracs = isVan ? [0.36, 0.68] : [0.50];
-            const halfPillarV = isVan ? 0.028 : 0.034;
-            const uPillarBot = uBot - 0.015;
-            const uPillarTop = uTop + 0.015;
-            for (let p = 0; p < pillarFracs.length; p++) {
-              const vCenter = MathUtil.lerp(vRear, vFront, pillarFracs[p]);
-              const p1 = cabinPt(uPillarBot, vCenter - halfPillarV);
-              const p2 = cabinPt(uPillarBot, vCenter + halfPillarV);
-              const p3 = cabinPt(uPillarTop, vCenter + halfPillarV);
-              const p4 = cabinPt(uPillarTop, vCenter - halfPillarV);
-              if (p2.t > p1.t + 0.004 && p3.t > p4.t + 0.004) {
-                fillQuad(ctx, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y, flankUpperColor);
-              }
-            }
-          }
+      fillQuad(ctx, pBL.x, pBL.y, pBR.x, pBR.y, pTR.x, pTR.y, pTL.x, pTL.y, glassGrad);
 
-          if (wNear >= 15) {
-            ctx.strokeStyle = 'rgba(8, 5, 18, 0.85)';
-            ctx.lineWidth = Math.max(1.0, wNear * 0.010);
-            ctx.beginPath();
-            ctx.moveTo(pBL.x, pBL.y);
-            ctx.lineTo(pBR.x, pBR.y);
-            ctx.lineTo(pTR.x, pTR.y);
-            ctx.lineTo(pTL.x, pTL.y);
-            ctx.closePath();
-            ctx.stroke();
+      if (wNear >= 12) {
+        const rBL = cabinPt(uBot, MathUtil.lerp(vRear, vFront, 0.24));
+        const rBR = cabinPt(uBot, MathUtil.lerp(vRear, vFront, 0.44));
+        const rTR = cabinPt(uTop, MathUtil.lerp(vRear, vFront, 0.55));
+        const rTL = cabinPt(uTop, MathUtil.lerp(vRear, vFront, 0.35));
+        if (rBR.t > rBL.t + 0.008 && rTR.t > rTL.t + 0.008) {
+          fillQuad(ctx, rBL.x, rBL.y, rBR.x, rBR.y, rTR.x, rTR.y, rTL.x, rTL.y, 'rgba(210, 244, 255, 0.36)');
+        }
+      }
+
+      if (wNear >= 13 && type !== 'coupe') {
+        const pillarFracs = isVan ? [0.36, 0.68] : [0.50];
+        const halfPillarV = isVan ? 0.028 : 0.034;
+        const uPillarBot = uBot - 0.015;
+        const uPillarTop = uTop + 0.015;
+        for (let p = 0; p < pillarFracs.length; p++) {
+          const vCenter = MathUtil.lerp(vRear, vFront, pillarFracs[p]);
+          const p1 = cabinPt(uPillarBot, vCenter - halfPillarV);
+          const p2 = cabinPt(uPillarBot, vCenter + halfPillarV);
+          const p3 = cabinPt(uPillarTop, vCenter + halfPillarV);
+          const p4 = cabinPt(uPillarTop, vCenter - halfPillarV);
+          if (p2.t > p1.t + 0.004 && p3.t > p4.t + 0.004) {
+            fillQuad(ctx, p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p4.x, p4.y, flankUpperColor);
           }
         }
       }
+
+      if (wNear >= 15) {
+        ctx.strokeStyle = 'rgba(8, 5, 18, 0.85)';
+        ctx.lineWidth = Math.max(1.0, wNear * 0.010);
+        ctx.beginPath();
+        ctx.moveTo(pBL.x, pBL.y);
+        ctx.lineTo(pBR.x, pBR.y);
+        ctx.lineTo(pTR.x, pTR.y);
+        ctx.lineTo(pTL.x, pTL.y);
+        ctx.closePath();
+        ctx.stroke();
+      }
     }
-  }
+  };
 
-  const roofColor = MathUtil.shadeHex(primary, 1.18);
-  const deckColor = MathUtil.shadeHex(primary, 1.04);
-  const pillarFrameColor = MathUtil.shadeHex(primary, 0.94);
-  const innerGlassRoofFrac = roofHalfFrac * 0.80;
+  // 2. Дальняя сторона кузова и её колёса
+  drawSideWheels(flankOrder[0], false);
+  drawLowerFlank(flankOrder[0]);
 
+  // 3. Дальние верхние плоскости: капот (или багажник встречки) и дальнее стекло
   fillQuad(ctx, sCabinFront.cx - sCabinFront.w * 0.45, sCabinFront.cy - sCabinFront.h * 0.56, sCabinFront.cx + sCabinFront.w * 0.45, sCabinFront.cy - sCabinFront.h * 0.56, s1.cx + s1.w * 0.45, s1.cy - s1.h * 0.56, s1.cx - s1.w * 0.45, s1.cy - s1.h * 0.56, deckColor);
 
   if (nearFrac < tCF) {
@@ -1175,10 +1279,21 @@ function render3DCar(ctx, opts) {
     fillQuad(ctx, sRoofFront.cx - sRoofFront.w * innerGlassRoofFrac, sRoofFront.cy - sRoofFront.h * 0.905, sRoofFront.cx + sRoofFront.w * innerGlassRoofFrac, sRoofFront.cy - sRoofFront.h * 0.905, sCabinFront.cx + sCabinFront.w * 0.365, sCabinFront.cy - sCabinFront.h * 0.605, sCabinFront.cx - sCabinFront.w * 0.365, sCabinFront.cy - sCabinFront.h * 0.605, dir === -1 ? '#1d3557' : '#48cae4');
   }
 
+  // 4. Ближняя нижняя боковина и её видимые колёса с дисками
+  drawLowerFlank(flankOrder[1]);
+  drawSideWheels(flankOrder[1], true);
+
+  // 5. Крыша
   if (nearFrac < tRF) {
     fillQuad(ctx, sRoofRear.cx - sRoofRear.w * roofHalfFrac, sRoofRear.cy - sRoofRear.h * 0.96, sRoofRear.cx + sRoofRear.w * roofHalfFrac, sRoofRear.cy - sRoofRear.h * 0.96, sRoofFront.cx + sRoofFront.w * roofHalfFrac, sRoofFront.cy - sRoofFront.h * 0.96, sRoofFront.cx - sRoofFront.w * roofHalfFrac, sRoofFront.cy - sRoofFront.h * 0.96, roofColor);
   }
 
+  // 6. Видимые боковины кабины и боковые стёкла (рисуются поверх капота, дальнего стекла и крыши)
+  for (let f = 0; f < 2; f++) {
+    drawCabinFlankAndWindow(flankOrder[f]);
+  }
+
+  // 7. Ближнее стекло (заднее для попутных, лобовое для встречных)
   if (nearFrac < tRR) {
     fillQuad(ctx, sCabinRear.cx - sCabinRear.w * 0.45, sCabinRear.cy - sCabinRear.h * 0.56, sCabinRear.cx + sCabinRear.w * 0.45, sCabinRear.cy - sCabinRear.h * 0.56, sRoofRear.cx + sRoofRear.w * roofHalfFrac, sRoofRear.cy - sRoofRear.h * 0.96, sRoofRear.cx - sRoofRear.w * roofHalfFrac, sRoofRear.cy - sRoofRear.h * 0.96, pillarFrameColor);
 
@@ -1233,6 +1348,7 @@ function render3DCar(ctx, opts) {
     }
   }
 
+  // 8. Ближняя палуба (багажник для попутных, капот для встречных)
   if (nearFrac < tCR) {
     fillQuad(ctx, s0.cx - s0.w * 0.45, s0.cy - s0.h * 0.56, s0.cx + s0.w * 0.45, s0.cy - s0.h * 0.56, sCabinRear.cx + sCabinRear.w * 0.45, sCabinRear.cy - sCabinRear.h * 0.56, sCabinRear.cx - sCabinRear.w * 0.45, sCabinRear.cy - sCabinRear.h * 0.56, primary);
 
@@ -1263,7 +1379,14 @@ function render3DCar(ctx, opts) {
     }
   }
 
+  // 9. Ближняя торцевая панель (корма для попутных, передок для встречных)
   if (showRearPanel) {
+    const nearWheelW = s0.w * 0.17;
+    const nearWheelH = s0.h * 0.20;
+    ctx.fillStyle = '#090712';
+    ctx.fillRect(s0.cx - s0.w * 0.46, s0.cy - nearWheelH, nearWheelW, nearWheelH);
+    ctx.fillRect(s0.cx + s0.w * 0.46 - nearWheelW, s0.cy - nearWheelH, nearWheelW, nearWheelH);
+
     const rearX = s0.cx - s0.w * 0.50;
     const rearTopY = s0.cy - s0.h;
 
@@ -1739,8 +1862,6 @@ export function renderFrame(ctx) {
   let x = 0;
   let dx = -(baseSegment.curve * basePercent);
 
-  let hasRenderedRoad = false;
-
   // 1. Прямой проход: проекция и отрисовка дорожного полотна
   for (let n = 0; n < DRAW_DISTANCE; n++) {
     const segIndex = (baseSegment.index + n) % segments.length;
@@ -1775,19 +1896,19 @@ export function renderFrame(ctx) {
     dx += seg.curve;
     seg.clip = maxY;
 
+    // Отмечаем все спроецированные сегменты впереди камеры (включая скрытые за холмами),
+    // чтобы машины плавно выезжали из-за перегиба с обрезкой по seg.clip
+    if (seg.p2.camera.z > state.activeCameraDepth * 0.35) {
+      seg.projectedFrame = state.frameCounter;
+    }
+
     if (
       seg.p1.camera.z <= state.activeCameraDepth ||
       seg.p2.screen.y >= seg.p1.screen.y ||
       seg.p2.screen.y >= maxY
     ) {
-      if (!hasRenderedRoad && seg.p2.camera.z > state.activeCameraDepth * 0.35) {
-        seg.projectedFrame = state.frameCounter;
-      }
       continue;
     }
-
-    hasRenderedRoad = true;
-    seg.projectedFrame = state.frameCounter;
 
     const distNorm = Math.max(0, (n / DRAW_DISTANCE - 0.72) / 0.28);
     const fog = MathUtil.exponentialFog(distNorm, FOG_DENSITY);
@@ -1819,16 +1940,33 @@ export function renderFrame(ctx) {
         const spriteScale = seg.p1.screen.scale;
         const spriteX = seg.p1.screen.x + (spriteScale * sp.offset * ROAD_WIDTH * PROJ_HALF_WIDTH);
         const spriteY = seg.p1.screen.y;
-        renderSprite(ctx, sp, spriteScale, spriteX, spriteY, seg.clip);
+        const isArch = sp.type === 'start_arch' || sp.type === 'checkpoint_arch';
 
-        if (sp.type === 'start_arch' || sp.type === 'checkpoint_arch') {
+        if (isArch && seg.p1.camera.z < foregroundThresholdZ) {
+          // Если арка уже между камерой и машиной игрока, откладываем и опоры, и перекладину на передний план
           segArchBeams.push({
             scale: spriteScale,
             x: spriteX,
             y: spriteY,
             clip: seg.clip,
             isStartFinish: sp.type === 'start_arch',
-            camZ: seg.p1.camera.z
+            camZ: seg.p1.camera.z,
+            drawPillars: true
+          });
+          continue;
+        }
+
+        renderSprite(ctx, sp, spriteScale, spriteX, spriteY, seg.clip);
+
+        if (isArch) {
+          segArchBeams.push({
+            scale: spriteScale,
+            x: spriteX,
+            y: spriteY,
+            clip: seg.clip,
+            isStartFinish: sp.type === 'start_arch',
+            camZ: seg.p1.camera.z,
+            drawPillars: false
           });
         }
       }
@@ -1858,7 +1996,7 @@ export function renderFrame(ctx) {
 
     for (let b = 0; b < segArchBeams.length; b++) {
       const beam = segArchBeams[b];
-      if (beam.camZ < foregroundThresholdZ + 220) {
+      if (beam.drawPillars || beam.camZ < foregroundThresholdZ + 220) {
         foregroundArchBeams.push(beam);
       } else {
         renderOverheadArchBeam(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
@@ -1877,10 +2015,16 @@ export function renderFrame(ctx) {
     }
   }
 
-  // 5. Верхние перекладины арок вблизи игрока
-  for (let b = 0; b < foregroundArchBeams.length; b++) {
-    const beam = foregroundArchBeams[b];
-    renderOverheadArchBeam(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
+  // 5. Ближние арки (перекладины и опоры, оказавшиеся ближе машины игрока)
+  if (foregroundArchBeams.length > 0) {
+    foregroundArchBeams.sort((a, b) => b.camZ - a.camZ);
+    for (let b = 0; b < foregroundArchBeams.length; b++) {
+      const beam = foregroundArchBeams[b];
+      if (beam.drawPillars) {
+        renderOverheadArchPillarsClipped(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
+      }
+      renderOverheadArchBeam(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
+    }
   }
 
   // 6. Частицы

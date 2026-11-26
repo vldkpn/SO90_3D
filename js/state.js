@@ -115,7 +115,7 @@ export const state = {
   isSlipstreaming: false,
   minimapCacheKey: '',
 
-  // Прогресс вперед в режимах трафика
+  // Прогресс вперед в режимах трафика и для защиты одометра
   netForwardZ: PLAYER_Z + PLAYER_CENTER_OFFSET_Z,
   maxNetForwardZ: PLAYER_Z + PLAYER_CENTER_OFFSET_Z,
   passedCheckpointUids: new Set(),
@@ -177,6 +177,14 @@ export function getBestScoreStorageKey() {
   return `${GAME_CONFIG.storage.bestScoreKey}_${state.gameMode}_${state.difficulty}`;
 }
 
+/**
+ * Раздельный ключ рекорда средней скорости круга по уровню сложности.
+ * Также автоматически изолирует новые физически точные рекорды от старых завышенных записей.
+ */
+export function getBestLapStorageKey() {
+  return `${GAME_CONFIG.storage.bestLapSpeedKey}_${state.difficulty}`;
+}
+
 export function loadSavedRecords() {
   try {
     const modeKey = getBestScoreStorageKey();
@@ -187,9 +195,13 @@ export function loadSavedRecords() {
   }
 
   try {
-    const savedLapKmh = parseFloat(localStorage.getItem(GAME_CONFIG.storage.bestLapSpeedKey) || '0');
+    const lapKey = getBestLapStorageKey();
+    const savedLapKmh = parseFloat(localStorage.getItem(lapKey) || '0');
     if (savedLapKmh > 0 && isFinite(savedLapKmh)) {
       state.bestLapRecordKmh = savedLapKmh;
+    } else {
+      // Явно сбрасываем значение, чтобы при переключении сложности не залипал чужой рекорд
+      state.bestLapRecordKmh = null;
     }
   } catch (e) {
     state.bestLapRecordKmh = null;

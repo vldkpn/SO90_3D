@@ -53,7 +53,7 @@ html, body {
 }
 
 .top-bar-btn {
-  background: rgba(13, 2, 33, 0.88);
+  background: rgba(13, 2, 33, 0.90);
   border: 1.5px solid rgba(0, 240, 255, 0.55);
   color: #00f0ff;
   border-radius: 10px;
@@ -62,7 +62,6 @@ html, body {
   font-weight: 800;
   letter-spacing: 0.5px;
   cursor: pointer;
-  backdrop-filter: blur(4px);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
   transition: transform 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
 }
@@ -122,13 +121,13 @@ canvas {
   z-index: 5;
 }
 
-/* Кнопка переключения звука в углу на ПК */
+/* Кнопка переключения звука в углу на ПК (без backdrop-filter для стабильных 60 FPS поверх canvas) */
 #desktop-mute-btn {
   position: absolute;
   top: 10px;
   right: 10px;
   z-index: 20;
-  background: rgba(13, 2, 33, 0.78);
+  background: rgba(13, 2, 33, 0.88);
   border: 1.5px solid rgba(0, 240, 255, 0.55);
   color: #00f0ff;
   border-radius: 10px;
@@ -137,12 +136,12 @@ canvas {
   font-weight: 800;
   letter-spacing: 0.5px;
   cursor: pointer;
-  backdrop-filter: blur(4px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
   transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 
 #desktop-mute-btn:hover {
-  background: rgba(0, 240, 255, 0.18);
+  background: rgba(0, 240, 255, 0.22);
   box-shadow: 0 0 14px rgba(0, 240, 255, 0.45);
   transform: translateY(-1px);
 }
@@ -205,6 +204,7 @@ canvas {
   text-transform: uppercase;
   background: linear-gradient(180deg, #ffffff 0%, #7ce8ff 35%, #ff2a85 68%, #ffbe0b 100%);
   -webkit-background-clip: text;
+  background-clip: text;
   -webkit-text-fill-color: transparent;
   filter: drop-shadow(0 4px 0 #240046) drop-shadow(0 0 22px rgba(255, 42, 133, 0.7));
   margin-bottom: 8px;

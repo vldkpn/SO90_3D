@@ -9,6 +9,7 @@ import {
   PLAYER_LEN_Z,
   PLAYER_WIDTH_NORM,
   BASE_MAX_KMH,
+  WORLD_UNITS_PER_METER,
   MAX_SPEED,
   MAX_REVERSE_SPEED,
   ACCEL,
@@ -24,6 +25,7 @@ import {
   PLAYER_MAX_LATERAL_X,
   OFF_ROAD_THRESHOLD_X,
   COLLISION_TIME_PENALTY,
+  SCORE_PER_METER,
   MAX_HARDCORE_COLLISIONS
 } from './config.js';
 import { MathUtil, formatRaceTime, getShortestTrackDz } from './utils.js';
@@ -39,6 +41,9 @@ import {
 } from './state.js';
 import { recordSkidMarks } from './track.js';
 import { maintainTrafficDensity, updateTrafficOnly } from './traffic.js';
+
+// Смещение опор арок синхронизировано с js/renderer.js (ARCH_TOWER_OFFSET_NORM)
+const ARCH_PILLAR_HITBOX_OFFSET = 1.28;
 
 function updateParticles(dt) {
   const particles = state.particles;
@@ -80,7 +85,9 @@ function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗ�
     return false;
   }
 
-  const dmg = Math.max(1, damagePoints);
+  // В режиме «Легко» ограничиваем штраф за один удар, отвязывая его от смертельного урона хардкора
+  const rawDmg = Math.max(1, damagePoints);
+  const dmg = state.difficulty === 'hardcore' ? rawDmg : Math.min(2, rawDmg);
   const penaltySec = Math.round(COLLISION_TIME_PENALTY);
 
   const side = hitContext.side || 'center';
@@ -157,7 +164,9 @@ function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗ�
 export function computeCircuitRank() {
   let rank = 1;
   for (let i = 0; i < state.rivals.length; i++) {
-    if (state.rivals[i].progressZ > state.playerProgressZ) {
+    const r = state.rivals[i];
+    // Уже финишировавший соперник безусловно выше игрока, даже если сбросил темп после черты
+    if (r.finished || r.progressZ > state.playerProgressZ) {
       rank++;
     }
   }
@@ -238,6 +247,7 @@ export function updateSimulation(dt) {
           [0.2, 0.45]
         );
       }
+      // Разбитая машина реально стоит на полосе, поэтому трафик реагирует на неё
       updateTrafficOnly(dt, true);
       updateCameraDynamics(dt, findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z));
       audio.update(0, false, false, false);
@@ -252,7 +262,8 @@ export function updateSimulation(dt) {
       state.cityOffset = (state.cityOffset + demoSeg.curve * 0.0085) % 1;
     }
     maintainTrafficDensity();
-    updateTrafficOnly(dt, true);
+    // Вне активного заезда трафик и боты идут в безопасном демо-режиме без учёта призрачного игрока
+    updateTrafficOnly(dt, false);
     updateCameraDynamics(dt, demoSeg);
     audio.update(0, false, false, false);
     return;
@@ -370,10 +381,16 @@ export function updateSimulation(dt) {
   const isEngineMisfiring = state.engineMisfireTimer > 0;
 
   // 2. Система перегрева двигателя в режиме «Нормально»
+  // В кольцевом режиме нагрев ослаблен на 40% для честного баланса против ИИ без перегрева
   if (state.difficulty === 'hardcore') {
     const throttleLoadRatio = damageMaxSpeed > 0 ? Math.max(0, state.speed) / damageMaxSpeed : 0;
-    if (input.up && !input.down && throttleLoadRatio > 0.90 && !state.isOverheated) {
-      state.engineHeat = Math.min(100, state.engineHeat + dt * GAME_CONFIG.gameplay.engineHeatRate);
+    const heatThreshold = state.gameMode === 'circuit' ? 0.93 : 0.90;
+    const heatRate = state.gameMode === 'circuit'
+      ? GAME_CONFIG.gameplay.engineHeatRate * 0.60
+      : GAME_CONFIG.gameplay.engineHeatRate;
+
+    if (input.up && !input.down && throttleLoadRatio > heatThreshold && !state.isOverheated) {
+      state.engineHeat = Math.min(100, state.engineHeat + dt * heatRate);
       if (state.engineHeat >= 92 && state.heatWarnCooldown <= 0) {
         state.heatWarnCooldown = 2.0;
         showBanner('ВНИМАНИЕ! ПЕРЕГРЕВ МОТОРА!', '#ffbe0b', 1.3);
@@ -455,8 +472,12 @@ export function updateSimulation(dt) {
       state.offRoadWarnCooldown = 1.6;
       showBanner(isCornerCut ? 'СРЕЗКА ПОВОРОТА! СБРОС СКОРОСТИ!' : 'ВОЗВРАТ НА ТРАССУ!', '#ffbe0b', 1.2);
     }
+    // Ограничиваем замедление снизу лимитом обочины, чтобы скорость не проваливалась и не дёргалась на низком FPS
     if (state.speed > activeOffRoadLimit) {
-      state.speed += OFF_ROAD_DECEL * (isCornerCut ? 1.85 : (isDeepCornerCut ? 1.35 : 1.0)) * dt;
+      state.speed = Math.max(
+        activeOffRoadLimit,
+        state.speed + OFF_ROAD_DECEL * (isCornerCut ? 1.85 : (isDeepCornerCut ? 1.35 : 1.0)) * dt
+      );
     }
     if (Math.abs(state.speed) > 40 && Math.random() < 0.65) {
       spawnParticles(
@@ -517,11 +538,13 @@ export function updateSimulation(dt) {
   if (state.gameMode === 'circuit' && state.difficulty === 'arcade' && currentSeg) {
     const railInnerEdge = 1.15;
     const railOuterEdge = 1.21;
+    const railCenter = (railInnerEdge + railOuterEdge) * 0.5;
     const visualHalfCarW = 0.12;
     const carHalfScreenW = anchors.carW * 0.50;
 
     if (currentSeg.guardrailLeft) {
-      const wasInside = prevPlayerX - visualHalfCarW >= -railInnerEdge;
+      // Сторона определяется по центру автомобиля относительно оси отбойника, чтобы исключить выброс наружу с поребрика
+      const wasInside = prevPlayerX >= -railCenter;
       if (wasInside && state.playerX - visualHalfCarW < -railInnerEdge) {
         state.playerX = -railInnerEdge + visualHalfCarW;
         if (state.playerVX < 0) state.playerVX = Math.abs(state.playerVX) * 0.35;
@@ -542,7 +565,7 @@ export function updateSimulation(dt) {
     }
 
     if (currentSeg.guardrailRight) {
-      const wasInside = prevPlayerX + visualHalfCarW <= railInnerEdge;
+      const wasInside = prevPlayerX <= railCenter;
       if (wasInside && state.playerX + visualHalfCarW > railInnerEdge) {
         state.playerX = railInnerEdge - visualHalfCarW;
         if (state.playerVX > 0) state.playerVX = -Math.abs(state.playerVX) * 0.35;
@@ -576,7 +599,8 @@ export function updateSimulation(dt) {
   const prevNetForwardZ = state.netForwardZ;
   state.netForwardZ += deltaZ;
 
-  const rearAxleCamZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z - PLAYER_LEN_Z * 0.30;
+  // Привязываем следы непосредственно к пятну контакта задних шин 3D-модели
+  const rearAxleCamZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z - PLAYER_LEN_Z * 0.38;
   const rearTireWorldZ = (((state.position + rearAxleCamZ) % trackLength) + trackLength) % trackLength;
   const isHardBrakingOnRoad = !isOffRoad && input.down && state.speed > MAX_SPEED * 0.035;
   const isLateralSkiddingOnRoad = !isOffRoad && Math.abs(state.playerVX) > 0.35 && state.speed > MAX_SPEED * 0.12;
@@ -655,13 +679,16 @@ export function updateSimulation(dt) {
 
   if (state.gameMode === 'circuit') {
     state.playerProgressZ += deltaZ;
-    if (deltaZ > 0) {
-      state.distanceMeters += deltaZ / 25;
+    // Защита от накрутки одометра задним ходом в кольцевом режиме + точный перевод в метры
+    if (state.netForwardZ > state.maxNetForwardZ) {
+      const newForwardDelta = state.netForwardZ - state.maxNetForwardZ;
+      state.maxNetForwardZ = state.netForwardZ;
+      state.distanceMeters += newForwardDelta / WORLD_UNITS_PER_METER;
     }
 
     if (state.playerProgressZ >= state.circuitCurrentLap * trackLength) {
       const lapDuration = state.raceElapsedTime - state.currentLapStartTime;
-      const lapDistKm = trackLength / 25000;
+      const lapDistKm = trackLength / (WORLD_UNITS_PER_METER * 1000);
       const lapAvgKmh = lapDuration > 0 ? (lapDistKm / (lapDuration / 3600)) : 0;
       if (state.bestLapTime === null || lapDuration < state.bestLapTime) {
         state.bestLapTime = lapDuration;
@@ -692,11 +719,11 @@ export function updateSimulation(dt) {
     if (state.netForwardZ > state.maxNetForwardZ) {
       const newForwardDelta = state.netForwardZ - state.maxNetForwardZ;
       state.maxNetForwardZ = state.netForwardZ;
-      const metersDelta = newForwardDelta / 25;
+      const metersDelta = newForwardDelta / WORLD_UNITS_PER_METER;
       state.distanceMeters += metersDelta;
 
       const scoreMultiplier = isOncomingBonusActive() ? GAME_CONFIG.gameplay.oncomingScoreMultiplier : 1.0;
-      state.score += metersDelta * (1 + forwardSpeedRatio * 2.5) * scoreMultiplier;
+      state.score += metersDelta * SCORE_PER_METER * (1 + forwardSpeedRatio * 2.5) * scoreMultiplier;
     }
 
     if (deltaZ > 0 && oldPlayerSeg && newPlayerSeg && oldPlayerSeg !== newPlayerSeg) {
@@ -707,9 +734,11 @@ export function updateSimulation(dt) {
       while (safety < 15) {
         traversedZ += SEGMENT_LENGTH;
         if (segments[stepIdx].isCheckpoint) {
-          const lapIdx = Math.floor(Math.max(0, traversedZ - SEGMENT_LENGTH * 0.5) / trackLength);
+          // Устойчивый расчёт номера круга относительно координаты самого чекпоинта (исключает баг на сегменте 0)
+          const lapIdx = Math.max(0, Math.round((traversedZ - stepIdx * SEGMENT_LENGTH) / trackLength));
+          const isStartLineReverseExploit = stepIdx === 0 && lapIdx < 1;
           const checkpointUid = lapIdx * totalSegs + stepIdx;
-          if (!state.passedCheckpointUids.has(checkpointUid)) {
+          if (!isStartLineReverseExploit && !state.passedCheckpointUids.has(checkpointUid)) {
             state.passedCheckpointUids.add(checkpointUid);
             state.checkpointsPassed++;
             const bonusTime = Math.max(
@@ -736,7 +765,7 @@ export function updateSimulation(dt) {
     computeCircuitRank();
   }
 
-  // 6. Коллизии с машинами
+  // 6. Непрерывные (swept) коллизии с машинами
   const playerWorldZ = getPlayerWorldZ();
   if (newPlayerSeg) {
     const scanSpan = Math.max(3, Math.ceil((Math.abs(state.speed) * dt + MAX_SPEED * dt) / SEGMENT_LENGTH) + 2);
@@ -751,26 +780,34 @@ export function updateSimulation(dt) {
 
         const baseBlockDistZ = ((PLAYER_LEN_Z + (car.lenZ || SEGMENT_LENGTH * 1.3)) * 0.5) * 0.88;
         const dz = getShortestTrackDz(playerWorldZ, car.z, trackLength);
-        const relSpeedZ = Math.abs(state.speed - car.speed * car.dir);
-        const dynamicHalfZ = baseBlockDistZ + relSpeedZ * dt * 0.55;
+        const relVelZ = state.speed - car.speed * car.dir;
+        const prevDz = dz + relVelZ * dt;
+        const minDz = Math.min(prevDz, dz);
+        const maxDz = Math.max(prevDz, dz);
 
-        if (dz > -dynamicHalfZ && dz < dynamicHalfZ) {
+        // Проверяем пересечение отрезка движения [prevDz -> dz] с габаритом [-baseBlockDistZ, +baseBlockDistZ]
+        if (maxDz > -baseBlockDistZ && minDz < baseBlockDistZ) {
           const carNormX = car.x / ROAD_WIDTH;
           if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, carNormX, car.w, 0.90)) {
             const dx = state.playerX - carNormX;
             const combinedHalfW = (PLAYER_WIDTH_NORM + car.w) * 0.5;
             const overlapRatio = Math.abs(dx) / Math.max(0.01, combinedHalfW);
             const pushSign = dx >= 0 ? 1 : -1;
+            const wasAhead = prevDz > 12;
+            const wasBehind = prevDz < -28;
 
             if (car.isRival) {
-              if (dz > 28) {
-                const penetration = Math.max(0, baseBlockDistZ - dz);
+              const isRivalRearBump = dz > 28 || (prevDz > 28 && state.speed > car.speed);
+              if (isRivalRearBump) {
+                const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
                 state.position = (((state.position - penetration) % trackLength) + trackLength) % trackLength;
                 state.playerProgressZ -= penetration;
-              } else if (dz < -28 && state.speed < 0) {
-                const penetration = Math.max(0, baseBlockDistZ + dz);
+                state.netForwardZ -= penetration;
+              } else if ((dz < -28 || wasBehind) && state.speed < 0) {
+                const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
                 state.position = (((state.position + penetration) % trackLength) + trackLength) % trackLength;
                 state.playerProgressZ += penetration;
+                state.netForwardZ += penetration;
                 state.speed = 0;
               } else {
                 const minSepX = combinedHalfW * 0.92;
@@ -782,11 +819,11 @@ export function updateSimulation(dt) {
                 state.impactShake = 0.65;
                 audio.playCrash(0.65);
 
-                if (dz > 28) {
+                if (isRivalRearBump) {
                   car.speed = Math.min(MAX_SPEED * 0.995, Math.max(car.speed, state.speed * 0.96));
                   state.speed = Math.min(state.speed * GAME_CONFIG.circuit.rearBumpSlowdownRatio, car.speed * 0.96);
                   state.playerVX += dx * 1.15;
-                } else if (dz >= -28) {
+                } else if (dz >= -28 && !wasBehind) {
                   state.speed *= GAME_CONFIG.circuit.impactSlowdownRatio;
                   state.playerVX += pushSign * 1.05;
                   car.vx -= pushSign * 0.85;
@@ -808,14 +845,14 @@ export function updateSimulation(dt) {
 
             const impactSpeedKmh = Math.round((Math.abs(state.speed) / MAX_SPEED) * BASE_MAX_KMH);
             const isFrontalHit = overlapRatio < 0.65;
-            const isHeadOn = car.dir === -1 && dz > 12 && isFrontalHit;
-            const isRearEnd = overlapRatio < 0.72 && dz > 28;
-            const isBackingHit = overlapRatio < 0.72 && dz < -28 && state.speed < 0;
+            const isHeadOn = car.dir === -1 && (dz > 12 || wasAhead) && isFrontalHit;
+            const isRearEnd = overlapRatio < 0.72 && (dz > 28 || (prevDz > 28 && state.speed > car.speed * car.dir));
+            const isBackingHit = overlapRatio < 0.72 && (dz < -28 || wasBehind) && state.speed < 0;
             const hitSide = dx > 0.03 ? 'left' : (dx < -0.03 ? 'right' : 'center');
             const hitZone = isBackingHit ? 'rear' : ((isHeadOn || isRearEnd) ? 'front' : 'side');
 
-            if (dz > 28 || isHeadOn) {
-              const penetration = Math.max(0, baseBlockDistZ - dz);
+            if (dz > 28 || isHeadOn || isRearEnd) {
+              const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
               state.position = (((state.position - penetration) % trackLength) + trackLength) % trackLength;
               state.netForwardZ -= penetration;
               const carForwardVel = Math.max(0, car.speed * car.dir);
@@ -830,8 +867,8 @@ export function updateSimulation(dt) {
                   state.speed = carForwardVel;
                 }
               }
-            } else if (dz < -28 && state.speed < 0) {
-              const penetration = Math.max(0, baseBlockDistZ + dz);
+            } else if ((dz < -28 || wasBehind) && state.speed < 0) {
+              const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
               state.position = (((state.position + penetration) % trackLength) + trackLength) % trackLength;
               state.netForwardZ += penetration;
               state.speed = 0;
@@ -917,37 +954,60 @@ export function updateSimulation(dt) {
     }
   }
 
-  // 7. Коллизии с придорожными объектами
+  // 7. Коллизии с придорожными объектами (с точной swept-проверкой дистанции по Z)
   if (newPlayerSeg && state.spriteHitCooldown <= 0) {
     const totalSegs = segments.length;
     const segIndicesToCheck = [];
     const visitedSegs = new Set();
 
+    const addCandidateSeg = (idx) => {
+      const wrapped = ((idx % totalSegs) + totalSegs) % totalSegs;
+      if (!visitedSegs.has(wrapped)) {
+        visitedSegs.add(wrapped);
+        segIndicesToCheck.push(wrapped);
+      }
+    };
+
     if (oldPlayerSeg && deltaZ > 0) {
       let idx = oldPlayerSeg.index;
       let safety = 0;
       while (safety < 15) {
-        if (!visitedSegs.has(idx)) {
-          visitedSegs.add(idx);
-          segIndicesToCheck.push(idx);
-        }
+        addCandidateSeg(idx);
         if (idx === newPlayerSeg.index) break;
         idx = (idx + 1) % totalSegs;
         safety++;
       }
+    } else if (oldPlayerSeg && deltaZ < 0) {
+      let idx = oldPlayerSeg.index;
+      let safety = 0;
+      while (safety < 15) {
+        addCandidateSeg(idx);
+        if (idx === newPlayerSeg.index) break;
+        idx = (idx - 1 + totalSegs) % totalSegs;
+        safety++;
+      }
     } else {
-      visitedSegs.add(newPlayerSeg.index);
-      segIndicesToCheck.push(newPlayerSeg.index);
+      addCandidateSeg(newPlayerSeg.index);
     }
 
-    const lookAheadIdx = (newPlayerSeg.index + 1) % totalSegs;
-    if (!visitedSegs.has(lookAheadIdx)) {
-      segIndicesToCheck.push(lookAheadIdx);
-    }
+    // Проверяем соседние сегменты на случай касания бампером границы сегмента
+    addCandidateSeg(newPlayerSeg.index - 1);
+    addCandidateSeg(newPlayerSeg.index + 1);
 
+    const spriteHalfZ = PLAYER_LEN_Z * 0.45;
     let hitResolved = false;
+
     for (let s = 0; s < segIndicesToCheck.length && !hitResolved; s++) {
       const seg = segments[segIndicesToCheck[s]];
+      if (!seg.sprites.length) continue;
+
+      // Проверяем реальное продольное пересечение автомобиля с координатой спрайта seg.p1.world.z
+      const dzCurr = getShortestTrackDz(playerWorldZ, seg.p1.world.z, trackLength);
+      const dzPrev = dzCurr + deltaZ;
+      const minSpriteDz = Math.min(dzCurr, dzPrev);
+      const maxSpriteDz = Math.max(dzCurr, dzPrev);
+      if (maxSpriteDz <= -spriteHalfZ || minSpriteDz >= spriteHalfZ) continue;
+
       for (let i = 0; i < seg.sprites.length; i++) {
         const sp = seg.sprites[i];
         let hitTargets = [{ offset: sp.offset, width: 0.08 }];
@@ -955,8 +1015,8 @@ export function updateSimulation(dt) {
           hitTargets = [{ offset: sp.offset, width: 0.24 }];
         } else if (sp.type === 'start_arch' || sp.type === 'checkpoint_arch') {
           hitTargets = [
-            { offset: -1.21, width: 0.11 },
-            { offset:  1.21, width: 0.11 }
+            { offset: -ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 },
+            { offset:  ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 }
           ];
         } else if (sp.type === 'chevron_left' || sp.type === 'chevron_right') {
           hitTargets = [{ offset: sp.offset, width: 0.12 }];
@@ -1007,7 +1067,7 @@ export function updateSimulation(dt) {
               : 'МАШИНА РАЗБИТА!';
             const obstacleHitContext = {
               side: pushSign > 0 ? 'left' : 'right',
-              zone: 'front'
+              zone: deltaZ < 0 ? 'rear' : 'front'
             };
             if (registerCollision(obstacleDmg, fatalReason, obstacleHitContext)) return;
           }

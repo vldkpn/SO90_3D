@@ -52,6 +52,8 @@ export const GAME_CONFIG = {
     checkpointBaseBonusSec: 24,
     checkpointMinBonusSec: 14,
     checkpointScoreBonus: 500,
+    // Базовые очки за 1 реальный метр пути (сохраняет исходный темп набора счёта)
+    scorePerMeter: 5.85,
     oncomingScoreMultiplier: 2.0,
 
     collisionTimePenaltySec: 5.0,
@@ -69,7 +71,10 @@ export const GAME_CONFIG = {
   traffic: {
     initialCount: 34,
     maxCount: 68,
-    metersPerExtraCar: 220,
+    // Пересчитано под реальный масштаб метров (220 / 5.85 ≈ 38 м) для сохранения темпа уплотнения потока
+    metersPerExtraCar: 38,
+    // Дистанция выхода трафика на максимальную прогрессию скорости (5000 / 5.85 ≈ 860 м)
+    progressionDistanceMeters: 860,
     carTypes: [
       { type: 'coupe', w: 0.18, h: 1.00, lenZ: 255, primary: '#00e5ff', secondary: '#0077b6', speedMult: 1.02 },
       { type: 'sport', w: 0.19, h: 0.94, lenZ: 265, primary: '#ffbe0b', secondary: '#fb5607', speedMult: 1.18 },
@@ -147,11 +152,13 @@ export const HEADLIGHT_BEAM_DIST_Z = SEGMENT_LENGTH * 21.0;
 export const ONCOMING_DETECT_DIST_Z = SEGMENT_LENGTH * 21.0;
 export const ONCOMING_HORN_DIST_Z = SEGMENT_LENGTH * 17.0;
 
-// Физика автомобиля
+// Физика автомобиля и точный перевод мировых единиц в метры
 export const BASE_MAX_KMH = GAME_CONFIG.physics.baseMaxKmh;
 export const SPEED_PENALTY_PER_COLLISION_KMH = GAME_CONFIG.physics.speedPenaltyPerHitKmh;
 export const MIN_ALLOWED_MAX_KMH = GAME_CONFIG.physics.minAllowedMaxKmh;
 export const WORLD_SPEED_SCALE = (SEGMENT_LENGTH * 65) / 320;
+// 1 м/с = 3.6 км/ч => мировых единиц в 1 метре ровно WORLD_SPEED_SCALE * 3.6 (146.25)
+export const WORLD_UNITS_PER_METER = WORLD_SPEED_SCALE * 3.6;
 export const MAX_SPEED = BASE_MAX_KMH * WORLD_SPEED_SCALE;
 export const MAX_REVERSE_KMH = GAME_CONFIG.physics.maxReverseKmh;
 export const MAX_REVERSE_SPEED = MAX_SPEED * (MAX_REVERSE_KMH / BASE_MAX_KMH);
@@ -170,10 +177,12 @@ export const OFF_ROAD_THRESHOLD_X = 1.14;
 
 // Правила заезда и трафик
 export const COLLISION_TIME_PENALTY = GAME_CONFIG.gameplay.collisionTimePenaltySec;
+export const SCORE_PER_METER = GAME_CONFIG.gameplay.scorePerMeter;
 export const MAX_SKID_MARKS = GAME_CONFIG.playerVisuals.maxSkidMarks;
 export const INITIAL_TRAFFIC_COUNT = GAME_CONFIG.traffic.initialCount;
 export const MAX_TRAFFIC_COUNT = GAME_CONFIG.traffic.maxCount;
 export const METERS_PER_EXTRA_CAR = GAME_CONFIG.traffic.metersPerExtraCar;
+export const TRAFFIC_PROGRESSION_METERS = GAME_CONFIG.traffic.progressionDistanceMeters;
 export const MAX_HARDCORE_COLLISIONS = GAME_CONFIG.gameplay.maxHardcoreCollisions;
 export const PLAYER_WIDTH_NORM = GAME_CONFIG.playerVisuals.hitboxWidthNorm;
 export const CAR_TYPES = GAME_CONFIG.traffic.carTypes;

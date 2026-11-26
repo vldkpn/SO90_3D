@@ -214,7 +214,15 @@ export function buildTrack() {
     addSprite(cpIdx, 'checkpoint_arch', 0);
   }
 
-  for (let n = 0; n < segments.length; n++) {
+  const totalSegs = segments.length;
+  for (let n = 0; n < totalSegs; n++) {
+    // Исключаем постановку пальм, фонарей и билбордов вплотную к опорам чекпоинт-арки
+    const prevSeg = segments[(n - 1 + totalSegs) % totalSegs];
+    const nextSeg = segments[(n + 1) % totalSegs];
+    if (segments[n].isCheckpoint || prevSeg.isCheckpoint || nextSeg.isCheckpoint) {
+      continue;
+    }
+
     if (n % 7 === 0) {
       addSprite(n, 'palm', -1.42 - Math.random() * 0.45);
       addSprite(n, 'palm', 1.42 + Math.random() * 0.45);
@@ -466,19 +474,23 @@ export function buildCircuitTrack() {
 
   for (let n = 0; n < segments.length; n++) {
     const seg = segments[n];
-    if (Math.abs(seg.curve) > 5.6 && n % 5 === 0) {
+    const nearStartFinish = n === 0 || n === 1 || n === segments.length - 1;
+
+    if (!nearStartFinish && Math.abs(seg.curve) > 5.6 && n % 5 === 0) {
       const hasRail = seg.guardrailLeft || seg.guardrailRight;
       const signOffset = hasRail ? 1.38 : 1.30;
       const outerSide = seg.curve > 0 ? -signOffset : signOffset;
       addSprite(n, seg.curve > 0 ? 'chevron_right' : 'chevron_left', outerSide);
     }
 
-    if (n % 20 === 5) {
+    // Фаза фонарей (n % 20 === 7) разведена с шевронами (n % 5 === 0), чтобы исключить клиппинг в поворотах
+    if (!nearStartFinish && n % 20 === 7) {
       addSprite(n, 'lamp', -1.34);
       addSprite(n, 'lamp', 1.34);
     }
 
-    if (n > 18 && n < segments.length - 18 && n % 65 === 25) {
+    // Фаза билбордов (n % 65 === 23) также не пересекается ни с шевронами, ни с фонарями
+    if (n > 18 && n < segments.length - 18 && n % 65 === 23) {
       const side = (Math.floor(n / 65) % 2 === 0) ? -1.68 : 1.68;
       addSprite(n, 'billboard', side);
     }

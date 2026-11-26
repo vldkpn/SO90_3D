@@ -14,6 +14,7 @@ import {
   initStars,
   loadSavedRecords,
   getBestScoreStorageKey,
+  getBestLapStorageKey,
   resetRunState,
   showBanner,
   clearSkidMarks,
@@ -203,6 +204,7 @@ function startGame() {
   }
 
   state.gameState = STATE.PLAYING;
+  lastTimestamp = performance.now();
   startScreen.classList.add('hidden');
   if (pauseScreen) pauseScreen.classList.add('hidden');
   gameoverScreen.classList.add('hidden');
@@ -233,6 +235,8 @@ function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
   const newRecordTag = document.getElementById('new-record-tag');
 
   if (state.gameMode === 'circuit') {
+    // Актуализируем сохранённый рекорд для текущей сложности перед сравнением
+    loadSavedRecords();
     let isNewLapRecord = false;
     if (
       state.bestLapAvgKmh !== null &&
@@ -242,7 +246,7 @@ function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
       state.bestLapRecordKmh = state.bestLapAvgKmh;
       isNewLapRecord = true;
       try {
-        localStorage.setItem(GAME_CONFIG.storage.bestLapSpeedKey, state.bestLapRecordKmh.toFixed(1));
+        localStorage.setItem(getBestLapStorageKey(), state.bestLapRecordKmh.toFixed(1));
       } catch (e) {}
     }
 

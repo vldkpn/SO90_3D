@@ -60,6 +60,7 @@ export class RetroAudioEngine {
 
       this.engineFilter.type = 'lowpass';
       this.engineFilter.frequency.value = 280;
+      this.engineFilter.Q.value = 1.0;
       this.engineGain.gain.value = 0.0;
 
       this.engineOsc.connect(this.engineFilter);
@@ -180,17 +181,23 @@ export class RetroAudioEngine {
     this.init();
     if (!this.initialized || !this.ctx) return;
     try {
-      const startTime = this.ctx.currentTime + delay;
+      const safeDuration = Math.max(0.01, duration);
+      // Защита огибающей: время атаки не превышает четверти общей длительности звука
+      const attack = Math.min(0.015, safeDuration * 0.25);
+      const safeFreq = Math.max(20, freq);
+      const safeVolume = Math.max(0.001, volume);
+
+      const startTime = this.ctx.currentTime + Math.max(0, delay);
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.type = type;
-      osc.frequency.setValueAtTime(freq, startTime);
+      osc.frequency.setValueAtTime(safeFreq, startTime);
       if (slideTo !== null) {
-        osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), startTime + duration);
+        osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), startTime + safeDuration);
       }
       gain.gain.setValueAtTime(0.001, startTime);
-      gain.gain.linearRampToValueAtTime(volume, startTime + 0.015);
-      gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+      gain.gain.linearRampToValueAtTime(safeVolume, startTime + attack);
+      gain.gain.exponentialRampToValueAtTime(0.0001, startTime + safeDuration);
 
       osc.connect(gain);
       gain.connect(this.ctx.destination);
@@ -201,7 +208,7 @@ export class RetroAudioEngine {
         } catch (e) {}
       };
       osc.start(startTime);
-      osc.stop(startTime + duration + 0.02);
+      osc.stop(startTime + safeDuration + 0.02);
     } catch (e) {}
   }
 
@@ -296,6 +303,7 @@ export class RetroAudioEngine {
 
     if (this.muted || !isPlaying) {
       this.engineGain.gain.setTargetAtTime(0, now, 0.05);
+      this.engineFilter.Q.setTargetAtTime(1.0, now, 0.05);
       if (this.damageRattleGain) this.damageRattleGain.gain.setTargetAtTime(0, now, 0.05);
       this.brakeGain.gain.setTargetAtTime(0, now, 0.05);
       this.noiseGain.gain.setTargetAtTime(0, now, 0.05);
@@ -307,6 +315,8 @@ export class RetroAudioEngine {
       this.engineOsc.frequency.setTargetAtTime(baseFreq, now, 0.05);
       this.engineSubOsc.frequency.setTargetAtTime(baseFreq * 0.5, now, 0.05);
       this.engineFilter.frequency.setTargetAtTime(240 + speedRatio * 360, now, 0.05);
+      // Сбрасываем резонанс фильтра, чтобы после заезда на разбитой машине прогазовка звучала чисто
+      this.engineFilter.Q.setTargetAtTime(1.0, now, 0.05);
       this.engineGain.gain.setTargetAtTime(0.045 + speedRatio * 0.04, now, 0.05);
       if (this.damageRattleGain) this.damageRattleGain.gain.setTargetAtTime(0, now, 0.05);
       this.brakeGain.gain.setTargetAtTime(0, now, 0.04);

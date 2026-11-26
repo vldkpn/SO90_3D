@@ -20,12 +20,16 @@ import {
 
 let minimapCacheCanvas = null;
 
+/**
+ * Интерполяция позиции и направления на миникарте по мировой координате Z
+ */
 function getInterpolatedMapPose(worldZ) {
   const seg = findSegment(worldZ);
-  if (!seg) return null;
+  if (!seg || state.trackLength <= 0) return null;
   const segments = state.segments;
   const nextSeg = segments[(seg.index + 1) % segments.length];
-  const t = MathUtil.percentRemaining(((worldZ % state.trackLength) + state.trackLength) % state.trackLength, SEGMENT_LENGTH);
+  const wrappedZ = ((worldZ % state.trackLength) + state.trackLength) % state.trackLength;
+  const t = MathUtil.percentRemaining(wrappedZ, SEGMENT_LENGTH);
   const mapX = MathUtil.lerp(seg.mapX, nextSeg.mapX, t);
   const mapY = MathUtil.lerp(seg.mapY, nextSeg.mapY, t);
   const dAngle = Math.atan2(
@@ -36,6 +40,9 @@ function getInterpolatedMapPose(worldZ) {
   return { mapX, mapY, mapHeading };
 }
 
+/**
+ * Однократная отрисовка статической подложки и контура кольцевой трассы в offscreen-канвас
+ */
 function buildCircuitMinimapCache(boxSize, isCompact) {
   if (!minimapCacheCanvas) {
     minimapCacheCanvas = document.createElement('canvas');
@@ -53,11 +60,12 @@ function buildCircuitMinimapCache(boxSize, isCompact) {
 
   mctx.clearRect(0, 0, boxSize, boxSize);
 
+  // Отступ 1px по периметру предотвращает обрезку внешней половины обводки (lineWidth 1.5) границами offscreen-канваса
   mctx.fillStyle = 'rgba(13, 2, 33, 0.80)';
   mctx.strokeStyle = 'rgba(57, 255, 20, 0.55)';
   mctx.lineWidth = 1.5;
   mctx.beginPath();
-  mctx.roundRect(0, 0, boxSize, boxSize, 12);
+  mctx.roundRect(1, 1, boxSize - 2, boxSize - 2, 11);
   mctx.fill();
   mctx.stroke();
 
@@ -104,9 +112,13 @@ function buildCircuitMinimapCache(boxSize, isCompact) {
   mctx.fillStyle = '#a992d1';
   mctx.font = '800 9px sans-serif';
   mctx.textAlign = 'center';
-  mctx.fillText(`ТРЕК #${state.circuitSeedId}`, boxSize * 0.5, boxSize - 5);
+  mctx.textBaseline = 'alphabetic';
+  mctx.fillText(`ТРЕК #${state.circuitSeedId}`, boxSize * 0.5, boxSize - 6);
 }
 
+/**
+ * Отрисовка миникарты и маркеров гонщиков в кольцевом режиме
+ */
 function renderCircuitMinimap(ctx) {
   if (state.gameMode !== 'circuit' || !state.segments.length) return;
 
@@ -114,7 +126,8 @@ function renderCircuitMinimap(ctx) {
   const isCompact = state.cachedIsTouch || LOGICAL_WIDTH <= 780;
   const boxSize = isCompact ? 126 : 152;
   const boxX = LOGICAL_WIDTH - boxSize - 14;
-  const boxY = isCompact ? 14 : 46;
+  // Увеличенный вертикальный отступ на ПК (54px) исключает наложение кнопки звука поверх миникарты при сжатии окна
+  const boxY = isCompact ? 14 : 54;
   const pad = isCompact ? 16 : 20;
   const mapSize = boxSize - pad * 2;
   const offsetX = boxX + pad;
@@ -170,11 +183,15 @@ function renderCircuitMinimap(ctx) {
   ctx.restore();
 }
 
+/**
+ * Основная отрисовка HUD поверх игровой сцены
+ */
 export function renderHUD(ctx) {
   if (state.gameState !== STATE.PLAYING) return;
 
   const LOGICAL_WIDTH = state.logicalWidth;
   ctx.save();
+  ctx.textBaseline = 'alphabetic';
   const isCompact = state.cachedIsTouch || LOGICAL_WIDTH <= 780;
 
   if (state.gameMode === 'circuit') {
