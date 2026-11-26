@@ -7,14 +7,17 @@ import {
   PLAYER_CENTER_OFFSET_Z,
   INITIAL_TRAFFIC_COUNT
 } from './config.js';
-import { initCanvasPolyfills, formatRaceTime } from './utils.js';
+import { initCanvasPolyfills, MathUtil, formatRaceTime } from './utils.js';
 import { audio } from './audio.js';
 import {
   state,
   initStars,
   loadSavedRecords,
+  loadSettings,
+  saveSettings,
   getBestScoreStorageKey,
   getBestLapStorageKey,
+  getPlayerWorldZ,
   resetRunState,
   showBanner,
   clearSkidMarks,
@@ -29,6 +32,7 @@ import { renderFrame } from './renderer.js';
 initCanvasPolyfills();
 initStars();
 loadSavedRecords();
+loadSettings();
 
 const canvas = document.getElementById('gameCanvas');
 canvas.width = state.logicalWidth;
@@ -38,6 +42,7 @@ const ctx = canvas.getContext('2d');
 const wrapper = document.getElementById('game-wrapper');
 const topBar = document.getElementById('top-bar');
 const startScreen = document.getElementById('start-screen');
+const settingsScreen = document.getElementById('settings-screen');
 const pauseScreen = document.getElementById('pause-screen');
 const gameoverScreen = document.getElementById('gameover-screen');
 const touchControls = document.getElementById('touch-controls');
@@ -80,6 +85,62 @@ function syncSetupButtonsWithConfig() {
   document.querySelectorAll('#difficulty-group .mode-pill').forEach((b) => {
     b.classList.toggle('active', b.dataset.diff === state.difficulty);
   });
+}
+
+function isSettingsOpen() {
+  return Boolean(settingsScreen && !settingsScreen.classList.contains('hidden'));
+}
+
+function syncSettingsUI() {
+  const particlesVal = state.settings.particlesEnabled ? 'on' : 'off';
+  const soundVal = audio.muted ? 'off' : 'on';
+
+  document.querySelectorAll('#settings-particles-group .mode-pill').forEach((b) => {
+    b.classList.toggle('active', b.dataset.particles === particlesVal);
+  });
+  document.querySelectorAll('#settings-light-group .mode-pill').forEach((b) => {
+    b.classList.toggle('active', b.dataset.light === state.settings.lightStyle);
+  });
+  document.querySelectorAll('#settings-sound-group .mode-pill').forEach((b) => {
+    b.classList.toggle('active', b.dataset.sound === soundVal);
+  });
+
+  const label = audio.muted ? '🔇 ЗВУК: ВЫКЛ' : '🔊 ЗВУК: ВКЛ';
+  if (desktopMuteBtn) desktopMuteBtn.textContent = label;
+  if (mobileMuteBtn) mobileMuteBtn.textContent = label;
+}
+
+function setSoundEnabled(enabled, allowAudioInit = true) {
+  state.settings.soundEnabled = Boolean(enabled);
+  const shouldMute = !state.settings.soundEnabled;
+
+  if (audio.muted !== shouldMute) {
+    if (allowAudioInit || shouldMute) {
+      audio.toggleMute();
+    } else {
+      audio.muted = shouldMute;
+    }
+  }
+
+  saveSettings();
+  syncSettingsUI();
+}
+
+function openSettings() {
+  if (state.gameState !== STATE.TITLE || !settingsScreen) return;
+  blurActiveElement();
+  syncSettingsUI();
+  startScreen.classList.add('hidden');
+  settingsScreen.classList.remove('hidden');
+}
+
+function closeSettings() {
+  if (!settingsScreen) return;
+  blurActiveElement();
+  settingsScreen.classList.add('hidden');
+  if (state.gameState === STATE.TITLE) {
+    startScreen.classList.remove('hidden');
+  }
 }
 
 function updateMobileTopBarState() {
@@ -206,6 +267,7 @@ function startGame() {
   state.gameState = STATE.PLAYING;
   lastTimestamp = performance.now();
   startScreen.classList.add('hidden');
+  if (settingsScreen) settingsScreen.classList.add('hidden');
   if (pauseScreen) pauseScreen.classList.add('hidden');
   gameoverScreen.classList.add('hidden');
   touchControls.classList.add('active');
@@ -221,6 +283,15 @@ function startGame() {
 }
 
 function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
+  // Фиксируем положение машины игрока на трассе, чтобы камера проехала мимо и продолжила движение без неё
+  state.stoppedPlayerZ = getPlayerWorldZ();
+  state.stoppedPlayerX = state.playerX;
+  state.stoppedPlayerYaw = MathUtil.clamp(state.steerVisual * 0.22 + state.playerVX * 0.14, -0.34, 0.34);
+  state.playerCarPassedByCamera = false;
+  state.speed = 0;
+  state.playerVX = 0;
+  state.steerVisual = 0;
+
   state.isPaused = false;
   state.isSlipstreaming = false;
   clearInputs();
@@ -335,6 +406,7 @@ function returnToMenu() {
   audio.update(0, false, false, false);
 
   if (pauseScreen) pauseScreen.classList.add('hidden');
+  if (settingsScreen) settingsScreen.classList.add('hidden');
   gameoverScreen.classList.add('hidden');
   startScreen.classList.remove('hidden');
 
@@ -393,6 +465,45 @@ document.getElementById('start-btn').addEventListener('click', (e) => {
   e.currentTarget.blur();
   startGame();
 });
+const settingsBtn = document.getElementById('settings-btn');
+if (settingsBtn) {
+  settingsBtn.addEventListener('click', (e) => {
+    e.currentTarget.blur();
+    openSettings();
+  });
+}
+const settingsBackBtn = document.getElementById('settings-back-btn');
+if (settingsBackBtn) {
+  settingsBackBtn.addEventListener('click', (e) => {
+    e.currentTarget.blur();
+    closeSettings();
+  });
+}
+document.querySelectorAll('#settings-particles-group .mode-pill').forEach((btn) => {
+  btn.addEventListener('click', (e) => {
+    e.currentTarget.blur();
+    state.settings.particlesEnabled = btn.dataset.particles === 'on';
+    if (!state.settings.particlesEnabled) {
+      state.particles = [];
+    }
+    saveSettings();
+    syncSettingsUI();
+  });
+});
+document.querySelectorAll('#settings-light-group .mode-pill').forEach((btn) => {
+  btn.addEventListener('click', (e) => {
+    e.currentTarget.blur();
+    state.settings.lightStyle = btn.dataset.light === 'soft' ? 'soft' : 'hard';
+    saveSettings();
+    syncSettingsUI();
+  });
+});
+document.querySelectorAll('#settings-sound-group .mode-pill').forEach((btn) => {
+  btn.addEventListener('click', (e) => {
+    e.currentTarget.blur();
+    setSoundEnabled(btn.dataset.sound === 'on', true);
+  });
+});
 document.getElementById('restart-btn').addEventListener('click', (e) => {
   e.currentTarget.blur();
   startGame();
@@ -433,10 +544,7 @@ function handleToggleMute(e) {
   if (e && e.currentTarget instanceof HTMLElement) {
     e.currentTarget.blur();
   }
-  const isMuted = audio.toggleMute();
-  const label = isMuted ? '🔇 ЗВУК: ВЫКЛ' : '🔊 ЗВУК: ВКЛ';
-  if (desktopMuteBtn) desktopMuteBtn.textContent = label;
-  if (mobileMuteBtn) mobileMuteBtn.textContent = label;
+  setSoundEnabled(audio.muted, true);
 }
 if (desktopMuteBtn) desktopMuteBtn.addEventListener('click', handleToggleMute);
 if (mobileMuteBtn) mobileMuteBtn.addEventListener('click', handleToggleMute);
@@ -465,7 +573,10 @@ window.addEventListener('keydown', (e) => {
       else pauseGame();
     }
   } else if (code === 'Enter' || code === 'Space') {
-    if (state.gameState === STATE.PLAYING && state.isPaused) {
+    if (isSettingsOpen()) {
+      e.preventDefault();
+      closeSettings();
+    } else if (state.gameState === STATE.PLAYING && state.isPaused) {
       e.preventDefault();
       resumeGame();
     } else if (state.gameState === STATE.TITLE || state.gameState === STATE.GAMEOVER) {
@@ -473,7 +584,10 @@ window.addEventListener('keydown', (e) => {
       startGame();
     }
   } else if (code === 'Escape') {
-    if (state.gameState === STATE.PLAYING) {
+    if (isSettingsOpen()) {
+      e.preventDefault();
+      closeSettings();
+    } else if (state.gameState === STATE.PLAYING) {
       e.preventDefault();
       if (state.isPaused) resumeGame();
       else pauseGame();
@@ -613,7 +727,9 @@ function gameLoop(now) {
 }
 
 // Инициализация при запуске
+audio.muted = !state.settings.soundEnabled;
 syncSetupButtonsWithConfig();
+syncSettingsUI();
 if (state.gameMode === 'circuit') {
   buildCircuitTrack();
   resetCircuitRivals();

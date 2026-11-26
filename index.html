@@ -50,8 +50,15 @@
           </div>
         </div>
 
-        <button id="start-btn" class="arcade-btn" type="button">▶ СТАРТ</button>
+        <div class="start-actions">
+          <button id="start-btn" class="arcade-btn" type="button">▶ СТАРТ</button>
+          <button id="settings-btn" class="secondary-btn" type="button">⚙ НАСТРОЙКИ</button>
+        </div>
         <div class="blink-hint">НАЖМИТЕ ENTER ИЛИ ПРОБЕЛ</div>
+
+        <!-- Метка версии размещена до .controls-panel, чтобы сохранить центрирование :last-child -->
+        <div id="game-version" class="game-version" aria-label="Версия игры">v1.1</div>
+
         <div class="controls-panel">
           <div><span class="key-cap">W</span><span class="key-cap">↑</span> Газ</div>
           <div><span class="key-cap">S</span><span class="key-cap">↓</span> Тормоз / Задний ход</div>
@@ -59,6 +66,39 @@
           <div><span class="key-cap">ESC</span><span class="key-cap">P</span> Пауза</div>
           <div><span class="key-cap">M</span> Звук</div>
         </div>
+      </div>
+
+      <!-- Экран настроек -->
+      <div id="settings-screen" class="overlay hidden">
+        <div class="game-badge">ПАРАМЕТРЫ ГРАФИКИ И ЗВУКА</div>
+        <h2 class="game-title">НАСТРОЙКИ</h2>
+        <div class="setup-panel settings-panel">
+          <div class="setup-row">
+            <span class="setup-label">Дым и частицы</span>
+            <div class="setup-options" id="settings-particles-group">
+              <button type="button" class="mode-pill active" data-particles="on">ВКЛ</button>
+              <button type="button" class="mode-pill" data-particles="off">ВЫКЛ</button>
+            </div>
+          </div>
+          <div class="setup-row">
+            <span class="setup-label">Свет и ореолы</span>
+            <div class="setup-options" id="settings-light-group">
+              <button type="button" class="mode-pill active" data-light="hard">ЖЁСТКИЙ</button>
+              <button type="button" class="mode-pill" data-light="soft">МЯГКИЙ</button>
+            </div>
+          </div>
+          <div class="setup-row">
+            <span class="setup-label">Звук</span>
+            <div class="setup-options" id="settings-sound-group">
+              <button type="button" class="mode-pill active" data-sound="on">ВКЛ</button>
+              <button type="button" class="mode-pill" data-sound="off">ВЫКЛ</button>
+            </div>
+          </div>
+        </div>
+        <div class="gameover-actions">
+          <button id="settings-back-btn" class="arcade-btn" type="button">◀ НАЗАД</button>
+        </div>
+        <div class="blink-hint">ESC / ENTER — НАЗАД В МЕНЮ</div>
       </div>
 
       <!-- Экран паузы -->

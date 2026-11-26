@@ -48,6 +48,13 @@ export const state = {
   animClockMs: 0,
   frameCounter: 0,
 
+  // Пользовательские настройки (графика и звук)
+  settings: {
+    particlesEnabled: GAME_CONFIG.settings.particlesEnabled,
+    lightStyle: GAME_CONFIG.settings.lightStyle,
+    soundEnabled: GAME_CONFIG.settings.soundEnabled
+  },
+
   // Мир и сущности
   segments: [],
   trackLength: 0,
@@ -83,6 +90,11 @@ export const state = {
   playerVX: 0,
   speed: 0,
   steerVisual: 0,
+  // Мировые координаты машины игрока на момент завершения заезда (камера продолжает путь без неё)
+  stoppedPlayerZ: 0,
+  stoppedPlayerX: 0,
+  stoppedPlayerYaw: 0,
+  playerCarPassedByCamera: false,
   timeLeft: GAME_CONFIG.gameplay.initialTimeSec,
   score: 0,
   bestScore: 0,
@@ -128,6 +140,8 @@ export const state = {
   leftDamage: 0,
   rightDamage: 0,
   rearDamage: 0,
+  // Зафиксированная сторона повреждения спойлера (0 — целый, -1 — левая, 1 — правая)
+  spoilerDamageSide: 0,
   engineMisfireTimer: 0,
   engineMisfireCooldown: 0,
   engineHeat: 0,
@@ -206,6 +220,29 @@ export function loadSavedRecords() {
   } catch (e) {
     state.bestLapRecordKmh = null;
   }
+}
+
+export function loadSettings() {
+  try {
+    const raw = localStorage.getItem(GAME_CONFIG.storage.settingsKey);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.particlesEnabled === 'boolean') {
+      state.settings.particlesEnabled = parsed.particlesEnabled;
+    }
+    if (parsed.lightStyle === 'hard' || parsed.lightStyle === 'soft') {
+      state.settings.lightStyle = parsed.lightStyle;
+    }
+    if (typeof parsed.soundEnabled === 'boolean') {
+      state.settings.soundEnabled = parsed.soundEnabled;
+    }
+  } catch (e) {}
+}
+
+export function saveSettings() {
+  try {
+    localStorage.setItem(GAME_CONFIG.storage.settingsKey, JSON.stringify(state.settings));
+  } catch (e) {}
 }
 
 export function isOncomingBonusActive() {
@@ -289,6 +326,7 @@ export function spawnParticles(
   gravity = 260,
   expandRate = 0
 ) {
+  if (!state.settings.particlesEnabled) return;
   for (let i = 0; i < count; i++) {
     state.particles.push({
       x: x + (Math.random() - 0.5) * 18,
@@ -314,6 +352,10 @@ export function resetRunState() {
   state.playerVX = 0;
   state.speed = 0;
   state.steerVisual = 0;
+  state.stoppedPlayerZ = 0;
+  state.stoppedPlayerX = 0;
+  state.stoppedPlayerYaw = 0;
+  state.playerCarPassedByCamera = false;
 
   state.cameraPitch = 0;
   state.cameraLagX = 0;
@@ -351,6 +393,7 @@ export function resetRunState() {
   state.leftDamage = 0;
   state.rightDamage = 0;
   state.rearDamage = 0;
+  state.spoilerDamageSide = 0;
   state.engineMisfireTimer = 0;
   state.engineMisfireCooldown = 0;
   state.engineHeat = 0;

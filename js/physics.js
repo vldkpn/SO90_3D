@@ -128,8 +128,25 @@ function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗ�
     state.speed = cappedSpeed;
   }
 
+  // Однократная фиксация стороны повреждения спойлера (после изгиба/отлома сторона больше не меняется)
+  const lockSpoilerSide = () => {
+    if (state.spoilerDamageSide !== 0) return;
+    if (side === 'left') {
+      state.spoilerDamageSide = -1;
+    } else if (side === 'right') {
+      state.spoilerDamageSide = 1;
+    } else if (state.leftDamage !== state.rightDamage) {
+      state.spoilerDamageSide = state.leftDamage > state.rightDamage ? -1 : 1;
+    } else {
+      state.spoilerDamageSide = Math.random() < 0.5 ? -1 : 1;
+    }
+  };
+
   if (state.difficulty !== 'hardcore') {
     state.visualDamage = Math.min(4, Math.max(state.visualDamage, Math.ceil(state.collisionCount * 0.85)));
+    if (state.visualDamage >= 2) {
+      lockSpoilerSide();
+    }
     if (applyCollisionTimePenalty(COLLISION_TIME_PENALTY)) return true;
     const engineWarn = state.visualDamage >= 3 ? ' • ДВИГАТЕЛЬ ПОВРЕЖДЁН!' : '';
     showBanner(
@@ -142,6 +159,9 @@ function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗ�
 
   state.collisionsLeft = Math.max(0, state.collisionsLeft - dmg);
   state.visualDamage = MAX_HARDCORE_COLLISIONS - state.collisionsLeft;
+  if (state.visualDamage >= 2) {
+    lockSpoilerSide();
+  }
   if (state.collisionsLeft <= 0) {
     state.leftDamage = 3;
     state.rightDamage = 3;
@@ -255,6 +275,10 @@ export function updateSimulation(dt) {
     }
 
     state.position = (state.position + MAX_SPEED * 0.26 * dt) % trackLength;
+    if (state.gameState === STATE.GAMEOVER) {
+      // Камера плавно возвращается к центру трассы, пока машина игрока остаётся стоять на месте
+      state.playerX = MathUtil.lerp(state.playerX, 0, Math.min(1, dt * 1.4));
+    }
     const demoSeg = findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z);
     if (demoSeg) {
       state.skyOffset = (state.skyOffset + demoSeg.curve * 0.0018) % 1;

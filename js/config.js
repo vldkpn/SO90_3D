@@ -116,9 +116,16 @@ export const GAME_CONFIG = {
     tireSmokeMinKmh: 50
   },
 
+  settings: {
+    particlesEnabled: true,
+    lightStyle: 'hard',
+    soundEnabled: true
+  },
+
   storage: {
     bestScoreKey: 'sunset_overdrive_best',
-    bestLapSpeedKey: 'sunset_overdrive_best_lap_kmh'
+    bestLapSpeedKey: 'sunset_overdrive_best_lap_kmh',
+    settingsKey: 'sunset_overdrive_settings'
   }
 };
 

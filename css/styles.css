@@ -121,7 +121,7 @@ canvas {
   z-index: 5;
 }
 
-/* Кнопка переключения звука в углу на ПК (без backdrop-filter для стабильных 60 FPS поверх canvas) */
+/* Кнопка переключения звука в углу на ПК (без backdrop-filter ради стабильных 60 FPS) */
 #desktop-mute-btn {
   position: absolute;
   top: 10px;
@@ -136,12 +136,11 @@ canvas {
   font-weight: 800;
   letter-spacing: 0.5px;
   cursor: pointer;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
   transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 
 #desktop-mute-btn:hover {
-  background: rgba(0, 240, 255, 0.22);
+  background: rgba(0, 240, 255, 0.18);
   box-shadow: 0 0 14px rgba(0, 240, 255, 0.45);
   transform: translateY(-1px);
 }
@@ -151,7 +150,7 @@ canvas {
 }
 
 /* ==========================================================================
-   ЭКРАННЫЕ ОВЕРЛЕИ (СТАРТ, ПАУЗА И GAME OVER)
+   ЭКРАННЫЕ ОВЕРЛЕИ (СТАРТ, НАСТРОЙКИ, ПАУЗА И GAME OVER)
    ========================================================================== */
 .overlay {
   position: absolute;
@@ -220,7 +219,7 @@ canvas {
   text-shadow: 0 2px 6px rgba(0, 0, 0, 0.85);
 }
 
-/* Селекторы режима трассы и уровня сложности */
+/* Селекторы режима трассы, сложности и настроек */
 .setup-panel {
   display: flex;
   flex-direction: column;
@@ -228,6 +227,10 @@ canvas {
   margin-bottom: 16px;
   width: 100%;
   max-width: 630px;
+}
+
+.settings-panel {
+  max-width: 520px;
 }
 
 .setup-row {
@@ -380,10 +383,12 @@ canvas {
     0 4px 14px rgba(255, 42, 133, 0.6);
 }
 
+.start-actions,
 .gameover-actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
+  align-items: center;
   gap: 12px;
 }
 
@@ -437,6 +442,19 @@ canvas {
 @keyframes blinkAnim {
   from { opacity: 0.45; }
   to { opacity: 1; }
+}
+
+/* Метка версии в правом нижнем углу главного меню */
+.game-version {
+  position: absolute;
+  right: 14px;
+  bottom: 10px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+  color: rgba(184, 163, 224, 0.72);
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.35);
+  pointer-events: none;
 }
 
 .controls-panel {
@@ -610,6 +628,11 @@ canvas {
   .blink-hint {
     display: none;
   }
+  .game-version {
+    right: 8px;
+    bottom: 6px;
+    font-size: 9.5px;
+  }
   .setup-panel {
     gap: 4px;
     margin-bottom: 6px;
@@ -640,6 +663,10 @@ canvas {
     padding: 7px 16px;
     font-size: 12px;
     border-radius: 10px;
+  }
+  .start-actions,
+  .gameover-actions {
+    gap: 8px;
   }
   .stats-grid {
     gap: 5px;
