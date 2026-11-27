@@ -195,11 +195,19 @@ const _trafficCarOpts = {
   rightLightBroken: false,
   leftLightFlicker: false,
   rightLightFlicker: false,
+  brokenStopSide: -1,
+  leftRevBroken: false,
+  rightRevBroken: false,
+  leftRevCracked: false,
+  rightRevCracked: false,
   visualDamageLevel: 0,
   leftDamageLevel: 0,
   rightDamageLevel: 0,
   rearDamageLevel: 0,
+  frontDamageLevel: 0,
   spoilerDamageSide: 0,
+  spoilerStage: 0,
+  onAfterHood: null,
   showExhaustFlame: false,
   isSlipstreamingFlame: false,
   showBackfireFlame: false
@@ -756,17 +764,9 @@ function renderNearGlassAndDeck(ctx, C, opts, isSilhouetteLod) {
     if (opts.isPlayer && opts.visualDamageLevel >= 1 && C.wNear > 24) {
       const deckY0 = s0.cy - s0.h * BODY_SHOULDER;
       const deckY1 = sCR.cy - sCR.h * BODY_SHOULDER;
-
-      if (opts.visualDamageLevel >= 3) {
-        const sootGrad = ctx.createLinearGradient(0, deckY1, 0, deckY0);
-        sootGrad.addColorStop(0.0, 'rgba(12, 8, 20, 0.55)');
-        sootGrad.addColorStop(1.0, 'rgba(12, 8, 20, 0.14)');
-        fillQuad(ctx, s0.cx - s0.w * 0.28, deckY0, s0.cx + s0.w * 0.28, deckY0, sCR.cx + sCR.w * 0.26, deckY1, sCR.cx - sCR.w * 0.26, deckY1, sootGrad);
-      }
-
       const deckMidY = MathUtil.lerp(deckY0, deckY1, 0.52);
 
-      if (opts.visualDamageLevel >= 2 || opts.rearDamageLevel >= 1) {
+      if (opts.rearDamageLevel >= 1) {
         const dentSide = opts.spoilerDamageSide !== 0
           ? opts.spoilerDamageSide
           : (opts.leftDamageLevel >= opts.rightDamageLevel ? -1 : 1);
@@ -822,7 +822,10 @@ function drawWingEndplate(ctx, w0, wingH, primary, rearXPos, rearTopYPos, frontX
 }
 
 /**
- * Отрисовка заднего антикрыла игрока и соперников (включая состояния погнутого и оторванного спойлера)
+ * Отрисовка заднего антикрыла игрока и соперников:
+ * стадия 0 — целое; стадия 1 — погнуто на сторону удара;
+ * стадия 2 — сломанная половина полностью отлетела (остаётся вторая половина на целой стойке);
+ * стадия 3 — при следующем ударе отлетает и вторая половина (остаются только обломки креплений).
  */
 function renderCarSpoiler(ctx, C, opts, trunkLipY) {
   const s0 = C.s0;
@@ -833,8 +836,41 @@ function renderCarSpoiler(ctx, C, opts, trunkLipY) {
   const trunkRearY = trunkLipY;
   const trunkFrontY = sWingFront.cy - sWingFront.h * BODY_SHOULDER;
   const lipThickness = Math.max(1.5, s0.h * 0.045);
+  const spoilerStage = opts.isPlayer ? (opts.spoilerStage || 0) : 0;
 
-  if (opts.isPlayer && (opts.visualDamageLevel >= 4 || opts.isTotalWreck)) {
+  if (spoilerStage >= 3) {
+    // Обе половины спойлера полностью оторваны — на крышке багажника остаются лишь короткие обломки стоек
+    if (w0 < 12) return;
+    const breakLeft = opts.spoilerDamageSide !== 0
+      ? opts.spoilerDamageSide < 0
+      : (opts.leftDamageLevel >= opts.rightDamageLevel);
+
+    const leftStubX = s0.cx - w0 * 0.30;
+    const rightStubX = s0.cx + w0 * 0.30;
+    const leftStubTopY = trunkRearY - wingH * (breakLeft ? 0.22 : 0.30);
+    const rightStubTopY = trunkRearY - wingH * (breakLeft ? 0.30 : 0.22);
+    const leftTipX = leftStubX - strutW * 0.55;
+    const rightTipX = rightStubX + strutW * 0.45;
+
+    ctx.strokeStyle = '#140326';
+    ctx.lineWidth = Math.min(strutW, 10);
+    ctx.beginPath();
+    ctx.moveTo(leftStubX, trunkRearY);
+    ctx.lineTo(leftTipX, leftStubTopY);
+    ctx.moveTo(rightStubX, trunkRearY);
+    ctx.lineTo(rightTipX, rightStubTopY);
+    ctx.stroke();
+
+    if (w0 >= 18) {
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillRect(leftTipX - strutW * 0.5, leftStubTopY - 1, strutW, 1.8);
+      ctx.fillRect(rightTipX - strutW * 0.5, rightStubTopY - 1, strutW, 1.8);
+    }
+    return;
+  }
+
+  if (spoilerStage === 2) {
+    // Сломанная половина полностью отвалилась; оставшаяся половина прочно держится на своей целой стойке
     const breakLeft = opts.spoilerDamageSide !== 0
       ? opts.spoilerDamageSide < 0
       : (opts.leftDamageLevel >= opts.rightDamageLevel);
@@ -842,59 +878,60 @@ function renderCarSpoiler(ctx, C, opts, trunkLipY) {
     const iSign = -bSign;
 
     const stubX = s0.cx + bSign * w0 * 0.30;
-    const stubTopY = trunkRearY - wingH * 0.38;
+    const stubTopY = trunkRearY - wingH * 0.32;
+    const stubTipX = stubX + bSign * strutW * 0.65;
     ctx.strokeStyle = '#140326';
     ctx.lineWidth = Math.min(strutW, 10);
     ctx.beginPath();
     ctx.moveTo(stubX, trunkRearY);
-    ctx.lineTo(stubX + bSign * strutW * 0.7, stubTopY);
+    ctx.lineTo(stubTipX, stubTopY);
     ctx.stroke();
-    ctx.fillStyle = '#cbd5e1';
-    ctx.fillRect(stubX + bSign * strutW * 0.7 - strutW * 0.5, stubTopY - 1, strutW, 2);
+    if (w0 >= 18) {
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillRect(stubTipX - strutW * 0.5, stubTopY - 1, strutW, 1.8);
+    }
 
     const intactStrutX = s0.cx + iSign * w0 * 0.30;
-    const intactTopY = trunkRearY - wingH;
-    const intactFrontTopY = trunkFrontY - wingH * 0.85;
-    ctx.fillStyle = '#140326';
-    ctx.fillRect(intactStrutX - strutW * 0.5, intactTopY, strutW, wingH);
+    const outerRearY = trunkRearY - wingH;
+    const innerRearY = outerRearY + wingH * 0.06;
+    const outerFrontY = trunkFrontY - wingH * 0.85;
+    const innerFrontY = outerFrontY + wingH * 0.06;
 
-    const innerFrac = -bSign * 0.03;
+    ctx.fillStyle = '#140326';
+    ctx.fillRect(intactStrutX - strutW * 0.5, outerRearY, strutW, wingH);
+
+    const innerFrac = -bSign * 0.02;
     const outerFrac = iSign * 0.43;
     const xInnerRear = s0.cx + w0 * innerFrac;
     const xOuterRear = s0.cx + w0 * outerFrac;
     const xInnerFront = sWingFront.cx + sWingFront.w * (innerFrac * 0.95);
     const xOuterFront = sWingFront.cx + sWingFront.w * (outerFrac * 0.95);
-    const xMidBreak = (xInnerRear + xInnerFront) * 0.5 - bSign * w0 * 0.035;
-    const yMidBreak = (intactTopY + intactFrontTopY) * 0.5;
+    const xMidBreak = (xInnerRear + xInnerFront) * 0.5 - bSign * w0 * 0.032;
+    const yMidBreak = (innerRearY + innerFrontY) * 0.5;
 
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
-    ctx.moveTo(xInnerRear, intactTopY);
-    ctx.lineTo(xOuterRear, intactTopY);
-    ctx.lineTo(xOuterFront, intactFrontTopY);
-    ctx.lineTo(xInnerFront, intactFrontTopY);
+    ctx.moveTo(xInnerRear, innerRearY);
+    ctx.lineTo(xOuterRear, outerRearY);
+    ctx.lineTo(xOuterFront, outerFrontY);
+    ctx.lineTo(xInnerFront, innerFrontY);
     ctx.lineTo(xMidBreak, yMidBreak);
     ctx.closePath();
     ctx.fill();
 
-    ctx.fillStyle = '#140326';
-    ctx.fillRect(Math.min(xInnerRear, xOuterRear), intactTopY, Math.abs(xOuterRear - xInnerRear), lipThickness);
-    drawWingEndplate(ctx, w0, wingH, opts.primary, xOuterRear, intactTopY, xOuterFront, intactFrontTopY, 1);
-
-    const hangPivotX = s0.cx + bSign * w0 * 0.13;
-    const hangPivotY = trunkRearY - wingH * 0.22;
-    const hangTipX = s0.cx + bSign * w0 * 0.47;
-    const hangTipY = trunkRearY + wingH * 0.92;
-    const chordX = -bSign * w0 * 0.045;
-    const chordY = -wingH * 0.46;
-
-    fillQuad(ctx, hangPivotX, hangPivotY, hangTipX, hangTipY, hangTipX, hangTipY + lipThickness * 1.15, hangPivotX, hangPivotY + lipThickness * 1.15, '#140326');
-    fillQuad(ctx, hangPivotX, hangPivotY, hangTipX, hangTipY, hangTipX + chordX, hangTipY + chordY, hangPivotX + chordX, hangPivotY + chordY, '#e2e8f0');
-    drawWingEndplate(ctx, w0, wingH, opts.primary, hangTipX, hangTipY, hangTipX + chordX, hangTipY + chordY, 0.85);
+    fillQuad(
+      ctx,
+      xInnerRear, innerRearY,
+      xOuterRear, outerRearY,
+      xOuterRear, outerRearY + lipThickness,
+      xInnerRear, innerRearY + lipThickness,
+      '#140326'
+    );
+    drawWingEndplate(ctx, w0, wingH, opts.primary, xOuterRear, outerRearY, xOuterFront, outerFrontY, 1);
     return;
   }
 
-  if (opts.isPlayer && opts.visualDamageLevel >= 2) {
+  if (spoilerStage === 1) {
     const bendLeft = opts.spoilerDamageSide !== 0
       ? opts.spoilerDamageSide < 0
       : (opts.leftDamageLevel >= opts.rightDamageLevel);
@@ -940,11 +977,29 @@ function renderCarSpoiler(ctx, C, opts, trunkLipY) {
   drawWingEndplate(ctx, w0, wingH, opts.primary, s0.cx + w0 * 0.43, wingTopY, sWingFront.cx + sWingFront.w * 0.41, wingFrontTopY, 1);
 }
 
-function drawBrokenTaillight(ctx, lx, ly, lightW, lightH, wNear, isLeft) {
+/**
+ * Детерминированное нестабильное мерцание выжившей нити накала в разбитом фонаре (от animClockMs).
+ * Чередует короткие провалы контакта (0) с тусклым дребезжащим свечением (0.24..0.60).
+ */
+function computeBrokenBulbFlicker(clockMs, phaseOffset) {
+  const t = clockMs * 0.001 + phaseOffset;
+  const wave =
+    Math.sin(t * 17.3) * 0.34 +
+    Math.sin(t * 37.9 + 1.1) * 0.32 +
+    Math.sin(t * 58.7 + 2.4) * 0.22 +
+    Math.sin(t * 7.1 + 0.5) * 0.12;
+  if (wave < -0.08) return 0;
+  return MathUtil.clamp(0.24 + (wave + 0.08) * 0.38, 0.24, 0.60);
+}
+
+/**
+ * Отрисовка разбитого плафона стоп-сигнала с осколками рассеивателя и опциональным тусклым накалом внутри
+ */
+function drawBrokenTaillight(ctx, lx, ly, lightW, lightH, wNear, isLeft, dimGlow = 0) {
   ctx.fillStyle = '#18040b';
   ctx.fillRect(lx, ly, lightW, lightH);
-  if (wNear >= 24) {
-    ctx.fillStyle = '#5c0a20';
+  if (wNear >= 20) {
+    ctx.fillStyle = dimGlow > 0.01 ? '#730e29' : '#5c0a20';
     ctx.beginPath();
     if (isLeft) {
       ctx.moveTo(lx + lightW, ly);
@@ -968,6 +1023,109 @@ function drawBrokenTaillight(ctx, lx, ly, lightW, lightH, wNear, isLeft) {
       lightH * 0.48
     );
   }
+
+  // Тусклое нестабильное свечение оголённой лампы внутри разбитого корпуса при торможении или остановке
+  if (dimGlow > 0.01) {
+    const prevAlpha = ctx.globalAlpha;
+    ctx.globalAlpha = prevAlpha * dimGlow;
+    ctx.fillStyle = '#b81d42';
+    ctx.fillRect(lx + lightW * 0.18, ly + lightH * 0.18, lightW * 0.64, lightH * 0.64);
+    ctx.fillStyle = '#ff8fa3';
+    const bulbX = lx + (isLeft ? lightW * 0.42 : lightW * 0.34);
+    ctx.fillRect(bulbX, ly + lightH * 0.30, lightW * 0.24, lightH * 0.40);
+    ctx.globalAlpha = prevAlpha;
+  }
+}
+
+/**
+ * Отрисовка фонаря заднего хода игрока (целого, треснувшего или полностью разбитого с тусклым миганием)
+ */
+function drawPlayerReverseLight(
+  ctx,
+  rx,
+  ry,
+  revW,
+  revH,
+  wNear,
+  isLeft,
+  isReversing,
+  isBroken,
+  isCracked,
+  isTotalWreck,
+  brokenGlow,
+  crackedLit
+) {
+  if (isBroken) {
+    // Разбитая ниша фонаря заднего хода с остатками дымчатого стекла по краям
+    ctx.fillStyle = '#130e1d';
+    ctx.fillRect(rx, ry, revW, revH);
+
+    if (wNear >= 20) {
+      ctx.fillStyle = brokenGlow > 0.01 ? '#574a6b' : '#3d334d';
+      ctx.beginPath();
+      if (isLeft) {
+        ctx.moveTo(rx, ry);
+        ctx.lineTo(rx + revW * 0.46, ry);
+        ctx.lineTo(rx + revW * 0.22, ry + revH);
+        ctx.lineTo(rx, ry + revH);
+      } else {
+        ctx.moveTo(rx + revW, ry);
+        ctx.lineTo(rx + revW * 0.54, ry);
+        ctx.lineTo(rx + revW * 0.78, ry + revH);
+        ctx.lineTo(rx + revW, ry + revH);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = 'rgba(205, 222, 240, 0.26)';
+      ctx.fillRect(
+        rx + (isLeft ? revW * 0.58 : revW * 0.18),
+        ry + revH * 0.22,
+        revW * 0.22,
+        revH * 0.46
+      );
+    }
+
+    // При включении заднего хода в разбитом фонаре тускло и нестабильно мигает уцелевшая лампа
+    if (isReversing && brokenGlow > 0.01) {
+      const prevAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = prevAlpha * brokenGlow;
+      ctx.fillStyle = '#9fb3c8';
+      ctx.fillRect(rx + revW * 0.16, ry + revH * 0.18, revW * 0.68, revH * 0.64);
+      ctx.fillStyle = '#eef7ff';
+      ctx.fillRect(rx + revW * 0.34, ry + revH * 0.28, revW * 0.32, revH * 0.44);
+      ctx.globalAlpha = prevAlpha;
+    }
+    return;
+  }
+
+  if (isCracked) {
+    // Надтреснутый рассеиватель: работает ярко, но с редкими просадками и видимой диагональной трещиной
+    ctx.fillStyle = isReversing
+      ? (crackedLit ? '#e2f1f8' : '#4a3d59')
+      : (isTotalWreck ? '#241e2e' : '#332740');
+    ctx.fillRect(rx, ry, revW, revH);
+
+    if (wNear >= 20) {
+      ctx.strokeStyle = isReversing && crackedLit ? 'rgba(30, 18, 46, 0.68)' : 'rgba(18, 8, 30, 0.85)';
+      ctx.lineWidth = MathUtil.clamp(revH * 0.14, 0.9, 1.8);
+      ctx.beginPath();
+      if (isLeft) {
+        ctx.moveTo(rx + revW * 0.18, ry);
+        ctx.lineTo(rx + revW * 0.56, ry + revH * 0.55);
+        ctx.lineTo(rx + revW * 0.82, ry + revH);
+      } else {
+        ctx.moveTo(rx + revW * 0.82, ry);
+        ctx.lineTo(rx + revW * 0.44, ry + revH * 0.55);
+        ctx.lineTo(rx + revW * 0.18, ry + revH);
+      }
+      ctx.stroke();
+    }
+    return;
+  }
+
+  ctx.fillStyle = isReversing ? '#ffffff' : (isTotalWreck ? '#262030' : '#3a2d47');
+  ctx.fillRect(rx, ry, revW, revH);
 }
 
 function drawIntegratedTurnLensBase(ctx, w0, lensX, lensY, lensW, lensH, isLit) {
@@ -1022,6 +1180,43 @@ function renderCarNearPanel(ctx, C, opts, isSilhouetteLod) {
     ctx.stroke();
   }
 
+  // Утопленная тёмная рамка-панель на багажнике игрока вокруг задних стоп-сигналов и огней заднего хода (в стиле Testarossa '90)
+  if (opts.isPlayer) {
+    const panelHalfW = w0 * 0.422;
+    const panelX = s0.cx - panelHalfW;
+    const panelW = panelHalfW * 2;
+    const panelPadY = s0.h * 0.021;
+    const panelY = (s0.cy - s0.h * 0.535) - panelPadY;
+    const panelH = s0.h * 0.12 + panelPadY * 2;
+
+    ctx.fillStyle = opts.isTotalWreck ? '#16040e' : '#240514';
+    ctx.fillRect(panelX, panelY, panelW, panelH);
+
+    if (w0 >= 14) {
+      ctx.strokeStyle = '#11020b';
+      ctx.lineWidth = MathUtil.clamp(s0.h * 0.018, 0.9, 2.4);
+      ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+      if (w0 >= 20) {
+        // Тонкий нижний блик кромки ниши придаёт панели объём на фоне окрашенного кузова
+        ctx.strokeStyle = 'rgba(255, 115, 168, 0.25)';
+        ctx.lineWidth = MathUtil.clamp(s0.h * 0.013, 0.8, 1.8);
+        ctx.beginPath();
+        ctx.moveTo(panelX, panelY + panelH + 0.6);
+        ctx.lineTo(panelX + panelW, panelY + panelH + 0.6);
+        ctx.stroke();
+
+        // Внутренние перегородки секций между стоп-сигналами, лампами заднего хода и центральной вставкой
+        const sepW = Math.max(0.9, w0 * 0.006);
+        ctx.fillStyle = '#12020a';
+        ctx.fillRect(s0.cx - w0 * 0.2325 - sepW * 0.5, panelY + 1, sepW, panelH - 2);
+        ctx.fillRect(s0.cx + w0 * 0.2325 - sepW * 0.5, panelY + 1, sepW, panelH - 2);
+        ctx.fillRect(s0.cx - w0 * 0.132 - sepW * 0.5, panelY + 1, sepW, panelH - 2);
+        ctx.fillRect(s0.cx + w0 * 0.132 - sepW * 0.5, panelY + 1, sepW, panelH - 2);
+      }
+    }
+  }
+
   // Визуализация вмятин и потертостей задней панели автомобиля игрока
   if (opts.isPlayer && (opts.visualDamageLevel >= 1 || opts.rearDamageLevel >= 1) && C.wNear >= 20) {
     const seamSide = opts.spoilerDamageSide !== 0
@@ -1055,17 +1250,6 @@ function renderCarNearPanel(ctx, C, opts, isSilhouetteLod) {
       ctx.moveTo(dPeakX, dPeakY);
       ctx.lineTo(seamSide < 0 ? dLeftX : dRightX, dTopY);
       ctx.stroke();
-    }
-
-    if (opts.visualDamageLevel >= 3) {
-      fillQuad(
-        ctx,
-        s0.cx - w0 * 0.22, s0.cy - s0.h * 0.57,
-        s0.cx + w0 * 0.22, s0.cy - s0.h * 0.57,
-        s0.cx + w0 * 0.18, s0.cy - s0.h * 0.36,
-        s0.cx - w0 * 0.18, s0.cy - s0.h * 0.36,
-        'rgba(12, 6, 18, 0.28)'
-      );
     }
 
     for (let sideIdx = 0; sideIdx < 2; sideIdx++) {
@@ -1217,6 +1401,15 @@ function renderCarNearPanel(ctx, C, opts, isSilhouetteLod) {
 
   const leftTailLit = !opts.leftLightBroken && !opts.leftLightFlicker;
   const rightTailLit = !opts.rightLightBroken && !opts.rightLightFlicker;
+  // Выживший разбитый стоп-сигнал нестабильно и тускло мигает при торможении и полной остановке
+  const leftBrokenBrakeGlow =
+    opts.isPlayer && opts.braking && opts.leftLightBroken && opts.brokenStopSide < 0
+      ? computeBrokenBulbFlicker(state.animClockMs, 0.0)
+      : 0;
+  const rightBrokenBrakeGlow =
+    opts.isPlayer && opts.braking && opts.rightLightBroken && opts.brokenStopSide > 0
+      ? computeBrokenBulbFlicker(state.animClockMs, 1.35)
+      : 0;
   let leftTurnLit = false;
   let rightTurnLit = false;
 
@@ -1249,14 +1442,14 @@ function renderCarNearPanel(ctx, C, opts, isSilhouetteLod) {
     ctx.fillRect(rightLightX, rightLightY, lightW, lightH);
   } else {
     if (opts.leftLightBroken) {
-      drawBrokenTaillight(ctx, leftLightX, leftLightY, lightW, lightH, C.wNear, true);
+      drawBrokenTaillight(ctx, leftLightX, leftLightY, lightW, lightH, C.wNear, true, leftBrokenBrakeGlow);
     } else {
       ctx.fillStyle = leftTailLit && opts.braking ? '#ff4d6d' : (leftTailLit ? '#9e0b28' : '#3d0815');
       ctx.fillRect(leftLightX, leftLightY, lightW, lightH);
     }
 
     if (opts.rightLightBroken) {
-      drawBrokenTaillight(ctx, rightLightX, rightLightY, lightW, lightH, C.wNear, false);
+      drawBrokenTaillight(ctx, rightLightX, rightLightY, lightW, lightH, C.wNear, false, rightBrokenBrakeGlow);
     } else {
       ctx.fillStyle = rightTailLit && opts.braking ? '#ff4d6d' : (rightTailLit ? '#9e0b28' : '#3d0815');
       ctx.fillRect(rightLightX, rightLightY, lightW, lightH);
@@ -1270,10 +1463,48 @@ function renderCarNearPanel(ctx, C, opts, isSilhouetteLod) {
   const leftRevY = leftLightY + (lightH - revH) * 0.5;
   const rightRevY = rightLightY + (lightH - revH) * 0.5;
 
+  const revFlickerTick = Math.floor(state.animClockMs / 90);
+  const leftRevCrackedLit = !opts.leftRevCracked || (revFlickerTick % 6 !== 0);
+  const rightRevCrackedLit = !opts.rightRevCracked || ((revFlickerTick + 3) % 7 !== 0);
+  // В полностью разбитом состоянии оба сигнала заднего хода работают с независимым тусклым дребезжанием
+  const leftRevBrokenGlow = (opts.isPlayer && opts.reversing && opts.leftRevBroken)
+    ? computeBrokenBulbFlicker(state.animClockMs, 0.65)
+    : 0;
+  const rightRevBrokenGlow = (opts.isPlayer && opts.reversing && opts.rightRevBroken)
+    ? computeBrokenBulbFlicker(state.animClockMs, 2.55)
+    : 0;
+
   if (opts.isPlayer) {
-    ctx.fillStyle = opts.reversing ? '#ffffff' : (opts.isTotalWreck ? '#262030' : '#3a2d47');
-    ctx.fillRect(leftRevX, leftRevY, revW, revH);
-    ctx.fillRect(rightRevX, rightRevY, revW, revH);
+    drawPlayerReverseLight(
+      ctx,
+      leftRevX,
+      leftRevY,
+      revW,
+      revH,
+      C.wNear,
+      true,
+      opts.reversing,
+      opts.leftRevBroken,
+      opts.leftRevCracked,
+      opts.isTotalWreck,
+      leftRevBrokenGlow,
+      leftRevCrackedLit
+    );
+    drawPlayerReverseLight(
+      ctx,
+      rightRevX,
+      rightRevY,
+      revW,
+      revH,
+      C.wNear,
+      false,
+      opts.reversing,
+      opts.rightRevBroken,
+      opts.rightRevCracked,
+      opts.isTotalWreck,
+      rightRevBrokenGlow,
+      rightRevCrackedLit
+    );
 
     const plateW = w0 * 0.19;
     const plateH = s0.h * 0.12;
@@ -1417,22 +1648,78 @@ function renderCarNearPanel(ctx, C, opts, isSilhouetteLod) {
     }
   } else {
     const brakeHaloFade = MathUtil.clamp((w0 - 4.0) / 14, 0, 1);
-    if (opts.braking && brakeHaloFade > 0.01 && (leftTailLit || rightTailLit)) {
+    if (
+      opts.braking &&
+      brakeHaloFade > 0.01 &&
+      (leftTailLit || rightTailLit || leftBrokenBrakeGlow > 0.01 || rightBrokenBrakeGlow > 0.01)
+    ) {
       const hardBrakeR = lightW * (opts.isPlayer ? 1.15 : 1.05);
       const hardBrakeColor = opts.isPlayer ? 'rgba(255, 42, 95, 0.38)' : 'rgba(255, 42, 95, 0.36)';
       const softBrakeR = lightW * (opts.isPlayer ? 2.15 : 1.9);
       if (leftTailLit) {
         drawLightHalo(ctx, leftLightX + lightW * 0.5, leftLightY + lightH * 0.5, hardBrakeR, hardBrakeColor, softBrakeR, HALO_STOPS.brakeLight, brakeHaloFade);
+      } else if (leftBrokenBrakeGlow > 0.01) {
+        drawLightHalo(
+          ctx,
+          leftLightX + lightW * 0.52,
+          leftLightY + lightH * 0.5,
+          hardBrakeR * 0.68,
+          'rgba(255, 42, 95, 0.24)',
+          softBrakeR * 0.70,
+          HALO_STOPS.brakeLight,
+          brakeHaloFade * leftBrokenBrakeGlow * 0.58
+        );
       }
+
       if (rightTailLit) {
         drawLightHalo(ctx, rightLightX + lightW * 0.5, rightLightY + lightH * 0.5, hardBrakeR, hardBrakeColor, softBrakeR, HALO_STOPS.brakeLight, brakeHaloFade);
+      } else if (rightBrokenBrakeGlow > 0.01) {
+        drawLightHalo(
+          ctx,
+          rightLightX + lightW * 0.48,
+          rightLightY + lightH * 0.5,
+          hardBrakeR * 0.68,
+          'rgba(255, 42, 95, 0.24)',
+          softBrakeR * 0.70,
+          HALO_STOPS.brakeLight,
+          brakeHaloFade * rightBrokenBrakeGlow * 0.58
+        );
       }
     }
   }
 
   if (opts.isPlayer && opts.reversing) {
-    drawLightHalo(ctx, leftRevX + revW * 0.5, leftRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, HALO_STOPS.reverseLight);
-    drawLightHalo(ctx, rightRevX + revW * 0.5, rightRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, HALO_STOPS.reverseLight);
+    if (!opts.leftRevBroken && leftRevCrackedLit) {
+      const leftAlpha = opts.leftRevCracked ? 0.80 : 1.0;
+      drawLightHalo(ctx, leftRevX + revW * 0.5, leftRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, HALO_STOPS.reverseLight, leftAlpha);
+    } else if (opts.leftRevBroken && leftRevBrokenGlow > 0.01) {
+      drawLightHalo(
+        ctx,
+        leftRevX + revW * 0.5,
+        leftRevY + revH * 0.5,
+        revW * 1.05,
+        'rgba(210, 240, 255, 0.30)',
+        revW * 1.78,
+        HALO_STOPS.reverseLight,
+        leftRevBrokenGlow * 0.55
+      );
+    }
+
+    if (!opts.rightRevBroken && rightRevCrackedLit) {
+      const rightAlpha = opts.rightRevCracked ? 0.80 : 1.0;
+      drawLightHalo(ctx, rightRevX + revW * 0.5, rightRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, HALO_STOPS.reverseLight, rightAlpha);
+    } else if (opts.rightRevBroken && rightRevBrokenGlow > 0.01) {
+      drawLightHalo(
+        ctx,
+        rightRevX + revW * 0.5,
+        rightRevY + revH * 0.5,
+        revW * 1.05,
+        'rgba(210, 240, 255, 0.30)',
+        revW * 1.78,
+        HALO_STOPS.reverseLight,
+        rightRevBrokenGlow * 0.55
+      );
+    }
   } else if (isStreetTraffic && (leftTurnLit || rightTurnLit)) {
     const signalHaloFade = MathUtil.clamp((w0 - 3.5) / 10, 0, 1);
     if (signalHaloFade > 0.01) {
@@ -1601,12 +1888,17 @@ export function render3DCar(ctx, opts) {
 
   if (isActivePlayer) {
     const a = state.playerScreenAnchors;
+    const cowlY = C.sCabinFront.cy - C.sCabinFront.h * BODY_SHOULDER;
+    const noseY = C.s1.cy - C.s1.h * BODY_SHOULDER;
     a.rearCenterX = C.s0.cx;
     a.rearCenterY = C.s0.cy - C.s0.h * 0.36;
     a.rearGroundY = C.s0.cy;
     a.centerX = (C.s0.cx + C.s1.cx) * 0.5;
     a.centerY = (C.s0.cy + C.s1.cy) * 0.5 - C.s0.h * 0.36;
-    a.hoodY = C.s0.cy - C.s0.h * BODY_SHOULDER;
+    // Привязка источника дыма и искр к реальному переднему капоту (между основанием лобового стекла и носом)
+    a.hoodX = MathUtil.lerp(C.sCabinFront.cx, C.s1.cx, 0.58);
+    a.hoodY = MathUtil.lerp(cowlY, noseY, 0.58);
+    a.hoodW = MathUtil.lerp(C.sCabinFront.w, C.s1.w, 0.58);
     a.carW = C.s0.w;
     a.carH = C.s0.h;
     a.leftWheelX = C.saNearAxle.cx - C.saNearAxle.w * 0.38;
@@ -1647,28 +1939,68 @@ export function render3DCar(ctx, opts) {
     renderWheelTread(ctx, C, C.visibleFlankSign, C.tAxleNear);
   }
 
-  // 3. Дальние верхние плоскости: капот (или багажник встречки) и дальнее стекло
+  // 3. Передний капот (или дальний багажник встречки) с копотью моторного отсека при тяжёлом уроне
   const sCF = C.sCabinFront;
   const sRF = C.sRoofFront;
   const sRR = C.sRoofRear;
   const s1 = C.s1;
+  const hoodRearY = sCF.cy - sCF.h * BODY_SHOULDER;
+  const hoodFrontY = s1.cy - s1.h * BODY_SHOULDER;
 
   fillQuad(
     ctx,
-    sCF.cx - sCF.w * BODY_W_TOP, sCF.cy - sCF.h * BODY_SHOULDER,
-    sCF.cx + sCF.w * BODY_W_TOP, sCF.cy - sCF.h * BODY_SHOULDER,
-    s1.cx + s1.w * BODY_W_TOP, s1.cy - s1.h * BODY_SHOULDER,
-    s1.cx - s1.w * BODY_W_TOP, s1.cy - s1.h * BODY_SHOULDER,
+    sCF.cx - sCF.w * BODY_W_TOP, hoodRearY,
+    sCF.cx + sCF.w * BODY_W_TOP, hoodRearY,
+    s1.cx + s1.w * BODY_W_TOP, hoodFrontY,
+    s1.cx - s1.w * BODY_W_TOP, hoodFrontY,
     C.deckColor
   );
 
+  if (opts.isPlayer && (opts.visualDamageLevel >= 2 || opts.frontDamageLevel >= 1) && C.wNear > 22) {
+    const hoodGap = Math.max(1.2, s1.h * (0.022 + Math.min(3, opts.visualDamageLevel) * 0.008));
+    fillQuad(
+      ctx,
+      s1.cx - s1.w * 0.36, hoodFrontY,
+      s1.cx + s1.w * 0.36, hoodFrontY,
+      s1.cx + s1.w * 0.35, hoodFrontY + hoodGap,
+      s1.cx - s1.w * 0.35, hoodFrontY + hoodGap,
+      'rgba(10, 2, 16, 0.74)'
+    );
+
+    if (opts.visualDamageLevel >= 3) {
+      const sootGrad = ctx.createLinearGradient(0, hoodFrontY, 0, hoodRearY);
+      sootGrad.addColorStop(0.0, 'rgba(12, 8, 20, 0.58)');
+      sootGrad.addColorStop(1.0, 'rgba(12, 8, 20, 0.16)');
+      fillQuad(
+        ctx,
+        sCF.cx - sCF.w * 0.28, hoodRearY,
+        sCF.cx + sCF.w * 0.28, hoodRearY,
+        s1.cx + s1.w * 0.30, hoodFrontY,
+        s1.cx - s1.w * 0.30, hoodFrontY,
+        sootGrad
+      );
+    }
+  }
+
+  // 4. Видимая нижняя боковина и её перспективные колёсные арки с дисками
+  renderLowerFlank(ctx, C, opts, C.visibleFlankSign, isSilhouetteLod);
+  if (!isSilhouetteLod) {
+    renderSideWheelsAndArches(ctx, C, opts, C.visibleFlankSign);
+  }
+
+  // 4б. Частицы дыма и искр из-под переднего капота: рисуются ПОВЕРХ капота и крыльев, но ЗА кабиной и крышей
+  if (opts.onAfterHood) {
+    opts.onAfterHood(ctx);
+  }
+
+  // 5. Рамка лобового стекла / передние стойки и крыша
   if (nearFrac < C.tCF) {
     fillQuad(
       ctx,
       sRF.cx - sRF.w * C.roofHalfFrac, sRF.cy - sRF.h * ROOF_TOP,
       sRF.cx + sRF.w * C.roofHalfFrac, sRF.cy - sRF.h * ROOF_TOP,
-      sCF.cx + sCF.w * BODY_W_TOP, sCF.cy - sCF.h * BODY_SHOULDER,
-      sCF.cx - sCF.w * BODY_W_TOP, sCF.cy - sCF.h * BODY_SHOULDER,
+      sCF.cx + sCF.w * BODY_W_TOP, hoodRearY,
+      sCF.cx - sCF.w * BODY_W_TOP, hoodRearY,
       C.pillarFrameColor
     );
     if (!isSilhouetteLod) {
@@ -1683,13 +2015,6 @@ export function render3DCar(ctx, opts) {
     }
   }
 
-  // 4. Видимая нижняя боковина и её перспективные колёсные арки с дисками
-  renderLowerFlank(ctx, C, opts, C.visibleFlankSign, isSilhouetteLod);
-  if (!isSilhouetteLod) {
-    renderSideWheelsAndArches(ctx, C, opts, C.visibleFlankSign);
-  }
-
-  // 5. Крыша
   if (nearFrac < C.tRF) {
     fillQuad(
       ctx,
@@ -1752,6 +2077,7 @@ export function renderTrafficCar(ctx, car, precomputedCamZ = null) {
   o.name = car.name || '';
   o.num = car.num || '';
   o.plate = car.plate || '';
+  o.onAfterHood = null;
 
   render3DCar(ctx, o);
 }
@@ -1759,7 +2085,7 @@ export function renderTrafficCar(ctx, car, precomputedCamZ = null) {
 /**
  * Обёртка отрисовки автомобиля игрока (активного на трассе или остановленного при завершении заезда)
  */
-export function renderPlayerCar(ctx, parkedCamZ = null) {
+export function renderPlayerCar(ctx, parkedCamZ = null, onAfterHood = null) {
   const isParkedDetach = parkedCamZ !== null;
   const isTitleDemo = state.gameState === STATE.TITLE;
   const absSpeedRatio = Math.abs(state.speed) / MAX_SPEED;
@@ -1796,15 +2122,54 @@ export function renderPlayerCar(ctx, parkedCamZ = null) {
     state.gameState === STATE.PLAYING &&
     state.raceCountdownTimer <= 0 &&
     (state.speed < -2 || (input.down && !input.up && state.speed <= 2));
+  // Стоп-сигналы активны при торможении и полной остановке (включая остановленный разбитый автомобиль)
   const isBraking = isParkedDetach
-    ? !isTotalWreck
-    : (!isTitleDemo && !isTotalWreck && !isReversing && ((input.down && state.speed > 2) || (input.up && input.down) || Math.abs(state.speed) < 15));
+    ? true
+    : (!isTitleDemo && !isReversing && ((input.down && state.speed > 2) || (input.up && input.down) || Math.abs(state.speed) < 15));
   const leftLightBroken = isTotalWreck || (hasDamageSystem && (state.leftDamage >= 3 || state.visualDamage >= 4));
   const rightLightBroken = isTotalWreck || (hasDamageSystem && (state.rightDamage >= 3 || state.visualDamage >= 4));
   const leftLightFlicker = !leftLightBroken && hasDamageSystem && state.leftDamage >= 2 && (flickerPhase % 3 === 0);
   const rightLightFlicker = !rightLightBroken && hasDamageSystem && state.rightDamage >= 2 && (flickerPhase % 4 === 1);
+
+  // Фиксированная сторона выжившей нити стоп-сигнала (противоположная основному удару)
+  const brokenStopSide = state.spoilerDamageSide !== 0
+    ? -state.spoilerDamageSide
+    : (state.leftDamage <= state.rightDamage ? -1 : 1);
+
+  // Поэтапное повреждение (трещина -> полное разбитие) фонарей заднего хода
+  const leftRevBroken =
+    isTotalWreck ||
+    (hasDamageSystem && (
+      state.visualDamage >= 4 ||
+      state.rearDamage >= 3 ||
+      (state.rearDamage >= 2 && state.leftDamage >= state.rightDamage) ||
+      (state.visualDamage >= 3 && state.leftDamage >= 2)
+    ));
+  const rightRevBroken =
+    isTotalWreck ||
+    (hasDamageSystem && (
+      state.visualDamage >= 4 ||
+      state.rearDamage >= 3 ||
+      (state.rearDamage >= 2 && state.rightDamage >= state.leftDamage) ||
+      (state.visualDamage >= 3 && state.rightDamage >= 2)
+    ));
+  const leftRevCracked =
+    !leftRevBroken &&
+    hasDamageSystem &&
+    (state.rearDamage >= 1 || state.leftDamage >= 2 || state.visualDamage >= 2);
+  const rightRevCracked =
+    !rightRevBroken &&
+    hasDamageSystem &&
+    (state.rearDamage >= 1 || state.rightDamage >= 2 || state.visualDamage >= 2);
+
   const showExhaustFlame = !isParkedDetach && !state.isPaused && !isTotalWreck && input.up && !input.down && state.speed / MAX_SPEED > 0.72 && !state.isOverheated && state.engineMisfireTimer <= 0;
   const showBackfireFlame = !isParkedDetach && !state.isPaused && !isTotalWreck && activeVisualDamage >= 4 && state.engineMisfireTimer > 0 && input.up;
+  const fallbackSpoilerStage = isTotalWreck
+    ? 3
+    : (activeVisualDamage >= 4 ? 2 : (activeVisualDamage >= 2 ? 1 : 0));
+  const spoilerStage = (hasDamageSystem && activeVisualDamage > 0)
+    ? Math.max(state.spoilerStage || 0, fallbackSpoilerStage)
+    : 0;
 
   const o = _playerCarOpts;
   o.isParkedDetach = isParkedDetach;
@@ -1828,11 +2193,19 @@ export function renderPlayerCar(ctx, parkedCamZ = null) {
   o.rightLightBroken = rightLightBroken;
   o.leftLightFlicker = leftLightFlicker;
   o.rightLightFlicker = rightLightFlicker;
+  o.brokenStopSide = brokenStopSide;
+  o.leftRevBroken = leftRevBroken;
+  o.rightRevBroken = rightRevBroken;
+  o.leftRevCracked = leftRevCracked;
+  o.rightRevCracked = rightRevCracked;
   o.visualDamageLevel = activeVisualDamage;
   o.leftDamageLevel = hasDamageSystem ? state.leftDamage : 0;
   o.rightDamageLevel = hasDamageSystem ? state.rightDamage : 0;
   o.rearDamageLevel = hasDamageSystem ? state.rearDamage : 0;
+  o.frontDamageLevel = hasDamageSystem ? state.frontDamage : 0;
   o.spoilerDamageSide = hasDamageSystem ? state.spoilerDamageSide : 0;
+  o.spoilerStage = spoilerStage;
+  o.onAfterHood = onAfterHood;
   o.showExhaustFlame = showExhaustFlame;
   o.isSlipstreamingFlame = state.isSlipstreaming;
   o.showBackfireFlame = showBackfireFlame;

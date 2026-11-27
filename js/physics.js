@@ -40,7 +40,7 @@ import {
   spawnParticles
 } from './state.js';
 import { recordSkidMarks } from './track.js';
-import { maintainTrafficDensity, updateTrafficOnly } from './traffic.js';
+import { maintainTrafficDensity, updateTrafficOnly, moveCarToSegment } from './traffic.js';
 import { t, formatPlaceText } from './i18n.js';
 
 // Смещение опор арок синхронизировано с модулями рендера (ARCH_TOWER_OFFSET_NORM)
@@ -92,6 +92,8 @@ const RANGE_RIVAL_SPARK_SIZE = Object.freeze([2, 4.5]);
 const RANGE_RIVAL_SPARK_LIFE = Object.freeze([0.2, 0.45]);
 const RANGE_CRASH_SPARK_SIZE = Object.freeze([2, 5]);
 const RANGE_CRASH_SPARK_LIFE = Object.freeze([0.25, 0.55]);
+const RANGE_SPOILER_DEBRIS_SIZE = Object.freeze([2.5, 5.5]);
+const RANGE_SPOILER_DEBRIS_LIFE = Object.freeze([0.28, 0.52]);
 
 const _dynSizeRange = [0, 0];
 const _dynLifeRange = [0, 0];
@@ -162,6 +164,34 @@ function addCandidateSpriteSeg(idx, totalSegs) {
   if (!_visitedSegs.has(wrapped)) {
     _visitedSegs.add(wrapped);
     _segIndicesToCheck.push(wrapped);
+  }
+}
+
+/**
+ * Спавн частиц моторного отсека (дым и искры из-под переднего капота) с пометкой слоя isHood:
+ * рендерится между плоскостью капота и кабиной, чтобы дым шёл из капота, а не поверх багажника.
+ */
+function spawnHoodParticles(
+  x,
+  y,
+  count,
+  color,
+  vxSpread,
+  vyBase,
+  sizeRange,
+  lifeRange,
+  gravity = -20,
+  expandRate = 0,
+  vxBias = 0
+) {
+  const particles = state.particles;
+  const prevLen = particles.length;
+  spawnParticles(x, y, count, color, vxSpread, vyBase, sizeRange, lifeRange, gravity, expandRate);
+  for (let i = prevLen; i < particles.length; i++) {
+    particles[i].isHood = true;
+    if (vxBias !== 0) {
+      particles[i].vx += vxBias;
+    }
   }
 }
 
@@ -264,26 +294,50 @@ function registerCollision(damagePoints = 1, fatalReason = null, hitContext = _h
     state.speed = cappedSpeed;
   }
 
-  // Однократная фиксация стороны повреждения спойлера
-  if (state.spoilerDamageSide === 0) {
-    const nextVisDmg = state.difficulty !== 'hardcore'
-      ? Math.min(4, Math.max(state.visualDamage, Math.ceil(state.collisionCount * 0.85)))
-      : MAX_HARDCORE_COLLISIONS - Math.max(0, state.collisionsLeft - dmg);
-    if (nextVisDmg >= 2) {
-      if (side === 'left') {
-        state.spoilerDamageSide = -1;
-      } else if (side === 'right') {
-        state.spoilerDamageSide = 1;
-      } else if (state.leftDamage !== state.rightDamage) {
-        state.spoilerDamageSide = state.leftDamage > state.rightDamage ? -1 : 1;
-      } else {
-        state.spoilerDamageSide = Math.random() < 0.5 ? -1 : 1;
-      }
+  // На первом ударе заезда visualDamage ещё равен 0, что гарантирует чистый сброс стадии спойлера после рестарта
+  const prevSpoilerStage = state.visualDamage === 0 ? 0 : (state.spoilerStage || 0);
+  const nextVisDmg = state.difficulty !== 'hardcore'
+    ? Math.min(4, Math.max(state.visualDamage, Math.ceil(state.collisionCount * 0.85)))
+    : MAX_HARDCORE_COLLISIONS - Math.max(0, state.collisionsLeft - dmg);
+  const isFatalHardcore = state.difficulty === 'hardcore' && (state.collisionsLeft - dmg) <= 0;
+
+  // Однократная фиксация стороны первичного повреждения спойлера
+  if (state.spoilerDamageSide === 0 && nextVisDmg >= 2) {
+    if (side === 'left') {
+      state.spoilerDamageSide = -1;
+    } else if (side === 'right') {
+      state.spoilerDamageSide = 1;
+    } else if (state.leftDamage !== state.rightDamage) {
+      state.spoilerDamageSide = state.leftDamage > state.rightDamage ? -1 : 1;
+    } else {
+      state.spoilerDamageSide = Math.random() < 0.5 ? -1 : 1;
     }
   }
 
+  // Поэтапное разрушение антикрыла: 0 (целый) -> 1 (погнут) -> 2 (отлетела одна половина) -> 3 (на следующем ударе отлетает вторая)
+  let nextSpoilerStage = prevSpoilerStage;
+  if (isFatalHardcore || prevSpoilerStage >= 2) {
+    nextSpoilerStage = 3;
+  } else if (nextVisDmg >= 4) {
+    nextSpoilerStage = 2;
+  } else if (nextVisDmg >= 2) {
+    nextSpoilerStage = 1;
+  }
+  state.spoilerStage = nextSpoilerStage;
+
+  // При отрыве первой или второй половины антикрыла разлетаются осколки с соответствующей стороны багажника
+  if (nextSpoilerStage > prevSpoilerStage && nextSpoilerStage >= 2) {
+    const anchors = state.playerScreenAnchors;
+    const baseSide = state.spoilerDamageSide || -1;
+    const snapSide = nextSpoilerStage === 2 ? baseSide : -baseSide;
+    const debrisX = anchors.rearCenterX + snapSide * anchors.carW * 0.24;
+    const debrisY = anchors.rearCenterY - anchors.carH * 0.28;
+    spawnParticles(debrisX, debrisY, 5, '#f1f5f9', 185, 135, RANGE_SPOILER_DEBRIS_SIZE, RANGE_SPOILER_DEBRIS_LIFE);
+    spawnParticles(debrisX, debrisY, 3, '#1c1630', 155, 115, RANGE_SPOILER_DEBRIS_SIZE, RANGE_SPOILER_DEBRIS_LIFE);
+  }
+
   if (state.difficulty !== 'hardcore') {
-    state.visualDamage = Math.min(4, Math.max(state.visualDamage, Math.ceil(state.collisionCount * 0.85)));
+    state.visualDamage = nextVisDmg;
     if (applyCollisionTimePenalty(COLLISION_TIME_PENALTY)) return true;
     const engineWarn = state.visualDamage >= 3 ? t('bannerEngineDamagedSuffix') : '';
     showBanner(
@@ -397,30 +451,36 @@ export function updateSimulation(dt) {
   // Демонстрационный автопилот на стартовом экране (или сцена аварии при поломке)
   if (state.gameState !== STATE.PLAYING) {
     if (state.gameState === STATE.GAMEOVER && state.gameMode !== 'circuit' && state.visualDamage >= MAX_HARDCORE_COLLISIONS) {
+      const hoodX = anchors.hoodX !== undefined ? anchors.hoodX : anchors.centerX;
+      const hoodW = anchors.hoodW || anchors.carW * 0.82;
       if (Math.random() < 0.78 * step60) {
-        spawnParticles(
-          anchors.centerX + (Math.random() - 0.5) * anchors.carW * 0.35,
+        const offsetFrac = (Math.random() - 0.5) * 0.68;
+        spawnHoodParticles(
+          hoodX + offsetFrac * hoodW,
           anchors.hoodY,
           2,
           Math.random() < 0.7 ? 'rgba(32, 30, 40, 0.85)' : 'rgba(95, 90, 108, 0.75)',
-          70,
-          115,
+          82,
+          125,
           RANGE_WRECK_SMOKE_SIZE,
           RANGE_WRECK_SMOKE_LIFE,
-          -25,
-          12
+          -28,
+          13,
+          offsetFrac * 24
         );
       }
       if (Math.random() < 0.28 * step60) {
-        spawnParticles(
-          anchors.centerX + (Math.random() - 0.5) * anchors.carW * 0.30,
-          anchors.centerY,
+        spawnHoodParticles(
+          hoodX + (Math.random() - 0.5) * hoodW * 0.58,
+          anchors.hoodY,
           2,
           '#ffbe0b',
-          135,
-          95,
+          145,
+          110,
           RANGE_WRECK_SPARK_SIZE,
-          RANGE_WRECK_SPARK_LIFE
+          RANGE_WRECK_SPARK_LIFE,
+          260,
+          0
         );
       }
       // Разбитая машина реально стоит на полосе, поэтому трафик реагирует на неё
@@ -525,19 +585,23 @@ export function updateSimulation(dt) {
         const smokeColor = isHeavy
           ? (Math.random() < 0.68 ? 'rgba(34, 31, 44, 0.80)' : 'rgba(92, 88, 106, 0.70)')
           : 'rgba(180, 180, 196, 0.52)';
+        const hoodX = anchors.hoodX !== undefined ? anchors.hoodX : anchors.centerX;
+        const hoodW = anchors.hoodW || anchors.carW * 0.82;
+        const offsetFrac = (Math.random() - 0.5) * 0.72;
         _dynSizeRange[0] = 4 + state.visualDamage;
         _dynSizeRange[1] = 9 + state.visualDamage * 1.5;
-        spawnParticles(
-          anchors.centerX + (Math.random() - 0.5) * anchors.carW * 0.28,
+        spawnHoodParticles(
+          hoodX + offsetFrac * hoodW,
           anchors.hoodY,
           state.visualDamage >= 4 ? 2 : 1,
           smokeColor,
-          55 + absSpeedRatio * 40,
-          75 + (1 - absSpeedRatio) * 40,
+          58 + absSpeedRatio * 42,
+          95 + (1 - absSpeedRatio) * 35,
           _dynSizeRange,
           RANGE_DAMAGE_SMOKE_LIFE,
-          -20,
-          8
+          -26,
+          9,
+          offsetFrac * (22 + absSpeedRatio * 38)
         );
       }
     }
@@ -887,7 +951,8 @@ export function updateSimulation(dt) {
   maintainTrafficDensity();
   updateTrafficOnly(dt, true);
 
-  // 6. Непрерывные (swept) коллизии с машинами (отскок пропорционален скорости контакта)
+  // 6. Непрерывные (swept) коллизии с машинами (разделение по минимальной оси проникновения без боковых телепортов)
+  const playerLatVelNorm = dt > 0 ? (state.playerX - prevPlayerX) / dt : 0;
   let playerWorldZ = getPlayerWorldZ();
   const collisionCenterSeg = findSegment(playerWorldZ);
   if (collisionCenterSeg) {
@@ -903,7 +968,8 @@ export function updateSimulation(dt) {
 
         const baseBlockDistZ = ((PLAYER_LEN_Z + (car.lenZ || SEGMENT_LENGTH * 1.3)) * 0.5) * 0.88;
         const dz = getShortestTrackDz(playerWorldZ, car.z, trackLength);
-        const relVelZ = state.speed - car.speed * car.dir;
+        const carVelZ = car.speed * car.dir;
+        const relVelZ = state.speed - carVelZ;
         const prevDz = dz + relVelZ * dt;
         const minDz = Math.min(prevDz, dz);
         const maxDz = Math.max(prevDz, dz);
@@ -912,64 +978,104 @@ export function updateSimulation(dt) {
           const carNormX = car.x / ROAD_WIDTH;
           if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, carNormX, car.w, 0.90)) {
             const dx = state.playerX - carNormX;
+            const absDx = Math.abs(dx);
             const combinedHalfW = (PLAYER_WIDTH_NORM + car.w) * 0.5;
-            const overlapRatio = Math.abs(dx) / Math.max(0.01, combinedHalfW);
+            const halfSpanX = combinedHalfW * 0.90;
+            const overlapRatio = absDx / Math.max(0.01, combinedHalfW);
+            const penXNorm = Math.max(0, (halfSpanX - absDx) / Math.max(0.01, halfSpanX));
+            const penZNorm = Math.max(0, (baseBlockDistZ - Math.abs(dz)) / baseBlockDistZ);
             const pushSign = dx >= 0 ? 1 : -1;
             const wasAhead = prevDz > 12;
 
-            // Масштабирование отскока, тряски и искр пропорционально реальной скорости удара
+            // Разделяем продольную и реальную поперечную скорость сближения (исключает боковой выброс на заднем ходу и спам в упоре)
             const absRelVelZ = Math.abs(relVelZ);
+            const carLatVelNorm = (car.latVel || 0) / ROAD_WIDTH + (car.vx || 0);
+            const relLatVelNorm = Math.abs(playerLatVelNorm - carLatVelNorm);
+            const hasMeaningfulImpact = absRelVelZ > MAX_SPEED * 0.012 || relLatVelNorm > 0.15;
+
             const longBounceScale = MathUtil.clamp(absRelVelZ / (MAX_SPEED * 0.55), 0, 1.25);
-            const sideBounceScale = MathUtil.clamp(
-              Math.max(Math.abs(state.speed), absRelVelZ) / (MAX_SPEED * 0.55),
-              0,
-              1.15
-            );
+            const sideBounceScale = state.speed <= 0
+              ? MathUtil.clamp(relLatVelNorm / 2.4, 0.04, 0.22)
+              : MathUtil.clamp(
+                  (Math.abs(state.speed) / (MAX_SPEED * 0.60)) * (0.35 + 0.65 * Math.min(1, relLatVelNorm / 1.4)),
+                  0.08,
+                  1.15
+                );
+
+            // Контакт с машиной позади (игрок сдаёт назад центрально/углом бампера ИЛИ машину игрока догоняют сзади):
+            // всегда разрешается вдоль оси Z без искусственного сброса в боковую ветку при overlapRatio >= 0.72 или state.speed === 0
+            const isRearContact =
+              (dz < 0 || prevDz < -12) &&
+              !wasAhead &&
+              (prevDz <= -baseBlockDistZ * 0.76 || (dz < -baseBlockDistZ * 0.42 && penZNorm <= penXNorm + 0.10));
 
             if (car.isRival) {
-              const isRivalRearBump =
-                overlapRatio < 0.72 &&
+              const isRivalFrontBump =
+                !isRearContact &&
+                overlapRatio < 0.74 &&
                 (prevDz >= baseBlockDistZ * 0.78 || (dz > baseBlockDistZ * 0.55 && state.speed > car.speed));
-              const isRivalBackingHit =
-                overlapRatio < 0.72 &&
-                (prevDz <= -baseBlockDistZ * 0.78 || dz < -baseBlockDistZ * 0.55) &&
-                state.speed < 0;
 
-              if (isRivalRearBump) {
+              if (isRivalFrontBump) {
                 const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
                 shiftPlayerZ(-penetration, trackLength);
                 playerWorldZ = getPlayerWorldZ();
-              } else if (isRivalBackingHit) {
+              } else if (isRearContact) {
                 const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
-                shiftPlayerZ(penetration, trackLength);
-                playerWorldZ = getPlayerWorldZ();
-                state.speed = 0;
+                if (car.speed > Math.max(0, state.speed) + 10) {
+                  // Соперник накатывает сзади: разводим оба болида вдоль трассы и передаём импульс вперёд без сдвига по X
+                  const playerPushZ = penetration * 0.40;
+                  const rivalBackZ = penetration - playerPushZ + 4;
+                  shiftPlayerZ(playerPushZ, trackLength);
+                  playerWorldZ = getPlayerWorldZ();
+                  car.z = MathUtil.wrap(car.z - rivalBackZ, trackLength);
+                  car.progressZ -= rivalBackZ;
+                  moveCarToSegment(car);
+
+                  const prevCarSpeed = car.speed;
+                  state.speed = Math.max(0, state.speed, Math.min(MAX_SPEED * 0.36, prevCarSpeed * 0.26));
+                  car.speed = Math.min(prevCarSpeed * GAME_CONFIG.circuit.rearBumpSlowdownRatio, Math.max(0, state.speed * 0.92));
+                } else {
+                  // Игрок сам упёрся задним ходом в соперника: жёсткая остановка строго вдоль Z
+                  shiftPlayerZ(penetration, trackLength);
+                  playerWorldZ = getPlayerWorldZ();
+                  if (state.speed < 0) state.speed = 0;
+                }
               } else {
-                const minSepX = combinedHalfW * 0.92;
+                // Чистое боковое касание бортами: точный вынос к границе касания (0.904 вместо 0.92) без скачка
+                const minSepX = combinedHalfW * 0.904;
                 state.playerX = MathUtil.clamp(carNormX + pushSign * minSepX, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
+                if (state.speed < 0) {
+                  state.playerVX = 0;
+                  state.speed *= 0.75;
+                }
               }
 
-              if (car.hitCooldown <= 0) {
-                const activeScale = (isRivalRearBump || isRivalBackingHit) ? longBounceScale : sideBounceScale;
+              if (car.hitCooldown <= 0 && hasMeaningfulImpact) {
+                const isLongitudinal = isRivalFrontBump || isRearContact;
+                const activeScale = isLongitudinal ? longBounceScale : sideBounceScale;
                 car.hitCooldown = 0.35;
                 state.impactShake = Math.max(state.impactShake, 0.65 * MathUtil.clamp(activeScale, 0.12, 1.0));
-                audio.playCrash(MathUtil.clamp(0.65 * Math.max(0.28, activeScale), 0.18, 0.85));
+                audio.playCrash(MathUtil.clamp(0.65 * Math.max(0.25, activeScale), 0.18, 0.85));
 
-                if (isRivalRearBump) {
+                if (isRivalFrontBump) {
                   car.speed = Math.min(MAX_SPEED * 0.995, Math.max(car.speed, state.speed * 0.96));
                   state.speed = Math.min(state.speed * GAME_CONFIG.circuit.rearBumpSlowdownRatio, car.speed * 0.96);
                   state.playerVX += dx * 1.15 * longBounceScale;
-                } else if (!isRivalBackingHit) {
+                } else if (!isRearContact && state.speed > 0) {
                   state.speed *= GAME_CONFIG.circuit.impactSlowdownRatio;
-                  state.playerVX += pushSign * 1.05 * sideBounceScale;
-                  car.vx -= pushSign * 0.85 * sideBounceScale;
+                  state.playerVX += pushSign * 0.95 * sideBounceScale;
+                  car.vx -= pushSign * 0.80 * sideBounceScale;
                 }
 
                 const sparkCount = Math.round(10 * MathUtil.clamp(activeScale, 0, 1));
                 if (sparkCount > 0) {
+                  const sparkX = isRearContact
+                    ? anchors.rearCenterX - MathUtil.clamp(dx, -0.35, 0.35) * anchors.carW
+                    : anchors.centerX - dx * anchors.carW * 1.3;
+                  const sparkY = isRearContact ? anchors.rearCenterY : anchors.centerY;
                   spawnParticles(
-                    anchors.centerX - dx * anchors.carW * 1.3,
-                    anchors.centerY,
+                    sparkX,
+                    sparkY,
                     sparkCount,
                     '#ffbe0b',
                     190,
@@ -982,43 +1088,65 @@ export function updateSimulation(dt) {
               continue;
             }
 
-            const impactSpeedKmh = Math.round((Math.abs(state.speed) / MAX_SPEED) * BASE_MAX_KMH);
+            const preImpactPlayerSpeed = state.speed;
+            const impactSpeedKmh = Math.round((Math.abs(preImpactPlayerSpeed) / MAX_SPEED) * BASE_MAX_KMH);
             const isFrontalHit = overlapRatio < 0.65;
-            const isHeadOn = car.dir === -1 && (dz > 12 || wasAhead) && isFrontalHit;
+            const isHeadOn = !isRearContact && car.dir === -1 && (dz > 12 || wasAhead) && isFrontalHit;
             const isRearEnd =
+              !isRearContact &&
               car.dir === 1 &&
-              overlapRatio < 0.72 &&
+              overlapRatio < 0.74 &&
               (prevDz >= baseBlockDistZ * 0.78 || (dz > baseBlockDistZ * 0.55 && state.speed > car.speed));
-            const isBackingHit =
-              overlapRatio < 0.72 &&
-              (prevDz <= -baseBlockDistZ * 0.78 || dz < -baseBlockDistZ * 0.55) &&
-              state.speed < 0;
             const hitSide = dx > 0.03 ? 'left' : (dx < -0.03 ? 'right' : 'center');
-            const hitZone = isBackingHit ? 'rear' : ((isHeadOn || isRearEnd) ? 'front' : 'side');
+            const hitZone = isRearContact ? 'rear' : ((isHeadOn || isRearEnd) ? 'front' : 'side');
 
             if (isHeadOn || isRearEnd) {
               const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
               shiftPlayerZ(-penetration, trackLength);
               playerWorldZ = getPlayerWorldZ();
-              const carForwardVel = Math.max(0, car.speed * car.dir);
+              const carForwardVel = Math.max(0, carVelZ);
               if (state.speed > carForwardVel) {
                 state.speed = isHeadOn ? 0 : carForwardVel;
               }
-            } else if (isBackingHit) {
+            } else if (isRearContact) {
               const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
-              shiftPlayerZ(penetration, trackLength);
-              playerWorldZ = getPlayerWorldZ();
-              state.speed = 0;
+              if (car.dir === 1 && car.speed > Math.max(0, state.speed) + 10) {
+                // Попутный автомобиль упёрся в задний бампер игрока: разводим по оси Z и гасим скорость трафика без телепорта вбок
+                const playerPushZ = penetration * 0.40;
+                const carBackZ = penetration - playerPushZ + 4;
+                shiftPlayerZ(playerPushZ, trackLength);
+                playerWorldZ = getPlayerWorldZ();
+                car.z = MathUtil.wrap(car.z - carBackZ, trackLength);
+                moveCarToSegment(car);
+
+                const prevCarSpeed = car.speed;
+                state.speed = Math.max(0, state.speed, Math.min(MAX_SPEED * 0.22, prevCarSpeed * 0.20));
+                car.speed = Math.min(prevCarSpeed * 0.30, Math.max(0, state.speed * 0.85));
+                car.braking = true;
+                car.damagedByPlayer = true;
+                car.brakeForce = MAX_SPEED * 0.85;
+                car.targetX = car.x;
+              } else {
+                // Игрок упёрся задним ходом в стоящую/уходящую машину: чистый продольный упор по Z
+                shiftPlayerZ(penetration, trackLength);
+                playerWorldZ = getPlayerWorldZ();
+                if (state.speed < 0) state.speed = 0;
+              }
             } else {
-              const minSepX = combinedHalfW * 0.92;
+              // Боковое притирание: точный вынос на границу 0.904 и отсутствие бокового броска при заднем ходе
+              const minSepX = combinedHalfW * 0.904;
               state.playerX = MathUtil.clamp(carNormX + pushSign * minSepX, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
-              if (car.dir === -1 && state.speed > 0) {
+              if (state.speed < 0) {
+                state.playerVX = 0;
+                state.speed *= 0.75;
+              } else if (car.dir === -1 && state.speed > 0) {
                 state.speed *= 0.72;
               }
             }
 
-            if (car.hitCooldown <= 0) {
-              const activeScale = (isHeadOn || isRearEnd || isBackingHit) ? longBounceScale : sideBounceScale;
+            if (car.hitCooldown <= 0 && hasMeaningfulImpact) {
+              const isLongitudinal = isHeadOn || isRearEnd || isRearContact;
+              const activeScale = isLongitudinal ? longBounceScale : sideBounceScale;
               car.hitCooldown = 1.5;
               state.impactShake = Math.max(state.impactShake, MathUtil.clamp(activeScale, 0.14, 1.0));
 
@@ -1039,31 +1167,38 @@ export function updateSimulation(dt) {
                 if (car.dir === 1) {
                   state.speed = Math.min(state.speed, Math.max(0, car.speed * 0.75));
                 }
-                state.playerVX += pushSign * Math.max(0.95, Math.abs(dx) * 1.9) * longBounceScale;
-              } else if (isBackingHit) {
-                audio.playCrash(MathUtil.clamp(0.65 * Math.max(0.25, longBounceScale), 0.18, 0.75));
+                state.playerVX += pushSign * Math.max(0.95, absDx * 1.9) * longBounceScale;
+              } else if (isRearContact) {
+                audio.playCrash(MathUtil.clamp(0.60 * Math.max(0.22, longBounceScale), 0.18, 0.75));
                 car.braking = true;
                 car.damagedByPlayer = true;
-                car.brakeForce = MAX_SPEED * 0.65;
+                car.brakeForce = MAX_SPEED * 0.85;
                 car.targetX = car.x;
-                state.speed = 0;
-                state.playerVX += dx * 1.2 * longBounceScale;
+                if (car.dir === -1) {
+                  car.speed = 0;
+                }
               } else {
-                audio.playCrash(MathUtil.clamp(0.75 * Math.max(0.25, sideBounceScale), 0.20, 0.85));
+                audio.playCrash(MathUtil.clamp(0.75 * Math.max(0.22, sideBounceScale), 0.18, 0.85));
                 car.braking = true;
                 car.damagedByPlayer = true;
                 car.brakeForce = MAX_SPEED * 0.65;
-                state.speed *= 0.80;
-                state.playerVX += pushSign * 1.45 * sideBounceScale;
-                car.x = MathUtil.clamp(car.x - pushSign * 120 * sideBounceScale, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
+                if (preImpactPlayerSpeed > 0) {
+                  state.speed *= 0.80;
+                  state.playerVX += pushSign * 1.25 * sideBounceScale;
+                  car.x = MathUtil.clamp(car.x - pushSign * 110 * sideBounceScale, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
+                }
                 car.targetX = car.x;
               }
 
               const sparkCount = Math.round(14 * MathUtil.clamp(activeScale, 0, 1));
               if (sparkCount > 0) {
+                const sparkX = isRearContact
+                  ? anchors.rearCenterX - MathUtil.clamp(dx, -0.35, 0.35) * anchors.carW
+                  : anchors.centerX - dx * anchors.carW * 1.3;
+                const sparkY = isRearContact ? anchors.rearCenterY : anchors.centerY;
                 spawnParticles(
-                  anchors.centerX - dx * anchors.carW * 1.3,
-                  anchors.centerY,
+                  sparkX,
+                  sparkY,
                   sparkCount,
                   '#ffbe0b',
                   220,
@@ -1200,8 +1335,9 @@ export function updateSimulation(dt) {
     }
   }
 
-  // 8. Коллизии с придорожными объектами (быстрое отсечение на асфальте + swept-проверка по Z)
-  if (newPlayerSeg && state.spriteHitCooldown <= 0 && Math.abs(state.playerX) > 1.05) {
+  // 8. Коллизии с придорожными объектами (на заднем ходу — непрерывный продольный упор по Z без телепортации в сторону)
+  const isReverseObstacleMove = state.speed < 0 || netFrameDz < 0;
+  if (newPlayerSeg && Math.abs(state.playerX) > 1.05 && (isReverseObstacleMove || state.spriteHitCooldown <= 0)) {
     const totalSegs = segments.length;
     _segIndicesToCheck.length = 0;
     _visitedSegs.clear();
@@ -1223,7 +1359,7 @@ export function updateSimulation(dt) {
     addCandidateSpriteSeg(newPlayerSeg.index - 1, totalSegs);
     addCandidateSpriteSeg(newPlayerSeg.index + 1, totalSegs);
 
-    const spriteHalfZ = PLAYER_LEN_Z * 0.45;
+    const spriteHalfZ = PLAYER_LEN_Z * 0.46;
     let hitResolved = false;
 
     for (let s = 0; s < _segIndicesToCheck.length && !hitResolved; s++) {
@@ -1260,13 +1396,77 @@ export function updateSimulation(dt) {
 
         if (collidedOffset !== null) {
           hitResolved = true;
+          const dxSprite = state.playerX - collidedOffset;
+          const pushSign = dxSprite >= 0 ? 1 : -1;
+          const halfSpanX = (PLAYER_WIDTH_NORM + collidedWidth) * 0.45;
+
+          if (isReverseObstacleMove) {
+            const absSpriteDx = Math.abs(dxSprite);
+            const penXNorm = Math.max(0, (halfSpanX - absSpriteDx) / Math.max(0.01, halfSpanX));
+            const penZNorm = Math.max(0, (spriteHalfZ - Math.abs(dzCurr)) / spriteHalfZ);
+            const wasOverlappingX = MathUtil.overlap(prevPlayerX, PLAYER_WIDTH_NORM, collidedOffset, collidedWidth, 0.88);
+            const isRearBumperObstacleHit =
+              dzPrev <= -spriteHalfZ * 0.72 ||
+              (dzCurr < 0 && (wasOverlappingX || penZNorm <= penXNorm + 0.12));
+
+            const impactAbsSpeed = Math.abs(state.speed);
+            const latStep = Math.abs(state.playerX - prevPlayerX);
+
+            if (isRearBumperObstacleHit) {
+              // Наезд задним бампером на столб/пальму/щит/опору: упор строго вперёд по Z без сдвига playerX
+              const pushForwardZ = Math.min(spriteHalfZ * 2.2, Math.max(0, (spriteHalfZ + 2) + dzCurr));
+              shiftPlayerZ(pushForwardZ, trackLength);
+              playerWorldZ = getPlayerWorldZ();
+              if (state.speed < 0) state.speed = 0;
+              state.playerVX *= 0.5;
+            } else {
+              // Боковое касание опоры при рулении задним ходом: минимальное удержание на кромке без скачка
+              const minSep = halfSpanX + 0.003;
+              state.playerX = MathUtil.clamp(collidedOffset + pushSign * minSep, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
+              state.playerVX = 0;
+              state.speed *= 0.70;
+            }
+
+            const hasReverseImpact = isRearBumperObstacleHit
+              ? impactAbsSpeed > MAX_SPEED * 0.012
+              : (impactAbsSpeed > MAX_SPEED * 0.02 || latStep > 0.003);
+
+            if (state.spriteHitCooldown <= 0 && hasReverseImpact) {
+              const revBounce = MathUtil.clamp(impactAbsSpeed / (MAX_SPEED * 0.25), 0.14, 0.45);
+              state.spriteHitCooldown = 0.45;
+              state.impactShake = Math.max(state.impactShake, 0.38 * revBounce);
+              audio.playCrash(MathUtil.clamp(0.45 * revBounce + 0.12, 0.18, 0.48));
+
+              const sparkCount = Math.max(3, Math.round(7 * revBounce));
+              const sparkX = isRearBumperObstacleHit
+                ? anchors.rearCenterX - MathUtil.clamp(dxSprite, -0.35, 0.35) * anchors.carW
+                : anchors.rearCenterX + (-pushSign) * anchors.carW * 0.42;
+              spawnParticles(
+                sparkX,
+                anchors.rearCenterY,
+                sparkCount,
+                '#ffbe0b',
+                140,
+                90,
+                RANGE_CRASH_SPARK_SIZE,
+                RANGE_CRASH_SPARK_LIFE
+              );
+
+              if (state.gameMode !== 'circuit') {
+                _hitContext.side = absSpriteDx < 0.03 ? 'center' : (pushSign > 0 ? 'left' : 'right');
+                _hitContext.zone = isRearBumperObstacleHit ? 'rear' : 'side';
+                if (registerCollision(1, t('goCarWrecked'), _hitContext)) return;
+              }
+            }
+            break;
+          }
+
           const obsBounce = MathUtil.clamp(Math.abs(state.speed) / (MAX_SPEED * 0.55), 0, 1.15);
           state.spriteHitCooldown = 0.45;
           state.impactShake = Math.max(state.impactShake, 0.95 * MathUtil.clamp(obsBounce, 0.14, 1.0));
           audio.playCrash(MathUtil.clamp(1.0 * Math.max(0.25, obsBounce), 0.20, 1.05));
 
-          const pushSign = state.playerX >= collidedOffset ? 1 : -1;
-          const minSep = (PLAYER_WIDTH_NORM + collidedWidth) * 0.52;
+          const minSep = halfSpanX + 0.012;
           state.playerX = MathUtil.clamp(collidedOffset + pushSign * minSep, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
           state.playerVX = pushSign * 1.1 * obsBounce;
 

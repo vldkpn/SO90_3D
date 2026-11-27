@@ -41,6 +41,11 @@ const SUN_SPRITE_SIZE = SUN_SPRITE_HALF * 2;
 const SKY_LUT_H = 256;
 const HALO_SPRITE_SIZE = 64;
 
+// Параметры мип-кэша надписей для щитов и арок (устраняют дрожание шрифта и ступенчатые скачки размера)
+const SIGN_TEXT_BASE_H = 96;
+const SIGN_TEXT_BASE_FONT_PX = 68;
+const SIGN_TEXT_FONT_RATIO = SIGN_TEXT_BASE_FONT_PX / SIGN_TEXT_BASE_H;
+
 // Постоянные массивы разметки и колей (без пересоздания в каждом сегменте)
 const GROOVES_ONCOMING = Object.freeze([-0.66, -0.23, 0.23, 0.66]);
 const GROOVES_CIRCUIT = Object.freeze([-0.45, 0.45]);
@@ -150,6 +155,7 @@ let cityTileCanvas = null;
 
 const haloWeakCache = new WeakMap();
 const haloStringCache = new Map();
+const signLabelCache = new Map();
 
 // Переиспользуемые scratch-буферы для устранения аллокаций в расчёте света фар и геометрии арок
 const HEADLIGHT_STEPS = 20;
@@ -369,6 +375,102 @@ function getLightHaloSprite(softStops) {
   haloStringCache.set(key, off);
   haloWeakCache.set(softStops, off);
   return off;
+}
+
+/**
+ * Однократно запекает надпись дорожного баннера/арки в цепочку из 5 мип-уровней (96 -> 48 -> 24 -> 12 -> 6 px).
+ * Исключает ежекадровую растеризацию шрифта на CPU и квантование глифов fillText при масштабировании в 3D.
+ */
+function getSignLabelMipEntry(key, text, color) {
+  const cached = signLabelCache.get(key);
+  if (cached) return cached;
+
+  try {
+    const baseCanvas = document.createElement('canvas');
+    baseCanvas.width = 32;
+    baseCanvas.height = 32;
+    const bctx = baseCanvas.getContext('2d');
+    if (!bctx) return null;
+
+    const fontSpec = `900 ${SIGN_TEXT_BASE_FONT_PX}px sans-serif`;
+    bctx.font = fontSpec;
+    const rawW = Math.max(64, Math.ceil(bctx.measureText(text).width + 36));
+    // Кратность 16 гарантирует точное целочисленное деление пополам на всех 5 мип-уровнях без искажения пропорций
+    const baseW = Math.ceil(rawW / 16) * 16;
+
+    baseCanvas.width = baseW;
+    baseCanvas.height = SIGN_TEXT_BASE_H;
+    bctx.font = fontSpec;
+    bctx.textAlign = 'center';
+    bctx.textBaseline = 'middle';
+    bctx.fillStyle = color;
+    bctx.fillText(text, baseW * 0.5, SIGN_TEXT_BASE_H * 0.53);
+
+    const levels = [baseCanvas];
+    let prevCanvas = baseCanvas;
+    let mw = baseW;
+    let mh = SIGN_TEXT_BASE_H;
+
+    for (let m = 1; m <= 4; m++) {
+      mw >>= 1;
+      mh >>= 1;
+      const mipCanvas = document.createElement('canvas');
+      mipCanvas.width = mw;
+      mipCanvas.height = mh;
+      const mctx = mipCanvas.getContext('2d');
+      if (mctx) {
+        mctx.imageSmoothingEnabled = true;
+        if ('imageSmoothingQuality' in mctx) {
+          mctx.imageSmoothingQuality = 'high';
+        }
+        mctx.drawImage(prevCanvas, 0, 0, mw, mh);
+      }
+      levels.push(mipCanvas);
+      prevCanvas = mipCanvas;
+    }
+
+    const entry = { levels, aspect: baseW / SIGN_TEXT_BASE_H };
+    signLabelCache.set(key, entry);
+    return entry;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Субпиксельная отрисовка текста на 3D-объектах мира (арках и рекламных щитах) через мип-спрайт.
+ * Плавная float-интерполяция drawImage убирает рывки от Math.floor(fontSize) и хинтинга глифов.
+ */
+function drawWorldSignText(ctx, key, text, color, centerX, centerY, targetFontPx, maxWidth, alpha = 1) {
+  if (alpha <= 0.01 || targetFontPx < 0.9 || maxWidth <= 2) return;
+
+  const entry = getSignLabelMipEntry(key, text, color);
+  if (!entry) return;
+
+  let drawH = targetFontPx / SIGN_TEXT_FONT_RATIO;
+  let drawW = drawH * entry.aspect;
+
+  if (drawW > maxWidth) {
+    const fitScale = maxWidth / drawW;
+    drawW = maxWidth;
+    drawH *= fitScale;
+  }
+  if (drawH < 1.0) return;
+
+  // На порогах 48/24/12/6 px билинейная выборка 0.5x предыдущего уровня совпадает с 1.0x следующего (бесшовный переход)
+  const levels = entry.levels;
+  let mip = levels[0];
+  if (drawH < 6) mip = levels[4];
+  else if (drawH < 12) mip = levels[3];
+  else if (drawH < 24) mip = levels[2];
+  else if (drawH < 48) mip = levels[1];
+
+  const prevAlpha = ctx.globalAlpha;
+  if (alpha < 0.999) {
+    ctx.globalAlpha = prevAlpha * alpha;
+  }
+  ctx.drawImage(mip, centerX - drawW * 0.5, centerY - drawH * 0.5, drawW, drawH);
+  ctx.globalAlpha = prevAlpha;
 }
 
 /**
@@ -883,7 +985,7 @@ export function renderRoadHeadlights(ctx) {
  * Устранено ложное отсечение (y2 >= y1) на перегибах холмов: вертикальные балки корректно возвышаются
  * из-за гребня рельефа с точным отсечением по seg.clip, плавным скосом высоты на краях и фейдом у горизонта.
  */
-export function renderGuardrail(ctx, seg, distRatio = 0) {
+export function renderGuardrail(ctx, seg, distRatio = 0, drawShadow = true) {
   if (!seg.guardrailLeft && !seg.guardrailRight) return;
 
   // Плавное проявление отбойников из дымки горизонта на дальних 20% DRAW_DISTANCE
@@ -961,7 +1063,7 @@ export function renderGuardrail(ctx, seg, distRatio = 0) {
     }
 
     // Тень на обочине рисуется только на видимом склоне полотна (y1 > y2) и вблизи/на средней дистанции
-    if (y1 > y2 + 0.3 && w1 >= 10) {
+    if (drawShadow && y1 > y2 + 0.3 && w1 >= 10) {
       renderPolygon(
         ctx,
         gx1 - dir * w1 * 0.03, y1,
@@ -1020,13 +1122,15 @@ function computeArchLayout(destX, destY, roadHalfPx, isStartFinish) {
   return L;
 }
 
-function renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish) {
+function renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish, drawShadow = true) {
   const L = computeArchLayout(destX, destY, roadHalfPx, isStartFinish);
-  if (L.archH < 5 || destY < -40 || L.topY > LOGICAL_HEIGHT + 40) return;
+  if (L.archH < 3 || destY < -40 || L.topY > LOGICAL_HEIGHT + 40) return;
 
-  const shadowLen = roadHalfPx * 0.20;
-  fillQuad(ctx, L.leftOuterX, destY, L.leftInnerX + L.sideDepthW, destY, L.leftInnerX + L.sideDepthW + L.towerW * 0.25, destY + shadowLen, L.leftOuterX - L.towerW * 0.15, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
-  fillQuad(ctx, L.rightInnerX - L.sideDepthW, destY, L.rightOuterX, destY, L.rightOuterX + L.towerW * 0.15, destY + shadowLen, L.rightInnerX - L.sideDepthW - L.towerW * 0.25, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
+  if (drawShadow) {
+    const shadowLen = roadHalfPx * 0.20;
+    fillQuad(ctx, L.leftOuterX, destY, L.leftInnerX + L.sideDepthW, destY, L.leftInnerX + L.sideDepthW + L.towerW * 0.25, destY + shadowLen, L.leftOuterX - L.towerW * 0.15, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
+    fillQuad(ctx, L.rightInnerX - L.sideDepthW, destY, L.rightOuterX, destY, L.rightOuterX + L.towerW * 0.15, destY + shadowLen, L.rightInnerX - L.sideDepthW - L.towerW * 0.25, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
+  }
 
   const baseW = L.towerW * 1.42;
   const baseH = Math.max(2, L.archH * 0.055);
@@ -1069,6 +1173,7 @@ function renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish)
     }
   }
 
+  // Угловые раскосы жёсткости между стойками и верхней балкой арки
   const gussetSpan = Math.min(roadHalfPx * 0.20, L.bannerH * 1.15);
   const gussetDrop = L.bannerH * 0.85;
   if (gussetSpan > 4) {
@@ -1094,8 +1199,11 @@ function renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish)
   }
 }
 
-export function renderOverheadArchPillarsClipped(ctx, scale, destX, destY, clipY, isStartFinish) {
+export function renderOverheadArchPillarsClipped(ctx, scale, destX, destY, clipY, isStartFinish, drawShadow = true, distRatio = 0) {
   if (scale <= 0) return;
+  const archFade = distRatio > 0.88 ? MathUtil.clamp((1 - distRatio) / 0.12, 0, 1) : 1;
+  if (archFade <= 0.01) return;
+
   const LOGICAL_WIDTH = state.logicalWidth;
   const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
   const horizontalBound = roadHalfPx * 1.55;
@@ -1104,20 +1212,27 @@ export function renderOverheadArchPillarsClipped(ctx, scale, destX, destY, clipY
   }
 
   const archTopY = destY - roadHalfPx * 0.72;
-  const archBotY = destY + roadHalfPx * 0.20;
+  const archBotY = drawShadow ? (destY + roadHalfPx * 0.20) : destY;
   const hasClip = clipY !== null && clipY !== undefined;
   if (hasClip && archTopY >= clipY - 0.2) return;
 
   const needsClip = hasClip && archBotY > clipY + 0.5;
   if (needsClip) beginHorizonClip(ctx, clipY);
 
-  renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish);
+  const prevAlpha = ctx.globalAlpha;
+  if (archFade < 0.999) ctx.globalAlpha = prevAlpha * archFade;
 
+  renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish, drawShadow);
+
+  ctx.globalAlpha = prevAlpha;
   if (needsClip) ctx.restore();
 }
 
-export function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) {
+export function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish, distRatio = 0) {
   if (scale <= 0) return;
+  const archFade = distRatio > 0.88 ? MathUtil.clamp((1 - distRatio) / 0.12, 0, 1) : 1;
+  if (archFade <= 0.01) return;
+
   const LOGICAL_WIDTH = state.logicalWidth;
   const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
   const horizontalBound = roadHalfPx * 1.55;
@@ -1126,19 +1241,22 @@ export function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartF
   }
 
   const L = computeArchLayout(destX, destY, roadHalfPx, isStartFinish);
-  const soffitH = Math.max(2, L.bannerH * 0.16);
+  const soffitH = Math.max(1.2, L.bannerH * 0.16);
   const rawBeaconR = L.towerW * 0.34;
   const beaconR = MathUtil.clamp(rawBeaconR, 1.5, 22);
   const topBoundY = L.topY - beaconR * 2.5;
   const botBoundY = L.bannerBottomY + soffitH;
 
-  if (L.archH < 5 || botBoundY < -48 || topBoundY > LOGICAL_HEIGHT + 48) return;
+  if (L.archH < 3 || botBoundY < -48 || topBoundY > LOGICAL_HEIGHT + 48) return;
 
   const hasClip = clipY !== null && clipY !== undefined;
   if (hasClip && topBoundY >= clipY - 0.2) return;
 
   const needsClip = hasClip && botBoundY > clipY + 0.5;
   if (needsClip) beginHorizonClip(ctx, clipY);
+
+  const prevAlpha = ctx.globalAlpha;
+  if (archFade < 0.999) ctx.globalAlpha = prevAlpha * archFade;
 
   const beamOverhang = L.towerW * 0.16;
   const beamLeftX = L.leftOuterX - beamOverhang;
@@ -1149,15 +1267,23 @@ export function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartF
   ctx.fillStyle = L.darkFrameColor;
   ctx.fillRect(beamLeftX, L.topY, beamWidth, L.bannerH);
 
-  const trimH = Math.max(1.5, L.bannerH * 0.16);
-  if (isStartFinish && L.bannerH >= 8) {
-    const checkCols = 16;
-    const cellW = beamWidth / checkCols;
-    for (let c = 0; c < checkCols; c++) {
-      ctx.fillStyle = c % 2 === 0 ? '#ffffff' : '#140326';
-      ctx.fillRect(beamLeftX + c * cellW, L.topY, cellW + 0.4, trimH);
-      ctx.fillStyle = c % 2 === 1 ? '#ffffff' : '#140326';
-      ctx.fillRect(beamLeftX + c * cellW, L.bannerBottomY - trimH, cellW + 0.4, trimH);
+  // Пропорциональная толщина канта не перекрывает тёмное поле баннера на дальних дистанциях
+  const trimH = Math.max(0.5, L.bannerH * 0.15);
+  if (isStartFinish) {
+    if (L.bannerH >= 3.5) {
+      const checkCols = 16;
+      const cellW = beamWidth / checkCols;
+      for (let c = 0; c < checkCols; c++) {
+        ctx.fillStyle = c % 2 === 0 ? '#ffffff' : '#140326';
+        ctx.fillRect(beamLeftX + c * cellW, L.topY, cellW + 0.4, trimH);
+        ctx.fillStyle = c % 2 === 1 ? '#ffffff' : '#140326';
+        ctx.fillRect(beamLeftX + c * cellW, L.bannerBottomY - trimH, cellW + 0.4, trimH);
+      }
+    } else {
+      // На сверхдальней дистанции используем оптическое среднее шашечек вместо жёлтого, чтобы избежать скачка цвета
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillRect(beamLeftX, L.topY, beamWidth, trimH);
+      ctx.fillRect(beamLeftX, L.bannerBottomY - trimH, beamWidth, trimH);
     }
   } else {
     ctx.fillStyle = L.secondaryColor;
@@ -1172,7 +1298,7 @@ export function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartF
   ctx.arc(L.rightTowerCenterX, beaconY, beaconR, 0, Math.PI * 2);
   ctx.fill();
 
-  const beaconHaloFade = MathUtil.clamp((rawBeaconR - 0.5) / 1.8, 0, 1);
+  const beaconHaloFade = MathUtil.clamp((rawBeaconR - 0.5) / 1.8, 0, 1) * archFade;
   if (state.settings.lightStyle === 'soft' && beaconHaloFade > 0.01) {
     const beaconStops = isStartFinish ? HALO_STOPS.beaconStart : HALO_STOPS.beaconCheckpoint;
     const haloBaseR = MathUtil.clamp(rawBeaconR, 1.2, 22);
@@ -1180,26 +1306,34 @@ export function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartF
     drawLightHalo(ctx, L.rightTowerCenterX, beaconY, haloBaseR, L.secondaryColor, haloBaseR * 3.2, beaconStops, beaconHaloFade);
   }
 
-  if (L.bannerH >= 10 && L.bannerH < 420) {
-    const fontSize = Math.floor(L.bannerH * 0.52);
-    ctx.fillStyle = isStartFinish ? '#39ff14' : '#ffffff';
-    ctx.font = `900 ${fontSize}px sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(isStartFinish ? 'START / FINISH' : 'CHECKPOINT', destX, L.topY + L.bannerH * 0.52);
+  // Плавное проявление текста арки издалека (с L.bannerH = 2.0 px вместо позднего скачка на 10 px)
+  if (L.bannerH >= 2.0 && L.bannerH < 900) {
+    const textAlpha = MathUtil.clamp((L.bannerH - 2.0) / 1.8, 0, 1);
+    drawWorldSignText(
+      ctx,
+      isStartFinish ? 'arch_start' : 'arch_cp',
+      isStartFinish ? 'START / FINISH' : 'CHECKPOINT',
+      isStartFinish ? '#39ff14' : '#ffffff',
+      destX,
+      L.topY + L.bannerH * 0.50,
+      L.bannerH * 0.52,
+      beamWidth * 0.88,
+      textAlpha
+    );
   }
 
+  ctx.globalAlpha = prevAlpha;
   if (needsClip) ctx.restore();
 }
 
 /**
- * Отрисовка придорожных объектов с ранним отсечением за холмами (clipY), условным ctx.clip() и дистанционным LOD пальм
+ * Отрисовка только плоской наземной тени придорожного объекта или опор арки.
+ * Используется для объектов переднего плана (ближе машины игрока): тень ложится на траву/обочину
+ * строго ПОД колёса машин, тогда как сама вертикальная 3D-стойка рисуется позже поверх машин позади неё.
  */
-export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio = 0) {
-  if (scale <= 0) return;
-
-  const horizonFade = distRatio > 0.84 ? MathUtil.clamp((1 - distRatio) / 0.16, 0, 1) : 1;
-  if (horizonFade <= 0.01) return;
+export function renderSpriteGroundShadow(ctx, sprite, scale, destX, destY, clipY) {
+  // Если основание объекта уже ниже нижнего края экрана, направленная вниз тень полностью за кадром
+  if (scale <= 0 || destY > LOGICAL_HEIGHT + 24) return;
 
   const LOGICAL_WIDTH = state.logicalWidth;
   const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
@@ -1215,9 +1349,92 @@ export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio 
     return;
   }
 
+  const shadowSpanY = isFullArch ? roadHalfPx * 0.22 : unit * 0.36;
+  const hasClip = clipY !== null && clipY !== undefined;
+  if (hasClip && destY >= clipY - 0.2) return;
+
+  const needsClip = hasClip && (destY + shadowSpanY) > clipY + 0.5;
+  if (needsClip) beginHorizonClip(ctx, clipY);
+
+  const sunX = getSunX();
+  const shadowDirX = (destX - sunX) * 0.0005;
+
+  if (isFullArch) {
+    const L = computeArchLayout(destX, destY, roadHalfPx, sprite.type === 'start_arch');
+    if (L.archH >= 5) {
+      const shadowLen = roadHalfPx * 0.20;
+      fillQuad(ctx, L.leftOuterX, destY, L.leftInnerX + L.sideDepthW, destY, L.leftInnerX + L.sideDepthW + L.towerW * 0.25, destY + shadowLen, L.leftOuterX - L.towerW * 0.15, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
+      fillQuad(ctx, L.rightInnerX - L.sideDepthW, destY, L.rightOuterX, destY, L.rightOuterX + L.towerW * 0.15, destY + shadowLen, L.rightInnerX - L.sideDepthW - L.towerW * 0.25, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
+    }
+  } else if (sprite.type === 'palm') {
+    if (unit >= 10) {
+      const trunkW = MathUtil.clamp(unit * 0.055, 1.8, 42);
+      const shadowLen = unit * 0.34;
+      ctx.strokeStyle = 'rgba(6, 2, 16, 0.42)';
+      ctx.lineWidth = MathUtil.clamp(trunkW * 1.2, 2, 48);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(destX, destY);
+      ctx.lineTo(destX + shadowDirX * shadowLen * 12, destY + shadowLen);
+      ctx.stroke();
+      ctx.lineCap = 'butt';
+    }
+  } else if (sprite.type === 'lamp') {
+    if (unit >= 11) {
+      const poleW = MathUtil.clamp(unit * 0.028, 1.8, 24);
+      const shadowLen = unit * 0.28;
+      ctx.strokeStyle = 'rgba(6, 2, 16, 0.40)';
+      ctx.lineWidth = MathUtil.clamp(poleW * 1.1, 1.5, 26);
+      ctx.beginPath();
+      ctx.moveTo(destX, destY);
+      ctx.lineTo(destX + shadowDirX * shadowLen * 10, destY + shadowLen);
+      ctx.stroke();
+    }
+  } else if (sprite.type === 'billboard') {
+    if (unit >= 10) {
+      const boardW = unit * 0.56;
+      const bx = destX - boardW * 0.5;
+      fillQuad(ctx, bx, destY, bx + boardW, destY, bx + boardW + shadowDirX * unit * 3, destY + unit * 0.22, bx + shadowDirX * unit * 3, destY + unit * 0.22, 'rgba(6, 2, 16, 0.42)');
+    }
+  } else if (sprite.type === 'chevron_left' || sprite.type === 'chevron_right') {
+    if (unit >= 10) {
+      const signW = unit * 0.22;
+      const sx = destX - signW * 0.5;
+      fillQuad(ctx, sx, destY, sx + signW, destY, sx + signW, destY + unit * 0.14, sx, destY + unit * 0.14, 'rgba(6, 2, 16, 0.38)');
+    }
+  }
+
+  if (needsClip) ctx.restore();
+}
+
+/**
+ * Отрисовка придорожных объектов с ранним отсечением за холмами (clipY), условным ctx.clip() и дистанционным LOD пальм
+ */
+export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio = 0, drawShadow = true) {
+  if (scale <= 0) return;
+
+  const isFullArch = sprite.type === 'start_arch' || sprite.type === 'checkpoint_arch';
+  const horizonFade = isFullArch
+    ? (distRatio > 0.88 ? MathUtil.clamp((1 - distRatio) / 0.12, 0, 1) : 1)
+    : (distRatio > 0.84 ? MathUtil.clamp((1 - distRatio) / 0.16, 0, 1) : 1);
+  if (horizonFade <= 0.01) return;
+
+  const LOGICAL_WIDTH = state.logicalWidth;
+  const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
+  const unit = roadHalfPx * SPRITE_SCALE_RATIO;
+  const horizontalBound = isFullArch ? roadHalfPx * 1.55 : unit * 1.25;
+
+  if (
+    roadHalfPx < 1.2 ||
+    destX + horizontalBound < -48 ||
+    destX - horizontalBound > LOGICAL_WIDTH + 48
+  ) {
+    return;
+  }
+
   // Точная верхняя и нижняя граница спрайта для мгновенного отсечения объектов, полностью скрытых за гребнем холма
   const approxTopY = isFullArch ? (destY - roadHalfPx * 0.78) : (destY - unit * 1.18);
-  const approxBotY = destY + (isFullArch ? roadHalfPx * 0.22 : unit * 0.36);
+  const approxBotY = drawShadow ? (destY + (isFullArch ? roadHalfPx * 0.22 : unit * 0.36)) : destY;
 
   if (approxTopY > LOGICAL_HEIGHT + 48) return;
 
@@ -1229,7 +1446,7 @@ export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio 
   if (needsClip) beginHorizonClip(ctx, clipY);
 
   const prevAlpha = ctx.globalAlpha;
-  if (horizonFade < 0.999 && !isFullArch) {
+  if (horizonFade < 0.999) {
     ctx.globalAlpha = prevAlpha * horizonFade;
   }
 
@@ -1237,17 +1454,18 @@ export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio 
   const shadowDirX = (destX - sunX) * 0.0005;
 
   if (isFullArch) {
-    renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, sprite.type === 'start_arch');
+    renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, sprite.type === 'start_arch', drawShadow);
   } else if (sprite.type === 'palm') {
     const trunkW = MathUtil.clamp(unit * 0.055, 1.8, 42);
     const trunkH = unit * 0.85;
     const topX = destX + (sprite.offset < 0 ? -unit * 0.06 : unit * 0.06);
     const topY = destY - trunkH;
 
-    if (unit >= 10) {
+    if (drawShadow && unit >= 10) {
       const shadowLen = unit * 0.34;
       ctx.strokeStyle = 'rgba(6, 2, 16, 0.42)';
       ctx.lineWidth = MathUtil.clamp(trunkW * 1.2, 2, 48);
+      ctx.lineCap = 'round';
       ctx.beginPath();
       ctx.moveTo(destX, destY);
       ctx.lineTo(destX + shadowDirX * shadowLen * 12, destY + shadowLen);
@@ -1313,7 +1531,7 @@ export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio 
     const armDir = sprite.offset < 0 ? 1 : -1;
     const armLen = unit * 0.18 * armDir;
 
-    if (unit >= 11) {
+    if (drawShadow && unit >= 11) {
       const shadowLen = unit * 0.28;
       ctx.strokeStyle = 'rgba(6, 2, 16, 0.40)';
       ctx.lineWidth = MathUtil.clamp(poleW * 1.1, 1.5, 26);
@@ -1360,15 +1578,15 @@ export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio 
     const legH = unit * 0.34;
     const bx = destX - boardW * 0.5;
     const by = destY - legH - boardH;
-    const depthW = Math.max(2, boardW * 0.08);
+    const depthW = Math.max(0.8, boardW * 0.08);
     const sideSign = sprite.offset < 0 ? -1 : 1;
 
-    if (unit >= 10) {
+    if (drawShadow && unit >= 10) {
       fillQuad(ctx, bx, destY, bx + boardW, destY, bx + boardW + shadowDirX * unit * 3, destY + unit * 0.22, bx + shadowDirX * unit * 3, destY + unit * 0.22, 'rgba(6, 2, 16, 0.42)');
     }
 
     ctx.fillStyle = '#4a4e69';
-    const legW = Math.max(2, boardW * 0.08);
+    const legW = Math.max(1.2, boardW * 0.08);
     ctx.fillRect(bx + boardW * 0.2, destY - legH, legW, legH);
     ctx.fillRect(bx + boardW * 0.72, destY - legH, legW, legH);
 
@@ -1379,15 +1597,24 @@ export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio 
     ctx.fillStyle = '#14042e';
     ctx.fillRect(bx, by, boardW, boardH);
     ctx.strokeStyle = '#ff2a85';
-    ctx.lineWidth = MathUtil.clamp(unit * 0.015, 1.5, 10);
+    // Уменьшенный нижний порог толщины рамки сохраняет читаемое тёмное поле под текст вдали
+    ctx.lineWidth = MathUtil.clamp(unit * 0.015, 0.75, 10);
     ctx.strokeRect(bx, by, boardW, boardH);
 
-    if (boardH > 12 && boardH < 420) {
-      ctx.fillStyle = '#ffbe0b';
-      ctx.font = `900 ${Math.floor(boardH * 0.34)}px sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('TURBO 90', destX, by + boardH * 0.52);
+    // Плавное проявление текста щита издалека (с boardH = 2.6 px вместо позднего скачка на 12 px)
+    if (boardH >= 2.6 && boardH < 900) {
+      const textAlpha = MathUtil.clamp((boardH - 2.6) / 2.2, 0, 1);
+      drawWorldSignText(
+        ctx,
+        'billboard_turbo90',
+        'TURBO 90',
+        '#ffbe0b',
+        destX,
+        by + boardH * 0.50,
+        boardH * 0.36,
+        boardW * 0.84,
+        textAlpha
+      );
     }
   } else if (sprite.type === 'chevron_left' || sprite.type === 'chevron_right') {
     const signW = unit * 0.22;
@@ -1398,7 +1625,7 @@ export function renderSprite(ctx, sprite, scale, destX, destY, clipY, distRatio 
     const depthW = Math.max(1.5, signW * 0.10);
     const sideSign = sprite.offset < 0 ? -1 : 1;
 
-    if (unit >= 10) {
+    if (drawShadow && unit >= 10) {
       fillQuad(ctx, sx, destY, sx + signW, destY, sx + signW, destY + unit * 0.14, sx, destY + unit * 0.14, 'rgba(6, 2, 16, 0.38)');
     }
 

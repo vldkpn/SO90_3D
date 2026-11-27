@@ -27,6 +27,7 @@ import {
   renderGuardrail,
   renderOverheadArchPillarsClipped,
   renderOverheadArchBeam,
+  renderSpriteGroundShadow,
   renderSprite
 } from './renderWorld.js';
 import { renderTrafficCar, renderPlayerCar } from './renderCars.js';
@@ -36,56 +37,50 @@ const particleColorCache = new Map();
 const softParticleSpriteCache = new Map();
 const SOFT_PARTICLE_TEX_SIZE = 48;
 
-// Постоянные пулы объектов переднего плана (устраняют ежекадровые аллокации в куче при проезде арок и обгонах)
-const _fgCarPool = [];
-const _foregroundCars = [];
+// Типы 3D-объектов в единой очереди сортировки переднего плана (от дальних к ближним по camera.z)
+const FG_KIND_PLAYER_CAR = 0;
+const FG_KIND_TRAFFIC_CAR = 1;
+const FG_KIND_GUARDRAIL = 2;
+const FG_KIND_SPRITE = 3;
+const FG_KIND_ARCH_FULL = 4;
+const FG_KIND_ARCH_BEAM = 5;
 
-const _archBeamPool = [];
-const _foregroundArchBeams = [];
-const _segArchBeams = [];
-
+// Постоянный пул слотов переднего плана (0 аллокаций в куче при обгонах и проезде мимо столбов/арок)
+const _fgItemPool = [];
+const _foregroundItems = [];
 const _segCarsScratch = [];
+let _hoodParticlesRendered = false;
 
 /**
- * Выдаёт переиспользуемый слот для сортировки машин переднего плана (0 аллокаций после прогрева)
+ * Выдаёт переиспользуемый слот очереди переднего плана без создания новых объектов
  */
-function pushForegroundCar(car, isParkedPlayer, carCamZ) {
-  const idx = _foregroundCars.length;
-  let slot = _fgCarPool[idx];
-  if (!slot) {
-    slot = { car: null, isParkedPlayer: false, carCamZ: 0 };
-    _fgCarPool.push(slot);
-  }
-  slot.car = car;
-  slot.isParkedPlayer = isParkedPlayer;
-  slot.carCamZ = carCamZ;
-  _foregroundCars.push(slot);
-}
-
-/**
- * Выдаёт переиспользуемый слот параметров арки старта/чекпоинта (0 аллокаций после прогрева)
- */
-function allocArchBeamSlot(poolIdx, scale, x, y, clip, isStartFinish, camZ, drawPillars) {
-  let slot = _archBeamPool[poolIdx];
+function pushForegroundItem(kind, sortZ, tieOrder) {
+  const idx = _foregroundItems.length;
+  let slot = _fgItemPool[idx];
   if (!slot) {
     slot = {
+      kind: 0,
+      sortZ: 0,
+      tieOrder: 0,
+      car: null,
+      carCamZ: 0,
+      isParkedPlayer: false,
+      seg: null,
+      sprite: null,
       scale: 0,
       x: 0,
       y: 0,
       clip: LOGICAL_HEIGHT,
+      distRatio: 0,
       isStartFinish: false,
-      camZ: 0,
-      drawPillars: false
+      drawShadow: false
     };
-    _archBeamPool.push(slot);
+    _fgItemPool.push(slot);
   }
-  slot.scale = scale;
-  slot.x = x;
-  slot.y = y;
-  slot.clip = clip;
-  slot.isStartFinish = isStartFinish;
-  slot.camZ = camZ;
-  slot.drawPillars = drawPillars;
+  slot.kind = kind;
+  slot.sortZ = sortZ;
+  slot.tieOrder = tieOrder;
+  _foregroundItems.push(slot);
   return slot;
 }
 
@@ -94,12 +89,10 @@ function compareSegCarsFarToNear(a, b) {
   return b._frameCamZ - a._frameCamZ;
 }
 
-function compareForegroundCarsFarToNear(a, b) {
-  return b.carCamZ - a.carCamZ;
-}
-
-function compareArchBeamsFarToNear(a, b) {
-  return b.camZ - a.camZ;
+function compareForegroundItemsFarToNear(a, b) {
+  const dz = b.sortZ - a.sortZ;
+  if (Math.abs(dz) > 1e-3) return dz;
+  return a.tieOrder - b.tieOrder;
 }
 
 /**
@@ -179,13 +172,16 @@ function getSoftParticleSprite(c) {
 }
 
 /**
- * Отрисовка системы частиц (дым шин, пыль обочины, искры ударов и выхлопа) с отсечением за пределами экрана
+ * Отрисовка системы частиц с фильтрацией по 3D-слою ('hood' — из-под переднего капота за кабиной,
+ * 'foreground' — шины, пыль, выхлоп и внешние искры поверх машины, 'all' — все частицы).
  */
-function renderParticles(ctx) {
+function renderParticles(ctx, layerMode = 'all') {
   if (!state.settings.particlesEnabled) return;
   const particles = state.particles;
   if (!particles.length) return;
 
+  const onlyHood = layerMode === 'hood';
+  const skipHood = layerMode === 'foreground';
   const LOGICAL_WIDTH = state.logicalWidth;
   const isSoftLight = state.settings.lightStyle === 'soft';
 
@@ -194,6 +190,9 @@ function renderParticles(ctx) {
     let activeComposite = 'source-over';
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
+      const isHood = Boolean(p.isHood);
+      if ((onlyHood && !isHood) || (skipHood && isHood)) continue;
+
       const alpha = MathUtil.clamp(p.life / p.maxLife, 0, 1);
       if (alpha <= 0.01) continue;
 
@@ -218,6 +217,9 @@ function renderParticles(ctx) {
   } else {
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
+      const isHood = Boolean(p.isHood);
+      if ((onlyHood && !isHood) || (skipHood && isHood)) continue;
+
       const alpha = MathUtil.clamp(p.life / p.maxLife, 0, 1);
       if (alpha <= 0.01) continue;
 
@@ -239,6 +241,14 @@ function renderParticles(ctx) {
     }
   }
   ctx.restore();
+}
+
+/**
+ * Статичный колбэк отрисовки слоя дыма и искр капота внутри 3D-прохода машины игрока (0 замыканий в кадре)
+ */
+function renderHoodParticlesLayer(ctx) {
+  _hoodParticlesRendered = true;
+  renderParticles(ctx, 'hood');
 }
 
 /**
@@ -279,7 +289,8 @@ export function renderFrame(ctx) {
     ? MathUtil.lerp(playerSegment.p1.world.y, playerSegment.p2.world.y, playerPercent)
     : 0;
 
-  const effectiveCamWorldX = (state.playerX - state.cameraLagX) * ROAD_WIDTH;
+  const effectiveCamXNorm = state.playerX - state.cameraLagX;
+  const effectiveCamWorldX = effectiveCamXNorm * ROAD_WIDTH;
   const cameraWorldY = playerY + CAMERA_HEIGHT;
 
   // Запас +18px снизу гарантирует закрытие нижних углов экрана при максимальном угле крена камеры
@@ -339,7 +350,7 @@ export function renderFrame(ctx) {
       continue;
     }
 
-    const distRatio = n * invDrawDist;
+    const distRatio = Math.max(0, n - basePercent) * invDrawDist;
     const fogNorm = distRatio > 0.72 ? (distRatio - 0.72) / 0.28 : 0;
     const fog = fogNorm > 0 ? MathUtil.exponentialFog(fogNorm, FOG_DENSITY) * 0.28 : 0;
     renderSegment(ctx, seg, n, fog);
@@ -349,69 +360,60 @@ export function renderFrame(ctx) {
 
   renderRoadHeadlights(ctx);
 
-  _foregroundCars.length = 0;
-  _foregroundArchBeams.length = 0;
-  let archPoolCursor = 0;
-  const foregroundThresholdZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
+  const isTotalWreckGameOver =
+    state.gameState === STATE.GAMEOVER &&
+    state.gameMode !== 'circuit' &&
+    state.visualDamage >= MAX_HARDCORE_COLLISIONS;
+  const isDetachedGameOverCar = state.gameState === STATE.GAMEOVER && !isTotalWreckGameOver;
 
-  // 2. Обратный проход (от горизонта к камере): отбойники, придорожные объекты, трафик и арки
+  const activePlayerCenterZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
+  const playerRearCamZ = activePlayerCenterZ - PLAYER_LEN_Z * 0.5;
+
+  let parkedPlayerCamZ = 0;
+  let hasParkedPlayerInScene = false;
+  if (isDetachedGameOverCar && !state.playerCarPassedByCamera) {
+    parkedPlayerCamZ = getShortestTrackDz(state.position, state.stoppedPlayerZ, trackLength);
+    if (parkedPlayerCamZ + PLAYER_LEN_Z * 0.5 <= MIN_CAR_CAM_Z) {
+      state.playerCarPassedByCamera = true;
+    } else {
+      hasParkedPlayerInScene = true;
+    }
+  }
+
+  const foregroundThresholdZ = hasParkedPlayerInScene
+    ? Math.max(activePlayerCenterZ, parkedPlayerCamZ)
+    : activePlayerCenterZ;
+
+  _foregroundItems.length = 0;
+
+  // 2. Обратный проход (от горизонта к камере): дальние объекты рисуются сразу,
+  // а всё, что ближе центра машины игрока, собирается в Z-сортируемую очередь переднего плана
   for (let n = DRAW_DISTANCE - 1; n >= 0; n--) {
     const segIndex = (baseSegment.index + n) % segments.length;
     const seg = segments[segIndex];
-    const distRatio = n * invDrawDist;
-    _segArchBeams.length = 0;
+    const segCamZ = seg.p1.camera.z;
+    const distRatio = Math.max(0, n - basePercent) * invDrawDist;
 
-    if (seg.p1.camera.z > MIN_GUARDRAIL_CAM_Z) {
-      if (state.gameMode === 'circuit') {
-        renderGuardrail(ctx, seg, distRatio);
-      }
+    // 2а. Отбойники сегмента
+    if (state.gameMode === 'circuit' && segCamZ > MIN_GUARDRAIL_CAM_Z && (seg.guardrailLeft || seg.guardrailRight)) {
+      const isEntirelyInFrontOfPlayer = !isDetachedGameOverCar && seg.p2.camera.z <= playerRearCamZ - 40;
+      const isCrossingCameraToPlayer =
+        !isDetachedGameOverCar &&
+        segCamZ < foregroundThresholdZ &&
+        ((seg.guardrailLeft && state.playerX < -1.19 && effectiveCamXNorm > -1.17) ||
+          (seg.guardrailRight && state.playerX > 1.19 && effectiveCamXNorm < 1.17));
 
-      if (seg.p1.camera.z > MIN_SPRITE_CAM_Z && seg.sprites.length > 0) {
-        const spriteScale = seg.p1.screen.scale;
-        const spriteBaseX = seg.p1.screen.x;
-        const spriteY = seg.p1.screen.y;
-
-        for (let i = 0; i < seg.sprites.length; i++) {
-          const sp = seg.sprites[i];
-          const spriteX = spriteBaseX + (spriteScale * sp.offset * ROAD_WIDTH * PROJ_HALF_WIDTH);
-          const isArch = sp.type === 'start_arch' || sp.type === 'checkpoint_arch';
-
-          if (isArch && seg.p1.camera.z < foregroundThresholdZ) {
-            _segArchBeams.push(
-              allocArchBeamSlot(
-                archPoolCursor++,
-                spriteScale,
-                spriteX,
-                spriteY,
-                seg.clip,
-                sp.type === 'start_arch',
-                seg.p1.camera.z,
-                true
-              )
-            );
-            continue;
-          }
-
-          renderSprite(ctx, sp, spriteScale, spriteX, spriteY, seg.clip, distRatio);
-
-          if (isArch) {
-            _segArchBeams.push(
-              allocArchBeamSlot(
-                archPoolCursor++,
-                spriteScale,
-                spriteX,
-                spriteY,
-                seg.clip,
-                sp.type === 'start_arch',
-                seg.p1.camera.z,
-                false
-              )
-            );
-          }
-        }
+      if (isEntirelyInFrontOfPlayer || isCrossingCameraToPlayer) {
+        const item = pushForegroundItem(FG_KIND_GUARDRAIL, (segCamZ + seg.p2.camera.z) * 0.5, 1);
+        item.seg = seg;
+        item.distRatio = distRatio;
+        item.drawShadow = isEntirelyInFrontOfPlayer;
+      } else {
+        renderGuardrail(ctx, seg, distRatio, true);
       }
     }
 
+    // 2б. Машины сегмента (carCamZ внутри [p1.z, p2.z), т.е. дальше точки p1.z со статическими спрайтами)
     if (seg.cars.length > 0) {
       let segCars = seg.cars;
       const carCount = segCars.length;
@@ -422,7 +424,6 @@ export function renderFrame(ctx) {
       }
 
       if (carCount === 2) {
-        // Быстрая сортировка двух машин в одном сегменте без вызова Array.prototype.sort
         const c0 = segCars[0];
         const c1 = segCars[1];
         _segCarsScratch.length = 2;
@@ -451,77 +452,122 @@ export function renderFrame(ctx) {
         if (carCamZ + halfCarLen <= MIN_CAR_CAM_Z) continue;
 
         if (carCamZ < foregroundThresholdZ) {
-          pushForegroundCar(car, false, carCamZ);
+          const item = pushForegroundItem(FG_KIND_TRAFFIC_CAR, carCamZ, 0);
+          item.car = car;
+          item.carCamZ = carCamZ;
         } else {
           renderTrafficCar(ctx, car, carCamZ);
         }
       }
     }
 
-    for (let b = 0; b < _segArchBeams.length; b++) {
-      const beam = _segArchBeams[b];
-      if (beam.drawPillars || beam.camZ < foregroundThresholdZ + 220) {
-        _foregroundArchBeams.push(beam);
-      } else {
-        renderOverheadArchBeam(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
+    // 2в. Придорожные статические объекты и арки (расположены на ближней границе сегмента p1.z)
+    if (segCamZ > MIN_SPRITE_CAM_Z && seg.sprites.length > 0) {
+      const spriteScale = seg.p1.screen.scale;
+      const spriteBaseX = seg.p1.screen.x;
+      const spriteY = seg.p1.screen.y;
+
+      for (let i = 0; i < seg.sprites.length; i++) {
+        const sp = seg.sprites[i];
+        const spriteX = spriteBaseX + (spriteScale * sp.offset * ROAD_WIDTH * PROJ_HALF_WIDTH);
+        const isArch = sp.type === 'start_arch' || sp.type === 'checkpoint_arch';
+
+        if (segCamZ < foregroundThresholdZ) {
+          // Тень кладём на землю сразу (под шины машин), а сам столб/пальму/щит/арку — в Z-очередь переднего плана
+          renderSpriteGroundShadow(ctx, sp, spriteScale, spriteX, spriteY, seg.clip);
+
+          const item = pushForegroundItem(
+            isArch ? FG_KIND_ARCH_FULL : FG_KIND_SPRITE,
+            segCamZ,
+            isArch ? 3 : 2
+          );
+          item.sprite = sp;
+          item.scale = spriteScale;
+          item.x = spriteX;
+          item.y = spriteY;
+          item.clip = seg.clip;
+          item.distRatio = distRatio;
+          item.isStartFinish = sp.type === 'start_arch';
+          continue;
+        }
+
+        renderSprite(ctx, sp, spriteScale, spriteX, spriteY, seg.clip, distRatio, true);
+
+        if (isArch) {
+          if (segCamZ < foregroundThresholdZ + 220) {
+            // При заезде капота под арку её опоры уже позади центра машины, но верхняя балка остаётся над крышей
+            const item = pushForegroundItem(
+              FG_KIND_ARCH_BEAM,
+              Math.min(segCamZ, activePlayerCenterZ - 0.5),
+              3
+            );
+            item.scale = spriteScale;
+            item.x = spriteX;
+            item.y = spriteY;
+            item.clip = seg.clip;
+            item.distRatio = distRatio;
+            item.isStartFinish = sp.type === 'start_arch';
+          } else {
+            renderOverheadArchBeam(ctx, spriteScale, spriteX, spriteY, seg.clip, sp.type === 'start_arch', distRatio);
+          }
+        }
       }
     }
   }
 
-  // 3. Автомобиль игрока (при Game Over, кроме полного тотала, остаётся на трассе, пока камера проезжает вперёд)
-  const isTotalWreckGameOver =
-    state.gameState === STATE.GAMEOVER &&
-    state.gameMode !== 'circuit' &&
-    state.visualDamage >= MAX_HARDCORE_COLLISIONS;
-  const isDetachedGameOverCar = state.gameState === STATE.GAMEOVER && !isTotalWreckGameOver;
-
+  // 3. Добавляем автомобиль игрока в общую Z-очередь переднего плана и рисуем все ближние объекты строго от дальних к ближним
   if (!isDetachedGameOverCar) {
-    renderPlayerCar(ctx);
-  } else if (!state.playerCarPassedByCamera) {
-    const parkedCamZ = getShortestTrackDz(state.position, state.stoppedPlayerZ, trackLength);
-    if (parkedCamZ + PLAYER_LEN_Z * 0.5 <= MIN_CAR_CAM_Z) {
-      state.playerCarPassedByCamera = true;
-    } else {
-      pushForegroundCar(null, true, parkedCamZ);
-    }
+    const item = pushForegroundItem(FG_KIND_PLAYER_CAR, activePlayerCenterZ, 0);
+    item.isParkedPlayer = false;
+    item.carCamZ = activePlayerCenterZ;
+  } else if (hasParkedPlayerInScene) {
+    const item = pushForegroundItem(FG_KIND_PLAYER_CAR, parkedPlayerCamZ, 0);
+    item.isParkedPlayer = true;
+    item.carCamZ = parkedPlayerCamZ;
   }
 
-  // 4. Машины на переднем плане (между бампером игрока и объективом камеры)
-  if (_foregroundCars.length > 0) {
-    if (_foregroundCars.length > 1) {
-      _foregroundCars.sort(compareForegroundCarsFarToNear);
-    }
-    for (let i = 0; i < _foregroundCars.length; i++) {
-      const item = _foregroundCars[i];
-      if (item.isParkedPlayer) {
-        renderPlayerCar(ctx, item.carCamZ);
-      } else {
+  if (_foregroundItems.length > 1) {
+    _foregroundItems.sort(compareForegroundItemsFarToNear);
+  }
+
+  _hoodParticlesRendered = false;
+
+  for (let i = 0; i < _foregroundItems.length; i++) {
+    const item = _foregroundItems[i];
+    switch (item.kind) {
+      case FG_KIND_PLAYER_CAR:
+        renderPlayerCar(
+          ctx,
+          item.isParkedPlayer ? item.carCamZ : null,
+          item.isParkedPlayer ? null : renderHoodParticlesLayer
+        );
+        break;
+      case FG_KIND_TRAFFIC_CAR:
         renderTrafficCar(ctx, item.car, item.carCamZ);
-      }
+        break;
+      case FG_KIND_GUARDRAIL:
+        renderGuardrail(ctx, item.seg, item.distRatio, item.drawShadow);
+        break;
+      case FG_KIND_SPRITE:
+        renderSprite(ctx, item.sprite, item.scale, item.x, item.y, item.clip, item.distRatio, false);
+        break;
+      case FG_KIND_ARCH_FULL:
+        renderOverheadArchPillarsClipped(ctx, item.scale, item.x, item.y, item.clip, item.isStartFinish, false, item.distRatio);
+        renderOverheadArchBeam(ctx, item.scale, item.x, item.y, item.clip, item.isStartFinish, item.distRatio);
+        break;
+      case FG_KIND_ARCH_BEAM:
+        renderOverheadArchBeam(ctx, item.scale, item.x, item.y, item.clip, item.isStartFinish, item.distRatio);
+        break;
     }
   }
 
-  // 5. Ближние арки (перекладины и опоры, оказавшиеся ближе машины игрока)
-  if (_foregroundArchBeams.length > 0) {
-    if (_foregroundArchBeams.length > 1) {
-      _foregroundArchBeams.sort(compareArchBeamsFarToNear);
-    }
-    for (let b = 0; b < _foregroundArchBeams.length; b++) {
-      const beam = _foregroundArchBeams[b];
-      if (beam.drawPillars) {
-        renderOverheadArchPillarsClipped(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
-      }
-      renderOverheadArchBeam(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
-    }
-  }
-
-  // 6. Экранный слой частиц
-  renderParticles(ctx);
+  // 4. Экранный слой внешних частиц (дым шин, пыль, выхлоп, искры ударов и осколки спойлера)
+  renderParticles(ctx, _hoodParticlesRendered ? 'foreground' : 'all');
 
   if (hasRollTransform) {
     ctx.restore();
   }
 
-  // 7. Приборная панель и интерфейс поверх 3D-сцены
+  // 5. Приборная панель и интерфейс поверх 3D-сцены
   renderHUD(ctx);
 }
