@@ -9,11 +9,47 @@ import {
 import { MathUtil, getShortestTrackDz } from './utils.js';
 import { state, findSegment } from './state.js';
 
+// Предельно допустимая кривизна кольцевой трассы (острые, но физически проходимые повороты)
+const MAX_CIRCUIT_CURVE = 7.6;
+const SHARP_CURVE_THRESHOLD = 5.8;
+
+// Переиспользуемые неизменяемые палитры сегментов (убирают 1660 аллокаций объектов при построении трассы)
+const PALETTE_DARK = Object.freeze({
+  road: '#252a42',
+  grass: '#100624',
+  rumble: '#ff2a85',
+  edge: '#ffffff',
+  lane: '#ffffff'
+});
+
+const PALETTE_LIGHT = Object.freeze({
+  road: '#2f3552',
+  grass: '#160930',
+  rumble: '#ffffff',
+  edge: '#b8f2ff',
+  lane: null
+});
+
+const PALETTE_DARK_SHARP_YELLOW = Object.freeze({ ...PALETTE_DARK, rumble: '#ffbe0b' });
+const PALETTE_LIGHT_SHARP_YELLOW = Object.freeze({ ...PALETTE_LIGHT, rumble: '#ffbe0b' });
+const PALETTE_LIGHT_SHARP_PINK = Object.freeze({ ...PALETTE_LIGHT, rumble: '#ff2a85' });
+
+// Кольцевой индекс перезаписи следов торможения за O(1) вместо Array.shift()
+let skidWriteIdx = 0;
+
 /**
  * Запись следов торможения для игрока (sampleOwner = null) или соперника
  */
 export function recordSkidMarks(currZ, currX, alpha, fallbackBackDist = 0, sampleOwner = null) {
-  const prev = sampleOwner ? sampleOwner.prevSkidSample : state.prevSkidSample;
+  const trackLength = state.trackLength;
+  const totalSegs = state.segments.length;
+  if (trackLength <= 0 || totalSegs === 0) return;
+
+  if (state.skidMarksList.length === 0) {
+    skidWriteIdx = 0;
+  }
+
+  let prev = sampleOwner ? sampleOwner.prevSkidSample : state.prevSkidSample;
   const setPrev = (val) => {
     if (sampleOwner) sampleOwner.prevSkidSample = val;
     else state.prevSkidSample = val;
@@ -21,23 +57,23 @@ export function recordSkidMarks(currZ, currX, alpha, fallbackBackDist = 0, sampl
 
   if (!prev) {
     if (fallbackBackDist > 1) {
-      const startZ = (((currZ - fallbackBackDist) % state.trackLength) + state.trackLength) % state.trackLength;
-      setPrev({ z: startZ, x: currX });
+      const startZ = (((currZ - fallbackBackDist) % trackLength) + trackLength) % trackLength;
+      prev = { z: startZ, x: currX };
+      setPrev(prev);
     } else {
       setPrev({ z: currZ, x: currX });
       return;
     }
   }
 
-  const activePrev = sampleOwner ? sampleOwner.prevSkidSample : state.prevSkidSample;
-  const dz = getShortestTrackDz(activePrev.z, currZ, state.trackLength);
+  const dz = getShortestTrackDz(prev.z, currZ, trackLength);
   if (dz <= 0.5 || dz > SEGMENT_LENGTH * 6) {
     setPrev({ z: currZ, x: currX });
     return;
   }
 
   let rem = dz;
-  let curPos = activePrev.z;
+  let curPos = prev.z;
   let safety = 0;
 
   while (rem > 0.05 && safety < 16) {
@@ -48,29 +84,41 @@ export function recordSkidMarks(currZ, currX, alpha, fallbackBackDist = 0, sampl
     const segStart = seg.index * SEGMENT_LENGTH;
     const offsetInSeg = (((curPos - segStart) % SEGMENT_LENGTH) + SEGMENT_LENGTH) % SEGMENT_LENGTH;
     const distToSegEnd = SEGMENT_LENGTH - offsetInSeg;
-    const step = Math.min(rem, distToSegEnd);
+    const reachesSegEnd = rem >= distToSegEnd - 1e-4;
+    const step = reachesSegEnd ? distToSegEnd : rem;
 
-    const t1 = offsetInSeg / SEGMENT_LENGTH;
-    const t2 = (offsetInSeg + step) / SEGMENT_LENGTH;
-    const frac1 = (dz - rem) / dz;
-    const frac2 = (dz - rem + step) / dz;
+    // Пропускаем вырожденные микро-шаги на границах сегментов из-за погрешности float
+    if (step >= 0.05) {
+      const t1 = offsetInSeg / SEGMENT_LENGTH;
+      const t2 = Math.min(1, (offsetInSeg + step) / SEGMENT_LENGTH);
+      const frac1 = (dz - rem) / dz;
+      const frac2 = Math.min(1, (dz - rem + step) / dz);
 
-    const x1 = MathUtil.lerp(activePrev.x, currX, frac1);
-    const x2 = MathUtil.lerp(activePrev.x, currX, frac2);
+      const x1 = MathUtil.lerp(prev.x, currX, frac1);
+      const x2 = MathUtil.lerp(prev.x, currX, frac2);
 
-    const mark = { seg, t1, x1, t2, x2, alpha };
-    seg.skidMarks.push(mark);
-    state.skidMarksList.push(mark);
+      const mark = { seg, t1, x1, t2, x2, alpha };
+      seg.skidMarks.push(mark);
 
-    if (state.skidMarksList.length > MAX_SKID_MARKS) {
-      const oldest = state.skidMarksList.shift();
-      if (oldest && oldest.seg) {
-        const idx = oldest.seg.skidMarks.indexOf(oldest);
-        if (idx !== -1) oldest.seg.skidMarks.splice(idx, 1);
+      if (state.skidMarksList.length < MAX_SKID_MARKS) {
+        state.skidMarksList.push(mark);
+      } else {
+        const oldest = state.skidMarksList[skidWriteIdx];
+        if (oldest && oldest.seg) {
+          const idx = oldest.seg.skidMarks.indexOf(oldest);
+          if (idx !== -1) oldest.seg.skidMarks.splice(idx, 1);
+        }
+        state.skidMarksList[skidWriteIdx] = mark;
+        skidWriteIdx = (skidWriteIdx + 1) % MAX_SKID_MARKS;
       }
     }
 
-    curPos = (curPos + step) % state.trackLength;
+    // При достижении границы переходим точно на начало следующего сегмента без накопления float-погрешности
+    if (reachesSegEnd) {
+      curPos = ((seg.index + 1) % totalSegs) * SEGMENT_LENGTH;
+    } else {
+      curPos = (curPos + step) % trackLength;
+    }
     rem -= step;
   }
 
@@ -88,8 +136,8 @@ function addSegment(curve, y) {
   const isDark = Math.floor(n / RUMBLE_LENGTH) % 2 === 1;
   state.segments.push({
     index: n,
-    p1: { world: { y: lastY(), z: n * SEGMENT_LENGTH }, camera: {}, screen: {} },
-    p2: { world: { y: y, z: (n + 1) * SEGMENT_LENGTH }, camera: {}, screen: {} },
+    p1: { world: { x: 0, y: lastY(), z: n * SEGMENT_LENGTH }, camera: {}, screen: {} },
+    p2: { world: { x: 0, y: y, z: (n + 1) * SEGMENT_LENGTH }, camera: {}, screen: {} },
     curve: curve,
     sprites: [],
     cars: [],
@@ -103,21 +151,7 @@ function addSegment(curve, y) {
     mapHeading: 0,
     clip: LOGICAL_HEIGHT,
     projectedFrame: -1,
-    color: isDark
-      ? {
-          road: '#252a42',
-          grass: '#100624',
-          rumble: '#ff2a85',
-          edge: '#ffffff',
-          lane: '#ffffff'
-        }
-      : {
-          road: '#2f3552',
-          grass: '#160930',
-          rumble: '#ffffff',
-          edge: '#b8f2ff',
-          lane: null
-        }
+    color: isDark ? PALETTE_DARK : PALETTE_LIGHT
   });
 }
 
@@ -183,6 +217,7 @@ export function applySharpTurnGuardrails(curveThreshold) {
  */
 export function buildTrack() {
   state.segments = [];
+  skidWriteIdx = 0;
 
   addRoad(15, 65, 15, 0, 0);
   addRoad(40, 85, 40, 2.1, 8);
@@ -196,32 +231,34 @@ export function buildTrack() {
   addRoad(50, 110, 50, 2.5, 9);
   const remainingY = -lastY() / SEGMENT_LENGTH;
   addRoad(45, 95, 45, -1.9, remainingY);
-  addRoad(20, 60, 20, 0, -lastY() / SEGMENT_LENGTH);
+  addRoad(20, 60, 20, 0, 0);
 
   const segments = state.segments;
-  if (segments.length > 0) {
-    segments[segments.length - 1].p2.world.y = segments[0].p1.world.y;
+  const totalSegs = segments.length;
+  if (totalSegs > 0) {
+    segments[totalSegs - 1].p2.world.y = segments[0].p1.world.y;
   }
 
-  state.trackLength = segments.length * SEGMENT_LENGTH;
+  state.trackLength = totalSegs * SEGMENT_LENGTH;
 
-  // Равномерная расстановка чекпоинтов кратно полной длине трассы
-  const cpCount = Math.max(1, Math.round(segments.length / CHECKPOINT_INTERVAL));
-  const exactStep = Math.floor(segments.length / cpCount);
+  // Равномерная расстановка чекпоинтов с гарантированным совпадением последнего с сегментом 0
+  const cpCount = Math.max(1, Math.round(totalSegs / CHECKPOINT_INTERVAL));
   for (let c = 1; c <= cpCount; c++) {
-    const cpIdx = (c * exactStep) % segments.length;
+    const cpIdx = Math.round((c * totalSegs) / cpCount) % totalSegs;
     segments[cpIdx].isCheckpoint = true;
     addSprite(cpIdx, 'checkpoint_arch', 0);
   }
 
-  const totalSegs = segments.length;
   for (let n = 0; n < totalSegs; n++) {
-    // Исключаем постановку пальм, фонарей и билбордов вплотную к опорам чекпоинт-арки
-    const prevSeg = segments[(n - 1 + totalSegs) % totalSegs];
-    const nextSeg = segments[(n + 1) % totalSegs];
-    if (segments[n].isCheckpoint || prevSeg.isCheckpoint || nextSeg.isCheckpoint) {
-      continue;
+    // Расширенная чистая зона (±3 сегмента) вокруг арок исключает клиппинг пальм и фонарей с опорами
+    let nearCheckpoint = false;
+    for (let pad = -3; pad <= 3; pad++) {
+      if (segments[(n + pad + totalSegs) % totalSegs].isCheckpoint) {
+        nearCheckpoint = true;
+        break;
+      }
     }
+    if (nearCheckpoint) continue;
 
     if (n % 7 === 0) {
       addSprite(n, 'palm', -1.42 - Math.random() * 0.45);
@@ -240,77 +277,58 @@ export function buildTrack() {
   }
 }
 
-function evalCatmullRom(p0, p1, p2, p3, t) {
-  const t2 = t * t;
-  const t3 = t2 * t;
-  return {
-    x: 0.5 * (
-      (2 * p1.x) +
-      (-p0.x + p2.x) * t +
-      (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
-      (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3
-    ),
-    y: 0.5 * (
-      (2 * p1.y) +
-      (-p0.y + p2.y) * t +
-      (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
-      (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3
-    )
-  };
+function evalCatmullRomAxis(v0, v1, v2, v3, t, t2, t3) {
+  return 0.5 * (
+    (2 * v1) +
+    (-v0 + v2) * t +
+    (2 * v0 - 5 * v1 + 4 * v2 - v3) * t2 +
+    (-v0 + 3 * v1 - 3 * v2 + v3) * t3
+  );
 }
 
-function resampleClosedLoop(points, numSegments) {
-  const count = points.length;
-  const cumLen = new Array(count + 1);
-  cumLen[0] = 0;
+/**
+ * Равномерная передискретизация замкнутого контура в типизированные буферы (без аллокации объектов)
+ */
+function resampleClosedLoopFlat(srcX, srcY, srcCount, dstX, dstY, numSegments, cumLenBuf) {
+  cumLenBuf[0] = 0;
   let totalArc = 0;
-  for (let i = 0; i < count; i++) {
-    const curr = points[i];
-    const next = points[(i + 1) % count];
-    totalArc += Math.hypot(next.x - curr.x, next.y - curr.y);
-    cumLen[i + 1] = totalArc;
+  for (let i = 0; i < srcCount; i++) {
+    const nextIdx = (i + 1) % srcCount;
+    totalArc += Math.hypot(srcX[nextIdx] - srcX[i], srcY[nextIdx] - srcY[i]);
+    cumLenBuf[i + 1] = totalArc;
   }
 
-  const uniformPts = new Array(numSegments);
   let rawIdx = 0;
   for (let i = 0; i < numSegments; i++) {
     const targetS = (i / numSegments) * totalArc;
-    while (rawIdx < count - 1 && cumLen[rawIdx + 1] < targetS) {
+    while (rawIdx < srcCount - 1 && cumLenBuf[rawIdx + 1] < targetS) {
       rawIdx++;
     }
-    const segStartS = cumLen[rawIdx];
-    const segEndS = cumLen[rawIdx + 1];
+    const segStartS = cumLenBuf[rawIdx];
+    const segEndS = cumLenBuf[rawIdx + 1];
     const frac = segEndS > segStartS ? (targetS - segStartS) / (segEndS - segStartS) : 0;
-    const a = points[rawIdx];
-    const b = points[(rawIdx + 1) % count];
-    uniformPts[i] = {
-      x: MathUtil.lerp(a.x, b.x, frac),
-      y: MathUtil.lerp(a.y, b.y, frac)
-    };
+    const nextIdx = (rawIdx + 1) % srcCount;
+    dstX[i] = MathUtil.lerp(srcX[rawIdx], srcX[nextIdx], frac);
+    dstY[i] = MathUtil.lerp(srcY[rawIdx], srcY[nextIdx], frac);
   }
-  return uniformPts;
 }
 
-function computeClosedLoopTurnAngles(pts) {
-  const n = pts.length;
-  const headings = new Array(n);
+function computeClosedLoopTurnAnglesFlat(ptsX, ptsY, n, headingsOut, dThetasOut) {
   for (let i = 0; i < n; i++) {
-    const a = pts[i];
-    const b = pts[(i + 1) % n];
-    headings[i] = Math.atan2(b.y - a.y, b.x - a.x);
+    const nextIdx = (i + 1) % n;
+    headingsOut[i] = Math.atan2(ptsY[nextIdx] - ptsY[i], ptsX[nextIdx] - ptsX[i]);
   }
-  const dThetas = new Array(n);
+
   let maxAbsTurn = 0;
   for (let i = 0; i < n; i++) {
-    const dt = Math.atan2(
-      Math.sin(headings[(i + 1) % n] - headings[i]),
-      Math.cos(headings[(i + 1) % n] - headings[i])
-    );
-    dThetas[i] = dt;
+    const nextHeading = headingsOut[(i + 1) % n];
+    const diff = nextHeading - headingsOut[i];
+    const dt = Math.atan2(Math.sin(diff), Math.cos(diff));
+    dThetasOut[i] = dt;
     const absDt = Math.abs(dt);
     if (absDt > maxAbsTurn) maxAbsTurn = absDt;
   }
-  return { headings, dThetas, maxAbsTurn };
+  return maxAbsTurn;
 }
 
 /**
@@ -319,112 +337,144 @@ function computeClosedLoopTurnAngles(pts) {
 export function buildCircuitTrack() {
   state.segments = [];
   state.minimapCacheKey = '';
+  skidWriteIdx = 0;
   state.circuitSeedId = 1000 + Math.floor(Math.random() * 9000);
 
   const numCtrl = 12;
   const aspectStretch = 1.24 + Math.random() * 0.34;
 
-  const weights = [];
+  const weights = new Float64Array(numCtrl);
   let weightSum = 0;
   for (let k = 0; k < numCtrl; k++) {
     const isStartZone = k === 0 || k === 1 || k === numCtrl - 1;
     const w = isStartZone ? 1.15 : (0.84 + Math.random() * 0.38);
-    weights.push(w);
+    weights[k] = w;
     weightSum += w;
   }
 
-  const angles = [];
+  const angles = new Float64Array(numCtrl);
   let accAngle = 0;
   for (let k = 0; k < numCtrl; k++) {
-    angles.push(accAngle);
+    angles[k] = accAngle;
     accAngle += (weights[k] / weightSum) * Math.PI * 2;
   }
 
-  const radii = new Array(numCtrl).fill(1.0);
+  const radii = new Float64Array(numCtrl);
+  radii.fill(1.0);
   let idx = 2;
   while (idx <= numCtrl - 3) {
     const featureRoll = Math.random();
     if (featureRoll < 0.44 && idx <= numCtrl - 5) {
-      radii[idx] = 1.28 + Math.random() * 0.14;
-      radii[idx + 1] = 0.56 + Math.random() * 0.10;
-      radii[idx + 2] = 1.26 + Math.random() * 0.14;
+      radii[idx] = 1.18 + Math.random() * 0.10;
+      radii[idx + 1] = 0.68 + Math.random() * 0.10;
+      radii[idx + 2] = 1.16 + Math.random() * 0.10;
       idx += 3;
     } else if (featureRoll < 0.76 && idx <= numCtrl - 6) {
-      radii[idx] = 1.24 + Math.random() * 0.12;
-      radii[idx + 1] = 0.62 + Math.random() * 0.10;
-      radii[idx + 2] = 1.22 + Math.random() * 0.12;
-      radii[idx + 3] = 0.60 + Math.random() * 0.10;
+      radii[idx] = 1.16 + Math.random() * 0.10;
+      radii[idx + 1] = 0.72 + Math.random() * 0.10;
+      radii[idx + 2] = 1.14 + Math.random() * 0.10;
+      radii[idx + 3] = 0.70 + Math.random() * 0.10;
       idx += 4;
     } else {
-      radii[idx] = Math.random() < 0.5 ? (0.58 + Math.random() * 0.12) : (1.26 + Math.random() * 0.14);
+      radii[idx] = Math.random() < 0.5 ? (0.70 + Math.random() * 0.10) : (1.18 + Math.random() * 0.10);
       idx += 1;
     }
   }
 
-  const ctrlPoints = [];
+  const ctrlX = new Float64Array(numCtrl);
+  const ctrlY = new Float64Array(numCtrl);
   for (let k = 0; k < numCtrl; k++) {
     const phi = angles[k];
-    ctrlPoints.push({
-      x: Math.cos(phi) * radii[k] * aspectStretch,
-      y: Math.sin(phi) * radii[k]
-    });
+    ctrlX[k] = Math.cos(phi) * radii[k] * aspectStretch;
+    ctrlY[k] = Math.sin(phi) * radii[k];
   }
 
   const startStraightX = aspectStretch * 1.05;
-  ctrlPoints[0].x = startStraightX;
-  ctrlPoints[0].y = 0;
-  ctrlPoints[1].x = startStraightX;
-  ctrlPoints[1].y = Math.sin(angles[1]) * 1.05;
-  ctrlPoints[numCtrl - 1].x = startStraightX;
-  ctrlPoints[numCtrl - 1].y = Math.sin(angles[numCtrl - 1]) * 1.05;
+  ctrlX[0] = startStraightX;
+  ctrlY[0] = 0;
+  ctrlX[1] = startStraightX;
+  ctrlY[1] = Math.sin(angles[1]) * 1.05;
+  ctrlX[numCtrl - 1] = startStraightX;
+  ctrlY[numCtrl - 1] = Math.sin(angles[numCtrl - 1]) * 1.05;
 
   const samplesPerSpan = 220;
-  const rawPoints = [];
+  const rawCount = numCtrl * samplesPerSpan;
+  const rawX = new Float64Array(rawCount);
+  const rawY = new Float64Array(rawCount);
+
+  let rawWrite = 0;
   for (let i = 0; i < numCtrl; i++) {
-    const pt0 = ctrlPoints[(i - 1 + numCtrl) % numCtrl];
-    const pt1 = ctrlPoints[i];
-    const pt2 = ctrlPoints[(i + 1) % numCtrl];
-    const pt3 = ctrlPoints[(i + 2) % numCtrl];
+    const i0 = (i - 1 + numCtrl) % numCtrl;
+    const i1 = i;
+    const i2 = (i + 1) % numCtrl;
+    const i3 = (i + 2) % numCtrl;
     for (let s = 0; s < samplesPerSpan; s++) {
-      rawPoints.push(evalCatmullRom(pt0, pt1, pt2, pt3, s / samplesPerSpan));
+      const t = s / samplesPerSpan;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      rawX[rawWrite] = evalCatmullRomAxis(ctrlX[i0], ctrlX[i1], ctrlX[i2], ctrlX[i3], t, t2, t3);
+      rawY[rawWrite] = evalCatmullRomAxis(ctrlY[i0], ctrlY[i1], ctrlY[i2], ctrlY[i3], t, t2, t3);
+      rawWrite++;
     }
   }
 
-  const minSegs = GAME_CONFIG.circuit.minSegments;
-  const maxSegs = GAME_CONFIG.circuit.maxSegments;
-  const numSegments = minSegs + Math.floor(Math.random() * (maxSegs - minSegs + 1));
-  let loopPts = resampleClosedLoop(rawPoints, numSegments);
+  // Квантуем длину круга кратно полному циклу поребриков и пунктира (2 * RUMBLE_LENGTH = 10) для бесшовного стыка
+  const patternCycle = RUMBLE_LENGTH * 2;
+  const minSegs = Math.ceil(GAME_CONFIG.circuit.minSegments / patternCycle) * patternCycle;
+  const maxSegs = Math.floor(GAME_CONFIG.circuit.maxSegments / patternCycle) * patternCycle;
+  const cycleSteps = Math.max(0, Math.floor((maxSegs - minSegs) / patternCycle));
+  const numSegments = minSegs + Math.floor(Math.random() * (cycleSteps + 1)) * patternCycle;
 
-  const maxAllowedTurnRad = 12.0 / SEGMENT_LENGTH;
-  let turnData = computeClosedLoopTurnAngles(loopPts);
+  const loopX = new Float64Array(numSegments);
+  const loopY = new Float64Array(numSegments);
+  const smoothX = new Float64Array(numSegments);
+  const smoothY = new Float64Array(numSegments);
+  const rawCumLen = new Float64Array(rawCount + 1);
+  const loopCumLen = new Float64Array(numSegments + 1);
+  const headings = new Float64Array(numSegments);
+  const dThetas = new Float64Array(numSegments);
+
+  resampleClosedLoopFlat(rawX, rawY, rawCount, loopX, loopY, numSegments, rawCumLen);
+  // Ограничиваем максимальную кривизну для честной физики и точного соответствия 3D-дороги контуру миникарты
+  const maxAllowedTurnRad = MAX_CIRCUIT_CURVE / SEGMENT_LENGTH;
+  let maxAbsTurn = computeClosedLoopTurnAnglesFlat(loopX, loopY, numSegments, headings, dThetas);
   let smoothPasses = 0;
-  while (turnData.maxAbsTurn > maxAllowedTurnRad && smoothPasses < 45) {
-    smoothPasses++;
-    const smoothed = new Array(numSegments);
-    for (let i = 0; i < numSegments; i++) {
-      const prev = loopPts[(i - 1 + numSegments) % numSegments];
-      const curr = loopPts[i];
-      const next = loopPts[(i + 1) % numSegments];
-      smoothed[i] = {
-        x: prev.x * 0.25 + curr.x * 0.5 + next.x * 0.25,
-        y: prev.y * 0.25 + curr.y * 0.5 + next.y * 0.25
-      };
-    }
-    loopPts = resampleClosedLoop(smoothed, numSegments);
-    turnData = computeClosedLoopTurnAngles(loopPts);
-  }
 
-  const finalCurves = new Array(numSegments);
-  for (let i = 0; i < numSegments; i++) {
-    finalCurves[i] = MathUtil.clamp(turnData.dThetas[i] * SEGMENT_LENGTH, -12.0, 12.0);
+  // Равномерное 7-точечное сглаживание [1, 3, 6, 8, 6, 3, 1]/28 сходится в 4 раза быстрее
+  // и гарантированно доводит углы контура до maxAllowedTurnRad без клиппинга и изломов у старта
+  while (maxAbsTurn > maxAllowedTurnRad && smoothPasses < 140) {
+    smoothPasses++;
+    for (let i = 0; i < numSegments; i++) {
+      const m3 = (i - 3 + numSegments) % numSegments;
+      const m2 = (i - 2 + numSegments) % numSegments;
+      const m1 = (i - 1 + numSegments) % numSegments;
+      const p1 = (i + 1) % numSegments;
+      const p2 = (i + 2) % numSegments;
+      const p3 = (i + 3) % numSegments;
+
+      smoothX[i] = (
+        loopX[m3] + 3 * loopX[m2] + 6 * loopX[m1] +
+        8 * loopX[i] +
+        6 * loopX[p1] + 3 * loopX[p2] + loopX[p3]
+      ) / 28;
+      smoothY[i] = (
+        loopY[m3] + 3 * loopY[m2] + 6 * loopY[m1] +
+        8 * loopY[i] +
+        6 * loopY[p1] + 3 * loopY[p2] + loopY[p3]
+      ) / 28;
+    }
+    resampleClosedLoopFlat(smoothX, smoothY, numSegments, loopX, loopY, numSegments, loopCumLen);
+    maxAbsTurn = computeClosedLoopTurnAnglesFlat(loopX, loopY, numSegments, headings, dThetas);
   }
 
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (let i = 0; i < numSegments; i++) {
-    if (loopPts[i].x < minX) minX = loopPts[i].x;
-    if (loopPts[i].x > maxX) maxX = loopPts[i].x;
-    if (loopPts[i].y < minY) minY = loopPts[i].y;
-    if (loopPts[i].y > maxY) maxY = loopPts[i].y;
+    const px = loopX[i];
+    const py = loopY[i];
+    if (px < minX) minX = px;
+    if (px > maxX) maxX = px;
+    if (py < minY) minY = py;
+    if (py > maxY) maxY = py;
   }
   const spanX = Math.max(0.001, maxX - minX);
   const spanY = Math.max(0.001, maxY - minY);
@@ -446,18 +496,22 @@ export function buildCircuitTrack() {
       hillAmp2 * Math.sin(4 * Math.PI * tNext + hillPhase2)
     ) * hillEnvelope;
 
-    const curveVal = finalCurves[i];
+    const curveVal = MathUtil.clamp(dThetas[i] * SEGMENT_LENGTH, -MAX_CIRCUIT_CURVE, MAX_CIRCUIT_CURVE);
     addSegment(curveVal, worldY);
 
     const seg = state.segments[i];
-    const currPt = loopPts[i];
-    seg.mapX = (currPt.x - minX + padX) / maxSpan;
-    seg.mapY = (currPt.y - minY + padY) / maxSpan;
-    seg.mapHeading = turnData.headings[i];
+    seg.mapX = (loopX[i] - minX + padX) / maxSpan;
+    seg.mapY = (loopY[i] - minY + padY) / maxSpan;
+    seg.mapHeading = headings[i];
 
-    if (Math.abs(curveVal) > 5.8) {
+    if (Math.abs(curveVal) > SHARP_CURVE_THRESHOLD) {
       const isAlt = Math.floor(i / 2) % 2 === 0;
-      seg.color.rumble = isAlt ? '#ffbe0b' : '#ff2a85';
+      const isDark = seg.color === PALETTE_DARK;
+      if (isDark) {
+        seg.color = isAlt ? PALETTE_DARK_SHARP_YELLOW : PALETTE_DARK;
+      } else {
+        seg.color = isAlt ? PALETTE_LIGHT_SHARP_YELLOW : PALETTE_LIGHT_SHARP_PINK;
+      }
     }
   }
 
@@ -474,7 +528,8 @@ export function buildCircuitTrack() {
 
   for (let n = 0; n < segments.length; n++) {
     const seg = segments[n];
-    const nearStartFinish = n === 0 || n === 1 || n === segments.length - 1;
+    // Свободная от декораций зона ±3 сегмента вокруг стартовой арки исключает наложение фонарей на опоры
+    const nearStartFinish = n <= 3 || n >= segments.length - 3;
 
     if (!nearStartFinish && Math.abs(seg.curve) > 5.6 && n % 5 === 0) {
       const hasRail = seg.guardrailLeft || seg.guardrailRight;
@@ -483,13 +538,11 @@ export function buildCircuitTrack() {
       addSprite(n, seg.curve > 0 ? 'chevron_right' : 'chevron_left', outerSide);
     }
 
-    // Фаза фонарей (n % 20 === 7) разведена с шевронами (n % 5 === 0), чтобы исключить клиппинг в поворотах
     if (!nearStartFinish && n % 20 === 7) {
       addSprite(n, 'lamp', -1.34);
       addSprite(n, 'lamp', 1.34);
     }
 
-    // Фаза билбордов (n % 65 === 23) также не пересекается ни с шевронами, ни с фонарями
     if (n > 18 && n < segments.length - 18 && n % 65 === 23) {
       const side = (Math.floor(n / 65) % 2 === 0) ? -1.68 : 1.68;
       addSprite(n, 'billboard', side);

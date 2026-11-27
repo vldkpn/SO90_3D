@@ -19,15 +19,23 @@ import {
   getBestLapStorageKey,
   getPlayerWorldZ,
   resetRunState,
+  resetPlayerScreenAnchors,
   showBanner,
   clearSkidMarks,
   queryTouchDevice,
   getActiveAspectRatio
 } from './state.js';
 import { buildTrack, buildCircuitTrack, applySharpTurnGuardrails } from './track.js';
-import { resetTraffic, resetCircuitRivals } from './traffic.js';
+import { resetTraffic, resetCircuitRivals, getCircuitGridSlotPose } from './traffic.js';
 import { updateSimulation } from './physics.js';
 import { renderFrame } from './renderer.js';
+import {
+  t,
+  getLang,
+  getNumberLocale,
+  formatLapsCount,
+  applyDomTranslations
+} from './i18n.js';
 
 initCanvasPolyfills();
 initStars();
@@ -54,22 +62,84 @@ const startSubtitle = document.getElementById('start-subtitle');
 const devSettingsToggle = document.getElementById('dev-settings-toggle');
 const devSettingsContent = document.getElementById('dev-settings-content');
 
+// Кэшированные ссылки на узлы экрана завершения заезда (без повторного поиска в DOM)
+const gameoverEls = {
+  newRecordTag: document.getElementById('new-record-tag'),
+  modeTag: document.getElementById('gameover-mode-tag'),
+  title: document.getElementById('gameover-title'),
+  label1: document.getElementById('stat-label-1'),
+  finalScore: document.getElementById('final-score'),
+  label2: document.getElementById('stat-label-2'),
+  bestScore: document.getElementById('best-score'),
+  label3: document.getElementById('stat-label-3'),
+  finalDistance: document.getElementById('final-distance'),
+  label4: document.getElementById('stat-label-4'),
+  finalExtra: document.getElementById('final-extra')
+};
+
+// Таблица клавиш управления движением
+const DIR_KEYS = {
+  ArrowUp: 'up',
+  KeyW: 'up',
+  ArrowDown: 'down',
+  KeyS: 'down',
+  ArrowLeft: 'left',
+  KeyA: 'left',
+  ArrowRight: 'right',
+  KeyD: 'right'
+};
+
+// Раздельные буферы ввода исключают сброс зажатых клавиш клавиатуры при касании экрана или мыши
+const kbInput = { up: false, down: false, left: false, right: false };
+const pointerInput = { up: false, down: false, left: false, right: false };
+const touchInput = { up: false, down: false, left: false, right: false };
+
 const touchButtonMap = [
-  { id: 'btn-left', key: 'left', el: document.getElementById('btn-left') },
-  { id: 'btn-right', key: 'right', el: document.getElementById('btn-right') },
-  { id: 'btn-gas', key: 'up', el: document.getElementById('btn-gas') },
-  { id: 'btn-brake', key: 'down', el: document.getElementById('btn-brake') }
+  { id: 'btn-left', key: 'left', el: document.getElementById('btn-left'), rect: null },
+  { id: 'btn-right', key: 'right', el: document.getElementById('btn-right'), rect: null },
+  { id: 'btn-gas', key: 'up', el: document.getElementById('btn-gas'), rect: null },
+  { id: 'btn-brake', key: 'down', el: document.getElementById('btn-brake'), rect: null }
 ];
 
 let lastTimestamp = performance.now();
 let fpsFrameCount = 0;
 let fpsSampleStart = lastTimestamp;
+// Флаг однократной отрисовки сцены на паузе (экономит CPU/GPU без потери кадра при ресайзе)
+let needsPausedRedraw = false;
+
+/**
+ * Кэширование экранных прямоугольников тач-педалей (предотвращает принудительный reflow на каждом touchmove)
+ */
+function refreshTouchButtonRects() {
+  for (let i = 0; i < touchButtonMap.length; i++) {
+    const item = touchButtonMap[i];
+    item.rect = item.el ? item.el.getBoundingClientRect() : null;
+  }
+}
+
+/**
+ * Объединяет состояние клавиатуры, мыши и мультитача в единый state.input
+ */
+function syncCombinedInput() {
+  const allowActiveInput = state.gameState === STATE.PLAYING && !state.isPaused;
+  for (let i = 0; i < touchButtonMap.length; i++) {
+    const item = touchButtonMap[i];
+    const k = item.key;
+    const btnActive = allowActiveInput && (pointerInput[k] || touchInput[k]);
+    state.input[k] = allowActiveInput && (kbInput[k] || btnActive);
+    if (item.el) {
+      item.el.classList.toggle('pressed', btnActive);
+    }
+  }
+}
 
 function clearInputs() {
-  state.input.up = false;
-  state.input.down = false;
-  state.input.left = false;
-  state.input.right = false;
+  for (const k of ['up', 'down', 'left', 'right']) {
+    kbInput[k] = false;
+    pointerInput[k] = false;
+    touchInput[k] = false;
+    state.input[k] = false;
+  }
   for (let i = 0; i < touchButtonMap.length; i++) {
     const btn = touchButtonMap[i].el;
     if (btn) btn.classList.remove('pressed');
@@ -79,6 +149,47 @@ function clearInputs() {
 function blurActiveElement() {
   if (document.activeElement instanceof HTMLElement) {
     document.activeElement.blur();
+  }
+}
+
+/**
+ * Универсальная привязка клика с автоматическим снятием фокуса с кнопки
+ */
+function bindClick(el, handler) {
+  if (!el) return;
+  el.addEventListener('click', (e) => {
+    if (e.currentTarget instanceof HTMLElement) {
+      e.currentTarget.blur();
+    }
+    handler(e);
+  });
+}
+
+/**
+ * Универсальная привязка группы переключателей .mode-pill
+ */
+function bindPillGroup(groupSelector, datasetKey, onSelect) {
+  const buttons = document.querySelectorAll(`${groupSelector} .mode-pill`);
+  buttons.forEach((btn) => {
+    bindClick(btn, () => {
+      const value = btn.dataset[datasetKey];
+      if (value !== undefined) {
+        onSelect(value, buttons, btn);
+      }
+    });
+  });
+}
+
+/**
+ * Единая перестройка трассы и потока машин/соперников под выбранный режим
+ */
+function initWorldForCurrentMode(playerGridSlot = null) {
+  if (state.gameMode === 'circuit') {
+    buildCircuitTrack();
+    resetCircuitRivals(playerGridSlot);
+  } else {
+    buildTrack();
+    resetTraffic(INITIAL_TRAFFIC_COUNT);
   }
 }
 
@@ -96,10 +207,14 @@ function isSettingsOpen() {
 }
 
 function syncSettingsUI() {
+  const langVal = getLang();
   const particlesVal = state.settings.particlesEnabled ? 'on' : 'off';
   const soundVal = audio.muted ? 'off' : 'on';
   const fpsVal = state.settings.showFps ? 'on' : 'off';
 
+  document.querySelectorAll('#settings-lang-group .mode-pill').forEach((b) => {
+    b.classList.toggle('active', b.dataset.lang === langVal);
+  });
   document.querySelectorAll('#settings-particles-group .mode-pill').forEach((b) => {
     b.classList.toggle('active', b.dataset.particles === particlesVal);
   });
@@ -113,9 +228,10 @@ function syncSettingsUI() {
     b.classList.toggle('active', b.dataset.fps === fpsVal);
   });
 
-  const label = audio.muted ? '🔇 ЗВУК: ВЫКЛ' : '🔊 ЗВУК: ВКЛ';
+  const label = audio.muted ? t('muteOff') : t('muteOn');
   if (desktopMuteBtn) desktopMuteBtn.textContent = label;
   if (mobileMuteBtn) mobileMuteBtn.textContent = label;
+  needsPausedRedraw = true;
 }
 
 function setDevSettingsOpen(isOpen) {
@@ -125,16 +241,14 @@ function setDevSettingsOpen(isOpen) {
   devSettingsContent.classList.toggle('hidden', !isOpen);
 }
 
-function setSoundEnabled(enabled, allowAudioInit = true) {
+function setSoundEnabled(enabled) {
   state.settings.soundEnabled = Boolean(enabled);
   const shouldMute = !state.settings.soundEnabled;
 
   if (audio.muted !== shouldMute) {
-    if (allowAudioInit || shouldMute) {
-      audio.toggleMute();
-    } else {
-      audio.muted = shouldMute;
-    }
+    audio.toggleMute();
+  } else if (!shouldMute) {
+    audio.init();
   }
 
   saveSettings();
@@ -167,7 +281,7 @@ function updateMobileTopBarState() {
   }
   if (mobilePauseBtn) {
     mobilePauseBtn.classList.toggle('invisible', !inRace);
-    mobilePauseBtn.textContent = state.isPaused ? '▶ ИГРАТЬ' : '⏸ ПАУЗА';
+    mobilePauseBtn.textContent = state.isPaused ? t('mobilePlayBtn') : t('mobilePauseBtn');
   }
 }
 
@@ -178,14 +292,15 @@ function updateStartSubtitle() {
       GAME_CONFIG.circuit.rivalsCount || GAME_CONFIG.circuit.rivals.length,
       GAME_CONFIG.circuit.rivals.length
     );
-    startSubtitle.textContent =
-      `Кольцевая гонка на ${GAME_CONFIG.circuit.totalLaps} круга с ${activeRivalsCount} соперниками, миникартой и случайной генерацией трассы. Машина не ломается!`;
+    const lapsText = formatLapsCount(GAME_CONFIG.circuit.totalLaps);
+    startSubtitle.textContent = t('subtitleCircuit', {
+      laps: lapsText,
+      rivals: activeRivalsCount
+    });
   } else if (state.gameMode === 'oncoming') {
-    startSubtitle.textContent =
-      'Выезжайте на встречную полосу для двойного множителя очков 2X, уворачивайтесь от встречных фар и успевайте к чекпоинтам!';
+    startSubtitle.textContent = t('subtitleOncoming');
   } else {
-    startSubtitle.textContent =
-      'Мчитесь навстречу неоновому закату, обгоняйте трафик и пересекайте чекпоинты до истечения таймера!';
+    startSubtitle.textContent = t('subtitleOneway');
   }
 }
 
@@ -194,25 +309,34 @@ function resizeCanvas() {
 
   const aspect = getActiveAspectRatio();
   const targetLogicalWidth = Math.round(LOGICAL_HEIGHT * aspect);
-  if (state.aspectRatio !== aspect || state.logicalWidth !== targetLogicalWidth || canvas.width !== targetLogicalWidth) {
+  if (
+    state.aspectRatio !== aspect ||
+    state.logicalWidth !== targetLogicalWidth ||
+    canvas.width !== targetLogicalWidth
+  ) {
     state.aspectRatio = aspect;
     state.logicalWidth = targetLogicalWidth;
     canvas.width = state.logicalWidth;
     canvas.height = LOGICAL_HEIGHT;
+    resetPlayerScreenAnchors();
   }
 
   const pad = 12;
+  const vv = window.visualViewport;
+  const viewportW = vv ? vv.width : window.innerWidth;
+  const viewportH = vv ? vv.height : window.innerHeight;
 
   const topBarVisible = topBar && window.getComputedStyle(topBar).display !== 'none';
   const topBarReserve = topBarVisible ? (topBar.offsetHeight + 8) : 0;
 
   const controlsVisible =
+    touchControls &&
     touchControls.classList.contains('active') &&
     window.getComputedStyle(touchControls).display !== 'none';
   const controlsReserve = controlsVisible ? (touchControls.offsetHeight + 10) : 0;
 
-  const availW = Math.max(240, window.innerWidth - pad);
-  const availH = Math.max(135, window.innerHeight - pad - topBarReserve - controlsReserve);
+  const availW = Math.max(240, viewportW - pad);
+  const availH = Math.max(135, viewportH - pad - topBarReserve - controlsReserve);
 
   let targetW = availW;
   let targetH = availW / aspect;
@@ -236,12 +360,16 @@ function resizeCanvas() {
     const deckW = Math.min(availW, Math.max(finalW, 520));
     touchControls.style.width = `${Math.floor(deckW)}px`;
   }
+
+  refreshTouchButtonRects();
+  needsPausedRedraw = true;
 }
 
 function pauseGame() {
   if (state.gameState !== STATE.PLAYING || state.isPaused) return;
   blurActiveElement();
   state.isPaused = true;
+  needsPausedRedraw = true;
   clearInputs();
   audio.update(0, false, false, false);
   updateMobileTopBarState();
@@ -253,7 +381,10 @@ function resumeGame() {
   blurActiveElement();
   audio.init();
   state.isPaused = false;
+  needsPausedRedraw = false;
   lastTimestamp = performance.now();
+  fpsSampleStart = lastTimestamp;
+  fpsFrameCount = 0;
   updateMobileTopBarState();
   if (pauseScreen) pauseScreen.classList.add('hidden');
 }
@@ -265,41 +396,54 @@ function startGame() {
   loadSavedRecords();
   resetRunState();
 
-  if (state.gameMode === 'circuit') {
-    buildCircuitTrack();
-    const startBackOffset = 9.8 * SEGMENT_LENGTH;
-    state.position = (((state.trackLength - PLAYER_Z - startBackOffset) % state.trackLength) + state.trackLength) % state.trackLength;
-    state.playerProgressZ = -startBackOffset + PLAYER_CENTER_OFFSET_Z;
-    resetCircuitRivals();
-    state.playerRank = state.rivals.length + 1;
-    state.playerX = state.rivals.length % 2 === 0 ? -0.38 : 0.38;
-    state.raceCountdownTimer = GAME_CONFIG.circuit.countdownSec;
-    state.lastCountdownDigit = 4;
-  } else {
-    buildTrack();
-    resetTraffic(INITIAL_TRAFFIC_COUNT);
-    audio.playStartBeep();
-  }
-
   state.gameState = STATE.PLAYING;
-  lastTimestamp = performance.now();
-  startScreen.classList.add('hidden');
+  needsPausedRedraw = false;
+  if (startScreen) startScreen.classList.add('hidden');
   if (settingsScreen) settingsScreen.classList.add('hidden');
   if (pauseScreen) pauseScreen.classList.add('hidden');
-  gameoverScreen.classList.add('hidden');
-  touchControls.classList.add('active');
+  if (gameoverScreen) gameoverScreen.classList.add('hidden');
+
+  if (state.gameMode === 'circuit') {
+    const activeRivalsCount = Math.min(
+      GAME_CONFIG.circuit.rivalsCount || GAME_CONFIG.circuit.rivals.length,
+      GAME_CONFIG.circuit.rivals.length
+    );
+    const playerGridSlot = Math.floor(Math.random() * (activeRivalsCount + 1));
+    initWorldForCurrentMode(playerGridSlot);
+
+    const { gridCol, backFromStartLine } = getCircuitGridSlotPose(playerGridSlot);
+    state.playerX = gridCol;
+    // Позиционируем камеру с учётом смещения PLAYER_Z + PLAYER_CENTER_OFFSET_Z, чтобы сама машина игрока встала ровно в свой слот
+    state.position = MathUtil.wrap(
+      -backFromStartLine - (PLAYER_Z + PLAYER_CENTER_OFFSET_Z),
+      state.trackLength
+    );
+    state.playerProgressZ = -backFromStartLine;
+    state.playerRank = playerGridSlot + 1;
+    state.raceCountdownTimer = GAME_CONFIG.circuit.countdownSec;
+    state.lastCountdownDigit = 0;
+  } else {
+    state.position = 0;
+    resetTraffic(INITIAL_TRAFFIC_COUNT);
+  }
+
+  if (touchControls) {
+    touchControls.classList.toggle('active', state.cachedIsTouch);
+  }
   updateMobileTopBarState();
   resizeCanvas();
 
   if (state.gameMode === 'circuit') {
-    showBanner(`ТРЕК #${state.circuitSeedId} • ${state.circuitTotalLaps} КРУГА`, '#39ff14', 1.6);
+    const lapsUpper = formatLapsCount(state.circuitTotalLaps).toUpperCase();
+    showBanner(t('bannerStartCircuit', { seed: state.circuitSeedId, laps: lapsUpper }), '#39ff14', 1.6);
   } else {
-    const modeLabel = state.gameMode === 'oncoming' ? 'ВСТРЕЧНАЯ ПОЛОСА' : 'ПОПУТНЫЙ ПОТОК';
-    showBanner(`СТАРТ! ${modeLabel}`, '#00f0ff', 1.8);
+    const modeLabel = state.gameMode === 'oncoming' ? t('modeTagOncoming') : t('modeTagOneway');
+    showBanner(t('bannerStartHighway', { mode: modeLabel }), '#00f0ff', 1.8);
   }
 }
 
-function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
+function triggerGameOver(reasonTitle = null) {
+  const finalReason = reasonTitle || t('goTimeUp');
   // Фиксируем положение машины игрока на трассе, чтобы камера проехала мимо и продолжила движение без неё
   state.stoppedPlayerZ = getPlayerWorldZ();
   state.stoppedPlayerX = state.playerX;
@@ -314,24 +458,28 @@ function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
   clearInputs();
   state.gameState = STATE.GAMEOVER;
   if (pauseScreen) pauseScreen.classList.add('hidden');
-  touchControls.classList.remove('active');
+  if (touchControls) touchControls.classList.remove('active');
   updateMobileTopBarState();
   resizeCanvas();
   audio.update(0, false, false, false);
 
-  const diffText = state.difficulty === 'hardcore' ? 'НОРМАЛЬНО' : 'ЛЕГКО';
-  const newRecordTag = document.getElementById('new-record-tag');
+  const diffText = state.difficulty === 'hardcore' ? t('diffTagHardcore') : t('diffTagArcade');
+  const kmhUnit = t('unitKmhLower');
+  const newRecordTag = gameoverEls.newRecordTag;
 
   if (state.gameMode === 'circuit') {
-    // Актуализируем сохранённый рекорд для текущей сложности перед сравнением
     loadSavedRecords();
+    // Округляем средний темп круга до десятых до сравнения с сохранённым рекордом, исключая ложный «Новый рекорд»
+    const roundedLapAvgKmh = state.bestLapAvgKmh !== null
+      ? Math.round(state.bestLapAvgKmh * 10) / 10
+      : null;
     let isNewLapRecord = false;
     if (
-      state.bestLapAvgKmh !== null &&
-      state.bestLapAvgKmh > 0 &&
-      (state.bestLapRecordKmh === null || state.bestLapAvgKmh > state.bestLapRecordKmh)
+      roundedLapAvgKmh !== null &&
+      roundedLapAvgKmh > 0 &&
+      (state.bestLapRecordKmh === null || roundedLapAvgKmh > state.bestLapRecordKmh)
     ) {
-      state.bestLapRecordKmh = state.bestLapAvgKmh;
+      state.bestLapRecordKmh = roundedLapAvgKmh;
       isNewLapRecord = true;
       try {
         localStorage.setItem(getBestLapStorageKey(), state.bestLapRecordKmh.toFixed(1));
@@ -339,36 +487,36 @@ function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
     }
 
     const totalRacers = state.rivals.length + 1;
-    document.getElementById('gameover-mode-tag').textContent = `КОЛЬЦЕВОЙ ЗАЕЗД • ТРЕК #${state.circuitSeedId} • ${diffText}`;
-    document.getElementById('gameover-title').textContent = reasonTitle;
+    gameoverEls.modeTag.textContent = t('modeTagCircuit', { seed: state.circuitSeedId, diff: diffText });
+    gameoverEls.title.textContent = finalReason;
 
-    document.getElementById('stat-label-1').textContent = 'Итоговое место';
-    document.getElementById('final-score').textContent = `${state.playerRank} из ${totalRacers}`;
+    gameoverEls.label1.textContent = t('statFinalPos');
+    gameoverEls.finalScore.textContent = t('statRankOf', { rank: state.playerRank, total: totalRacers });
 
-    document.getElementById('stat-label-2').textContent = 'Время гонки';
-    document.getElementById('best-score').textContent = formatRaceTime(state.raceElapsedTime);
+    gameoverEls.label2.textContent = t('statRaceTime');
+    gameoverEls.bestScore.textContent = formatRaceTime(state.raceElapsedTime);
 
-    document.getElementById('stat-label-3').textContent = 'Лучший круг';
-    document.getElementById('final-distance').textContent = state.bestLapTime !== null
-      ? `${formatRaceTime(state.bestLapTime)} (${Math.round(state.bestLapAvgKmh || 0)} км/ч)`
+    gameoverEls.label3.textContent = t('statBestLap');
+    gameoverEls.finalDistance.textContent = state.bestLapTime !== null
+      ? `${formatRaceTime(state.bestLapTime)} (${Math.round(state.bestLapAvgKmh || 0)} ${kmhUnit})`
       : '--:--.--';
 
-    document.getElementById('stat-label-4').textContent = state.bestLapRecordKmh !== null ? 'Рекорд круга / Макс.' : 'Макс. скорость';
-    document.getElementById('final-extra').textContent = state.bestLapRecordKmh !== null
-      ? `${Math.round(state.bestLapRecordKmh)} / ${state.maxKmhReached} км/ч`
-      : `${state.maxKmhReached} км/ч`;
+    gameoverEls.label4.textContent = state.bestLapRecordKmh !== null ? t('statLapRecordMax') : t('statMaxSpeed');
+    gameoverEls.finalExtra.textContent = state.bestLapRecordKmh !== null
+      ? `${Math.round(state.bestLapRecordKmh)} / ${state.maxKmhReached} ${kmhUnit}`
+      : `${state.maxKmhReached} ${kmhUnit}`;
 
     if (isNewLapRecord && state.playerRank === 1) {
-      newRecordTag.textContent = '★ ПОБЕДА И РЕКОРД ТЕМПА КРУГА! ★';
+      newRecordTag.textContent = t('recWinAndLap');
       newRecordTag.classList.remove('hidden');
     } else if (isNewLapRecord) {
-      newRecordTag.textContent = '★ НОВЫЙ РЕКОРД ТЕМПА КРУГА! ★';
+      newRecordTag.textContent = t('recNewLap');
       newRecordTag.classList.remove('hidden');
     } else if (state.playerRank === 1) {
-      newRecordTag.textContent = '★ ПОБЕДА В ГОНКЕ! ★';
+      newRecordTag.textContent = t('recWin');
       newRecordTag.classList.remove('hidden');
     } else if (state.playerRank <= 3) {
-      newRecordTag.textContent = '★ ПОДИУМ! ПРИЗОВОЕ МЕСТО! ★';
+      newRecordTag.textContent = t('recPodium');
       newRecordTag.classList.remove('hidden');
     } else {
       newRecordTag.classList.add('hidden');
@@ -385,24 +533,25 @@ function triggerGameOver(reasonTitle = 'ВРЕМЯ ВЫШЛО!') {
       } catch (e) {}
     }
 
-    const modeText = state.gameMode === 'oncoming' ? 'ВСТРЕЧНАЯ ПОЛОСА' : 'ПОПУТНЫЙ ПОТОК';
-    document.getElementById('gameover-mode-tag').textContent = `${modeText} • ${diffText}`;
-    document.getElementById('gameover-title').textContent = reasonTitle;
+    const modeText = state.gameMode === 'oncoming' ? t('modeTagOncoming') : t('modeTagOneway');
+    const numLocale = getNumberLocale();
+    gameoverEls.modeTag.textContent = `${modeText} • ${diffText}`;
+    gameoverEls.title.textContent = finalReason;
 
-    document.getElementById('stat-label-1').textContent = 'Итоговый счёт';
-    document.getElementById('final-score').textContent = finalScoreInt.toLocaleString('ru-RU');
+    gameoverEls.label1.textContent = t('statFinalScore');
+    gameoverEls.finalScore.textContent = finalScoreInt.toLocaleString(numLocale);
 
-    document.getElementById('stat-label-2').textContent = 'Лучший рекорд';
-    document.getElementById('best-score').textContent = state.bestScore.toLocaleString('ru-RU');
+    gameoverEls.label2.textContent = t('statBestRecord');
+    gameoverEls.bestScore.textContent = state.bestScore.toLocaleString(numLocale);
 
-    document.getElementById('stat-label-3').textContent = 'Дистанция';
-    document.getElementById('final-distance').textContent = `${(state.distanceMeters / 1000).toFixed(2)} км`;
+    gameoverEls.label3.textContent = t('statDistance');
+    gameoverEls.finalDistance.textContent = `${(state.distanceMeters / 1000).toFixed(2)} ${t('unitKmLower')}`;
 
-    document.getElementById('stat-label-4').textContent = 'Чекпоинты / Макс. км/ч';
-    document.getElementById('final-extra').textContent = `${state.checkpointsPassed} / ${state.maxKmhReached} км/ч`;
+    gameoverEls.label4.textContent = t('statExtra');
+    gameoverEls.finalExtra.textContent = `${state.checkpointsPassed} / ${state.maxKmhReached} ${kmhUnit}`;
 
     if (isNewRecord && finalScoreInt > 0) {
-      newRecordTag.textContent = '★ НОВЫЙ РЕКОРД! ★';
+      newRecordTag.textContent = t('recNewHighScore');
       newRecordTag.classList.remove('hidden');
     } else {
       newRecordTag.classList.add('hidden');
@@ -418,7 +567,8 @@ function returnToMenu() {
   resetRunState();
 
   state.gameState = STATE.TITLE;
-  touchControls.classList.remove('active');
+  needsPausedRedraw = false;
+  if (touchControls) touchControls.classList.remove('active');
   updateMobileTopBarState();
   audio.update(0, false, false, false);
 
@@ -427,215 +577,163 @@ function returnToMenu() {
   gameoverScreen.classList.add('hidden');
   startScreen.classList.remove('hidden');
 
-  if (state.gameMode === 'circuit') {
-    buildCircuitTrack();
-    resetCircuitRivals();
-  } else {
-    buildTrack();
-    resetTraffic(INITIAL_TRAFFIC_COUNT);
-  }
+  initWorldForCurrentMode();
   updateStartSubtitle();
   resizeCanvas();
+}
+
+function handleToggleMute() {
+  setSoundEnabled(audio.muted);
 }
 
 // Подключаем обработчик завершения игры для physics.js
 state.onGameOver = triggerGameOver;
 
 window.addEventListener('resize', resizeCanvas);
-
-// Переключатели режима трассы и сложности
-document.querySelectorAll('#track-mode-group .mode-pill').forEach((btn) => {
-  btn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    document.querySelectorAll('#track-mode-group .mode-pill').forEach((b) => b.classList.remove('active'));
-    btn.classList.add('active');
-    state.gameMode = btn.dataset.mode;
-    loadSavedRecords();
-    state.position = 0;
-    clearSkidMarks();
-    if (state.gameMode === 'circuit') {
-      buildCircuitTrack();
-      resetCircuitRivals();
-    } else {
-      buildTrack();
-      resetTraffic(INITIAL_TRAFFIC_COUNT);
-    }
-    updateStartSubtitle();
-  });
-});
-
-document.querySelectorAll('#difficulty-group .mode-pill').forEach((btn) => {
-  btn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    document.querySelectorAll('#difficulty-group .mode-pill').forEach((b) => b.classList.remove('active'));
-    btn.classList.add('active');
-    state.difficulty = btn.dataset.diff;
-    loadSavedRecords();
-    if (state.gameMode === 'circuit') {
-      applySharpTurnGuardrails(GAME_CONFIG.circuit.guardrailCurveThreshold);
-    }
-  });
-});
-
-// Кнопки интерфейса
-document.getElementById('start-btn').addEventListener('click', (e) => {
-  e.currentTarget.blur();
-  startGame();
-});
-const settingsBtn = document.getElementById('settings-btn');
-if (settingsBtn) {
-  settingsBtn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    openSettings();
-  });
-}
-const settingsBackBtn = document.getElementById('settings-back-btn');
-if (settingsBackBtn) {
-  settingsBackBtn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    closeSettings();
-  });
-}
-document.querySelectorAll('#settings-particles-group .mode-pill').forEach((btn) => {
-  btn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    state.settings.particlesEnabled = btn.dataset.particles === 'on';
-    if (!state.settings.particlesEnabled) {
-      state.particles = [];
-    }
-    saveSettings();
-    syncSettingsUI();
-  });
-});
-document.querySelectorAll('#settings-light-group .mode-pill').forEach((btn) => {
-  btn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    state.settings.lightStyle = btn.dataset.light === 'soft' ? 'soft' : 'hard';
-    saveSettings();
-    syncSettingsUI();
-  });
-});
-document.querySelectorAll('#settings-sound-group .mode-pill').forEach((btn) => {
-  btn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    setSoundEnabled(btn.dataset.sound === 'on', true);
-  });
-});
-if (devSettingsToggle) {
-  devSettingsToggle.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    const currentlyOpen = devSettingsToggle.classList.contains('open');
-    setDevSettingsOpen(!currentlyOpen);
-  });
-}
-document.querySelectorAll('#settings-fps-group .mode-pill').forEach((btn) => {
-  btn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    state.settings.showFps = btn.dataset.fps === 'on';
-    saveSettings();
-    syncSettingsUI();
-  });
-});
-document.getElementById('restart-btn').addEventListener('click', (e) => {
-  e.currentTarget.blur();
-  startGame();
-});
-document.getElementById('menu-btn').addEventListener('click', (e) => {
-  e.currentTarget.blur();
-  returnToMenu();
-});
-const resumeBtn = document.getElementById('resume-btn');
-if (resumeBtn) {
-  resumeBtn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    resumeGame();
-  });
-}
-const pauseMenuBtn = document.getElementById('pause-menu-btn');
-if (pauseMenuBtn) {
-  pauseMenuBtn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    returnToMenu();
-  });
-}
-if (mobileMenuBtn) {
-  mobileMenuBtn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    returnToMenu();
-  });
-}
-if (mobilePauseBtn) {
-  mobilePauseBtn.addEventListener('click', (e) => {
-    e.currentTarget.blur();
-    if (state.isPaused) resumeGame();
-    else pauseGame();
-  });
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', resizeCanvas);
 }
 
-function handleToggleMute(e) {
-  if (e && e.currentTarget instanceof HTMLElement) {
-    e.currentTarget.blur();
+// Переключатели режима трассы, сложности и графических/звуковых настроек
+bindPillGroup('#track-mode-group', 'mode', (nextMode, buttons, activeBtn) => {
+  if (nextMode === state.gameMode) return;
+  buttons.forEach((b) => b.classList.remove('active'));
+  activeBtn.classList.add('active');
+  state.gameMode = nextMode;
+  loadSavedRecords();
+  state.position = 0;
+  clearSkidMarks();
+  initWorldForCurrentMode();
+  updateStartSubtitle();
+});
+
+bindPillGroup('#difficulty-group', 'diff', (nextDiff, buttons, activeBtn) => {
+  if (nextDiff === state.difficulty) return;
+  buttons.forEach((b) => b.classList.remove('active'));
+  activeBtn.classList.add('active');
+  state.difficulty = nextDiff;
+  loadSavedRecords();
+  if (state.gameMode === 'circuit') {
+    applySharpTurnGuardrails(GAME_CONFIG.circuit.guardrailCurveThreshold);
   }
-  setSoundEnabled(audio.muted, true);
-}
-if (desktopMuteBtn) desktopMuteBtn.addEventListener('click', handleToggleMute);
-if (mobileMuteBtn) mobileMuteBtn.addEventListener('click', handleToggleMute);
+});
 
-// Клавиатура
+bindPillGroup('#settings-lang-group', 'lang', (val) => {
+  const nextLang = val === 'en' ? 'en' : 'ru';
+  if (nextLang === state.settings.language) return;
+  state.settings.language = nextLang;
+  saveSettings();
+  applyDomTranslations();
+  syncSettingsUI();
+  updateStartSubtitle();
+  updateMobileTopBarState();
+  resizeCanvas();
+});
+
+bindPillGroup('#settings-particles-group', 'particles', (val) => {
+  state.settings.particlesEnabled = val === 'on';
+  if (!state.settings.particlesEnabled) {
+    state.particles = [];
+  }
+  saveSettings();
+  syncSettingsUI();
+});
+
+bindPillGroup('#settings-light-group', 'light', (val) => {
+  state.settings.lightStyle = val === 'soft' ? 'soft' : 'hard';
+  saveSettings();
+  syncSettingsUI();
+});
+
+bindPillGroup('#settings-sound-group', 'sound', (val) => {
+  setSoundEnabled(val === 'on');
+});
+
+bindPillGroup('#settings-fps-group', 'fps', (val) => {
+  state.settings.showFps = val === 'on';
+  saveSettings();
+  syncSettingsUI();
+});
+
+// Основные кнопки навигации по экранам
+bindClick(document.getElementById('start-btn'), startGame);
+bindClick(document.getElementById('settings-btn'), openSettings);
+bindClick(document.getElementById('settings-back-btn'), closeSettings);
+bindClick(document.getElementById('restart-btn'), startGame);
+bindClick(document.getElementById('menu-btn'), returnToMenu);
+bindClick(document.getElementById('resume-btn'), resumeGame);
+bindClick(document.getElementById('pause-menu-btn'), returnToMenu);
+bindClick(mobileMenuBtn, returnToMenu);
+bindClick(mobilePauseBtn, () => {
+  if (state.isPaused) resumeGame();
+  else pauseGame();
+});
+bindClick(devSettingsToggle, () => {
+  const currentlyOpen = devSettingsToggle.classList.contains('open');
+  setDevSettingsOpen(!currentlyOpen);
+});
+bindClick(desktopMuteBtn, handleToggleMute);
+bindClick(mobileMuteBtn, handleToggleMute);
+
+// Клавиатура (с защитой от системных сочетаний и автоповтора e.repeat на хоткеях)
 window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+
   const code = e.code;
-  if (code === 'ArrowUp' || code === 'KeyW') {
-    if (!state.isPaused) state.input.up = true;
+  const dirKey = DIR_KEYS[code];
+  if (dirKey) {
     e.preventDefault();
-  } else if (code === 'ArrowDown' || code === 'KeyS') {
-    if (!state.isPaused) state.input.down = true;
-    e.preventDefault();
-  } else if (code === 'ArrowLeft' || code === 'KeyA') {
-    if (!state.isPaused) state.input.left = true;
-    e.preventDefault();
-  } else if (code === 'ArrowRight' || code === 'KeyD') {
-    if (!state.isPaused) state.input.right = true;
-    e.preventDefault();
-  } else if (code === 'KeyM') {
-    handleToggleMute();
+    if (!e.repeat && !state.isPaused && state.gameState === STATE.PLAYING) {
+      kbInput[dirKey] = true;
+      syncCombinedInput();
+    }
+    return;
+  }
+
+  if (code === 'KeyM') {
+    if (!e.repeat) handleToggleMute();
   } else if (code === 'KeyP') {
     if (state.gameState === STATE.PLAYING) {
       e.preventDefault();
-      if (state.isPaused) resumeGame();
-      else pauseGame();
+      if (!e.repeat) {
+        if (state.isPaused) resumeGame();
+        else pauseGame();
+      }
     }
   } else if (code === 'Enter' || code === 'Space') {
     if (isSettingsOpen()) {
       e.preventDefault();
-      closeSettings();
+      if (!e.repeat) closeSettings();
     } else if (state.gameState === STATE.PLAYING && state.isPaused) {
       e.preventDefault();
-      resumeGame();
+      if (!e.repeat) resumeGame();
     } else if (state.gameState === STATE.TITLE || state.gameState === STATE.GAMEOVER) {
       e.preventDefault();
-      startGame();
+      if (!e.repeat) startGame();
     }
   } else if (code === 'Escape') {
     if (isSettingsOpen()) {
       e.preventDefault();
-      closeSettings();
+      if (!e.repeat) closeSettings();
     } else if (state.gameState === STATE.PLAYING) {
       e.preventDefault();
-      if (state.isPaused) resumeGame();
-      else pauseGame();
+      if (!e.repeat) {
+        if (state.isPaused) resumeGame();
+        else pauseGame();
+      }
     } else if (state.gameState === STATE.GAMEOVER) {
       e.preventDefault();
-      returnToMenu();
+      if (!e.repeat) returnToMenu();
     }
   }
 });
 
 window.addEventListener('keyup', (e) => {
-  const code = e.code;
-  if (code === 'ArrowUp' || code === 'KeyW') state.input.up = false;
-  else if (code === 'ArrowDown' || code === 'KeyS') state.input.down = false;
-  else if (code === 'ArrowLeft' || code === 'KeyA') state.input.left = false;
-  else if (code === 'ArrowRight' || code === 'KeyD') state.input.right = false;
+  const dirKey = DIR_KEYS[e.code];
+  if (dirKey) {
+    kbInput[dirKey] = false;
+    syncCombinedInput();
+  }
 });
 
 document.addEventListener('visibilitychange', () => {
@@ -650,14 +748,18 @@ window.addEventListener('blur', () => {
   pauseGame();
 });
 
-// Мультитач-управление
+// Мультитач-управление по предварительно закэшированным прямоугольникам кнопок (без getBoundingClientRect в touchmove)
 function updateTouchesFromList(touchList) {
   if (state.isPaused || state.gameState !== STATE.PLAYING) {
     clearInputs();
     return;
   }
 
-  const activeIds = new Set();
+  touchInput.up = false;
+  touchInput.down = false;
+  touchInput.left = false;
+  touchInput.right = false;
+
   const hitSlopPx = 5;
 
   for (let i = 0; i < touchList.length; i++) {
@@ -665,13 +767,12 @@ function updateTouchesFromList(touchList) {
     const tx = t.clientX;
     const ty = t.clientY;
 
-    let bestId = null;
+    let bestKey = null;
     let bestDistSq = Infinity;
 
     for (let b = 0; b < touchButtonMap.length; b++) {
-      const btnEl = touchButtonMap[b].el;
-      if (!btnEl) continue;
-      const rect = btnEl.getBoundingClientRect();
+      const rect = touchButtonMap[b].rect;
+      if (!rect || rect.width <= 0) continue;
       if (
         tx >= rect.left - hitSlopPx &&
         tx <= rect.right + hitSlopPx &&
@@ -683,22 +784,17 @@ function updateTouchesFromList(touchList) {
         const distSq = (tx - cx) * (tx - cx) + (ty - cy) * (ty - cy);
         if (distSq < bestDistSq) {
           bestDistSq = distSq;
-          bestId = touchButtonMap[b].id;
+          bestKey = touchButtonMap[b].key;
         }
       }
     }
 
-    if (bestId) activeIds.add(bestId);
-  }
-
-  for (let i = 0; i < touchButtonMap.length; i++) {
-    const item = touchButtonMap[i];
-    const isPressed = activeIds.has(item.id);
-    state.input[item.key] = isPressed;
-    if (item.el) {
-      item.el.classList.toggle('pressed', isPressed);
+    if (bestKey) {
+      touchInput[bestKey] = true;
     }
   }
+
+  syncCombinedInput();
 }
 
 if (touchControls) {
@@ -709,6 +805,7 @@ if (touchControls) {
       return;
     }
     audio.init();
+    refreshTouchButtonRects();
     updateTouchesFromList(e.touches);
   }, { passive: false });
 
@@ -732,23 +829,49 @@ for (let i = 0; i < touchButtonMap.length; i++) {
   const item = touchButtonMap[i];
   const el = item.el;
   if (!el) continue;
+
   el.addEventListener('mousedown', (e) => {
     e.preventDefault();
     if (state.isPaused || state.gameState !== STATE.PLAYING) return;
     audio.init();
-    state.input[item.key] = true;
-    el.classList.add('pressed');
+    pointerInput[item.key] = true;
+    syncCombinedInput();
   });
+
   const releaseMouse = () => {
-    state.input[item.key] = false;
-    el.classList.remove('pressed');
+    if (!pointerInput[item.key]) return;
+    pointerInput[item.key] = false;
+    syncCombinedInput();
   };
   el.addEventListener('mouseup', releaseMouse);
   el.addEventListener('mouseleave', releaseMouse);
 }
 
+window.addEventListener('mouseup', () => {
+  let changed = false;
+  for (const k of ['up', 'down', 'left', 'right']) {
+    if (pointerInput[k]) {
+      pointerInput[k] = false;
+      changed = true;
+    }
+  }
+  if (changed) syncCombinedInput();
+});
+
 // Главный игровой цикл
 function gameLoop(now) {
+  // На паузе не крутим холостую перерисовку 3D-сцены в 60–240 FPS (перерисовываем только при входе или ресайзе)
+  if (state.gameState === STATE.PLAYING && state.isPaused) {
+    lastTimestamp = now;
+    audio.update(0, false, false, false);
+    if (needsPausedRedraw) {
+      renderFrame(ctx);
+      needsPausedRedraw = false;
+    }
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
   const dt = Math.min(GAME_CONFIG.screen.maxFrameDeltaSec, Math.max(0.001, (now - lastTimestamp) / 1000));
   lastTimestamp = now;
 
@@ -766,17 +889,12 @@ function gameLoop(now) {
   requestAnimationFrame(gameLoop);
 }
 
-// Инициализация при запуске
+// Инициализация при запуске (без вызова audio.init() до первого пользовательского жеста)
 audio.muted = !state.settings.soundEnabled;
+applyDomTranslations();
 syncSetupButtonsWithConfig();
 syncSettingsUI();
-if (state.gameMode === 'circuit') {
-  buildCircuitTrack();
-  resetCircuitRivals();
-} else {
-  buildTrack();
-  resetTraffic(INITIAL_TRAFFIC_COUNT);
-}
+initWorldForCurrentMode();
 updateStartSubtitle();
 updateMobileTopBarState();
 resizeCanvas();

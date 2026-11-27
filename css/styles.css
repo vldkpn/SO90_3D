@@ -1,6 +1,16 @@
 /* ==========================================================================
-   БАЗОВЫЕ СТИЛИ И АДАПТИВНЫЙ КОНТЕЙНЕР (ZERO-SETUP)
+   ПАЛИТРА И БАЗОВЫЕ СТИЛИ (ZERO-SETUP)
    ========================================================================== */
+:root {
+  --bg-deep: #0d0221;
+  --neon-cyan: #00f0ff;
+  --neon-pink: #ff2a85;
+  --neon-amber: #ffbe0b;
+  --neon-green: #39ff14;
+  --text-muted: #b8a3e0;
+  --ui-font: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -10,12 +20,17 @@
   -webkit-touch-callout: none;
 }
 
-html, body {
+button {
+  font-family: inherit;
+}
+
+html,
+body {
   width: 100%;
   height: 100%;
   overflow: hidden;
   background: radial-gradient(circle at center, #16092b 0%, #07030f 100%);
-  font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+  font-family: var(--ui-font);
   color: #ffffff;
   display: flex;
   align-items: center;
@@ -55,12 +70,13 @@ html, body {
 .top-bar-btn {
   background: rgba(13, 2, 33, 0.90);
   border: 1.5px solid rgba(0, 240, 255, 0.55);
-  color: #00f0ff;
+  color: var(--neon-cyan);
   border-radius: 10px;
   padding: 6px 12px;
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.5px;
+  white-space: nowrap;
   cursor: pointer;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
   transition: transform 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
@@ -68,7 +84,7 @@ html, body {
 
 .top-bar-btn.menu-exit-btn {
   border-color: rgba(255, 190, 11, 0.65);
-  color: #ffbe0b;
+  color: var(--neon-amber);
 }
 
 .top-bar-btn.pause-toggle-btn {
@@ -85,7 +101,7 @@ html, body {
   pointer-events: none;
 }
 
-/* Обертка игры, сохраняющая пропорции экрана без полос прокрутки */
+/* Обёртка игры, сохраняющая пропорции экрана без полос прокрутки */
 #game-wrapper {
   position: relative;
   flex-shrink: 0;
@@ -99,16 +115,17 @@ html, body {
   border-radius: 14px;
   overflow: hidden;
   border: 2px solid rgba(255, 110, 199, 0.35);
-  background: #0d0221;
+  background: var(--bg-deep);
 }
 
 canvas {
   display: block;
   width: 100%;
   height: 100%;
+  touch-action: none;
 }
 
-/* Эффект легких CRT-линий поверх экрана для атмосферы 90-х */
+/* Эффект лёгких CRT-линий поверх экрана для атмосферы 90-х */
 .crt-overlay {
   position: absolute;
   inset: 0;
@@ -129,12 +146,13 @@ canvas {
   z-index: 20;
   background: rgba(13, 2, 33, 0.88);
   border: 1.5px solid rgba(0, 240, 255, 0.55);
-  color: #00f0ff;
+  color: var(--neon-cyan);
   border-radius: 10px;
   padding: 6px 11px;
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0.5px;
+  white-space: nowrap;
   cursor: pointer;
   transition: transform 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
@@ -160,23 +178,27 @@ canvas {
   flex-direction: column;
   align-items: center;
   justify-content: flex-start;
-  padding: 16px 20px;
+  padding: 14px 20px;
   text-align: center;
   background: radial-gradient(
     circle at center,
     rgba(18, 5, 42, 0.66) 0%,
     rgba(9, 2, 22, 0.90) 100%
   );
+  -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
-  transition: opacity 0.25s ease;
   overflow-y: auto;
+  touch-action: pan-y;
 }
 
-.overlay > :first-child {
+/* Надёжное вертикальное центрирование через псевдоэлементы (не ломается от display: none или position: absolute у детей) */
+.overlay::before {
+  content: '';
   margin-top: auto;
 }
 
-.overlay > :last-child {
+.overlay::after {
+  content: '';
   margin-bottom: auto;
 }
 
@@ -189,25 +211,26 @@ canvas {
   font-weight: 800;
   letter-spacing: 3px;
   text-transform: uppercase;
-  color: #00f0ff;
+  color: var(--neon-cyan);
   text-shadow: 0 0 10px rgba(0, 240, 255, 0.8);
   margin-bottom: 4px;
 }
 
+/* Запас line-height и padding предотвращает срезание диакритики («Й») и курсивных краёв */
 .game-title {
-  font-size: clamp(22px, 5.2vw, 58px);
+  font-size: clamp(22px, 5.1vw, 56px);
   font-weight: 900;
   font-style: italic;
-  line-height: 1.0;
+  line-height: 1.12;
   letter-spacing: 2px;
   text-transform: uppercase;
-  background: linear-gradient(180deg, #ffffff 0%, #7ce8ff 35%, #ff2a85 68%, #ffbe0b 100%);
+  background: linear-gradient(180deg, #ffffff 0%, #7ce8ff 35%, var(--neon-pink) 68%, var(--neon-amber) 100%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
   filter: drop-shadow(0 4px 0 #240046) drop-shadow(0 0 22px rgba(255, 42, 133, 0.7));
-  margin-bottom: 8px;
-  padding: 0 10px;
+  margin-bottom: 5px;
+  padding: 2px 12px;
 }
 
 .game-subtitle {
@@ -229,14 +252,107 @@ canvas {
   max-width: 630px;
 }
 
-/* Балансировка акцентов в меню настроек: название параметра читается яснее статуса */
+.setup-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: rgba(13, 2, 33, 0.82);
+  border: 1px solid rgba(0, 240, 255, 0.25);
+  border-radius: 12px;
+  padding: 6px 8px 6px 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.setup-label {
+  font-size: clamp(10px, 1.25vw, 12px);
+  font-weight: 900;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.setup-options {
+  display: flex;
+  flex: 1;
+  max-width: 495px;
+  gap: 6px;
+  background: rgba(6, 1, 16, 0.75);
+  padding: 3px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.mode-pill {
+  --pill-bg: linear-gradient(180deg, rgba(0, 240, 255, 0.32) 0%, rgba(0, 140, 210, 0.25) 100%);
+  --pill-border: var(--neon-cyan);
+  --pill-color: #ffffff;
+  --pill-text-glow: rgba(0, 240, 255, 0.65);
+  --pill-box-glow: rgba(0, 240, 255, 0.38);
+
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  border: 1.5px solid transparent;
+  background: transparent;
+  color: #a992d1;
+  font-size: clamp(10px, 1.25vw, 12px);
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.mode-pill:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.mode-pill:active {
+  transform: scale(0.97);
+}
+
+.mode-pill.circuit-pill {
+  --pill-bg: linear-gradient(180deg, rgba(57, 255, 20, 0.30) 0%, rgba(18, 135, 10, 0.25) 100%);
+  --pill-border: var(--neon-green);
+  --pill-text-glow: rgba(57, 255, 20, 0.65);
+  --pill-box-glow: rgba(57, 255, 20, 0.38);
+}
+
+.mode-pill.hardcore-pill {
+  --pill-bg: linear-gradient(180deg, rgba(255, 42, 133, 0.48) 0%, rgba(190, 20, 90, 0.35) 100%);
+  --pill-border: var(--neon-amber);
+  --pill-color: #fff8e7;
+  --pill-text-glow: rgba(255, 190, 11, 0.70);
+  --pill-box-glow: rgba(255, 42, 133, 0.52);
+}
+
+.mode-pill.active {
+  background: var(--pill-bg);
+  border-color: var(--pill-border);
+  color: var(--pill-color);
+  text-shadow: 0 0 8px var(--pill-text-glow);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    0 0 14px var(--pill-box-glow);
+}
+
+/* Балансировка акцентов и компактная посадка 4 строк в меню настроек */
 .settings-panel {
   max-width: 560px;
+  gap: 6px;
+  margin-bottom: 12px;
 }
 
 .settings-panel .setup-row {
-  gap: 24px;
-  padding: 8px 10px 8px 16px;
+  gap: 20px;
+  padding: 6px 10px 6px 16px;
 }
 
 .settings-panel .setup-label {
@@ -249,8 +365,6 @@ canvas {
 
 .settings-panel .setup-options {
   flex: 0 0 208px;
-  width: 208px;
-  max-width: 208px;
   gap: 4px;
   padding: 2px;
   background: rgba(6, 1, 16, 0.65);
@@ -272,96 +386,6 @@ canvas {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.16),
     0 0 8px rgba(0, 240, 255, 0.20);
-}
-
-.setup-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  background: rgba(13, 2, 33, 0.82);
-  border: 1px solid rgba(0, 240, 255, 0.25);
-  border-radius: 12px;
-  padding: 6px 8px 6px 12px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-}
-
-.setup-label {
-  font-size: clamp(10px, 1.25vw, 12px);
-  font-weight: 900;
-  letter-spacing: 1.2px;
-  text-transform: uppercase;
-  color: #b8a3e0;
-  white-space: nowrap;
-}
-
-.setup-options {
-  display: flex;
-  flex: 1;
-  max-width: 495px;
-  gap: 6px;
-  background: rgba(6, 1, 16, 0.75);
-  padding: 3px;
-  border-radius: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.mode-pill {
-  flex: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  padding: 7px 8px;
-  border-radius: 7px;
-  border: 1.5px solid transparent;
-  background: transparent;
-  color: #a992d1;
-  font-size: clamp(10px, 1.25vw, 12px);
-  font-weight: 800;
-  letter-spacing: 0.4px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: all 0.15s ease;
-}
-
-.mode-pill:hover {
-  color: #ffffff;
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.mode-pill:active {
-  transform: scale(0.97);
-}
-
-.mode-pill.active {
-  background: linear-gradient(180deg, rgba(0, 240, 255, 0.32) 0%, rgba(0, 140, 210, 0.25) 100%);
-  border-color: #00f0ff;
-  color: #ffffff;
-  text-shadow: 0 0 8px rgba(0, 240, 255, 0.65);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.35),
-    0 0 14px rgba(0, 240, 255, 0.38);
-}
-
-.mode-pill.active.circuit-pill {
-  background: linear-gradient(180deg, rgba(57, 255, 20, 0.30) 0%, rgba(18, 135, 10, 0.25) 100%);
-  border-color: #39ff14;
-  color: #ffffff;
-  text-shadow: 0 0 8px rgba(57, 255, 20, 0.65);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.35),
-    0 0 14px rgba(57, 255, 20, 0.38);
-}
-
-.mode-pill.active.hardcore-pill {
-  background: linear-gradient(180deg, rgba(255, 42, 133, 0.48) 0%, rgba(190, 20, 90, 0.35) 100%);
-  border-color: #ffbe0b;
-  color: #fff8e7;
-  text-shadow: 0 0 8px rgba(255, 190, 11, 0.7);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.35),
-    0 0 15px rgba(255, 42, 133, 0.52);
 }
 
 /* Неброский выпадающий раздел тестовых настроек */
@@ -434,7 +458,7 @@ canvas {
   text-transform: uppercase;
   color: #ffffff;
   text-shadow: 0 2px 3px rgba(90, 0, 35, 0.85);
-  background: linear-gradient(180deg, #ff5ca1 0%, #ff2a85 48%, #e01468 100%);
+  background: linear-gradient(180deg, #ff5ca1 0%, var(--neon-pink) 48%, #e01468 100%);
   border: 2px solid #ffe066;
   border-radius: 13px;
   cursor: pointer;
@@ -445,21 +469,23 @@ canvas {
   transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
 }
 
+/* Композитная GPU-анимация блика через transform без пересчёта Layout (left) */
 .arcade-btn::after {
   content: '';
   position: absolute;
   top: 0;
-  left: -120%;
+  left: 0;
   width: 60%;
   height: 100%;
   background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.32), transparent);
-  transform: skewX(-24deg);
+  transform: translateX(-220%) skewX(-24deg);
+  will-change: transform;
   animation: btnShine 3.2s infinite;
 }
 
 @keyframes btnShine {
-  0%, 65% { left: -120%; }
-  100% { left: 160%; }
+  0%, 65% { transform: translateX(-220%) skewX(-24deg); }
+  100% { transform: translateX(300%) skewX(-24deg); }
 }
 
 .arcade-btn:hover {
@@ -479,9 +505,7 @@ canvas {
     0 4px 14px rgba(255, 42, 133, 0.6);
 }
 
-.start-actions,
-.settings-actions,
-.gameover-actions {
+.overlay-actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
@@ -499,9 +523,9 @@ canvas {
   font-weight: 900;
   letter-spacing: 1.5px;
   text-transform: uppercase;
-  color: #00f0ff;
+  color: var(--neon-cyan);
   background: linear-gradient(180deg, rgba(22, 10, 52, 0.92) 0%, rgba(11, 2, 30, 0.95) 100%);
-  border: 2px solid #00f0ff;
+  border: 2px solid var(--neon-cyan);
   border-radius: 13px;
   cursor: pointer;
   box-shadow:
@@ -528,11 +552,11 @@ canvas {
 }
 
 .blink-hint {
-  margin-top: 12px;
+  margin-top: 10px;
   font-size: clamp(11px, 1.4vw, 13px);
   font-weight: 700;
   letter-spacing: 1.5px;
-  color: #ffbe0b;
+  color: var(--neon-amber);
   animation: blinkAnim 1.15s infinite alternate;
 }
 
@@ -555,7 +579,7 @@ canvas {
 }
 
 .controls-panel {
-  margin-top: 12px;
+  margin-top: 10px;
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
@@ -574,14 +598,14 @@ canvas {
   border-radius: 5px;
   background: rgba(255, 255, 255, 0.12);
   border: 1px solid rgba(255, 255, 255, 0.35);
-  color: #00f0ff;
+  color: var(--neon-cyan);
   font-weight: 800;
   margin-right: 4px;
 }
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(120px, 185px));
+  grid-template-columns: repeat(2, minmax(120px, 190px));
   gap: 8px;
   margin-bottom: 16px;
 }
@@ -608,7 +632,7 @@ canvas {
 }
 
 .stat-value.highlight {
-  color: #ffbe0b;
+  color: var(--neon-amber);
   text-shadow: 0 0 12px rgba(255, 190, 11, 0.55);
 }
 
@@ -617,7 +641,7 @@ canvas {
   margin-bottom: 10px;
   padding: 4px 14px;
   border-radius: 20px;
-  background: linear-gradient(90deg, #ffbe0b, #ff2a85);
+  background: linear-gradient(90deg, var(--neon-amber), var(--neon-pink));
   color: #140326;
   font-weight: 900;
   font-size: 11px;
@@ -635,7 +659,7 @@ canvas {
   display: none;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 14px;
+  padding: 8px max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left));
   background: rgba(14, 4, 34, 0.88);
   border: 1.5px solid rgba(0, 240, 255, 0.28);
   border-radius: 16px;
@@ -653,6 +677,16 @@ canvas {
   #touch-controls.active {
     display: flex;
   }
+  /* Экономия мобильного GPU: отключаем тяжёлый blur поверх 60 FPS канваса */
+  .overlay {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    background: radial-gradient(
+      circle at center,
+      rgba(18, 5, 42, 0.78) 0%,
+      rgba(9, 2, 22, 0.94) 100%
+    );
+  }
 }
 
 .touch-group {
@@ -667,12 +701,13 @@ canvas {
   border-radius: 15px;
   background: linear-gradient(180deg, rgba(34, 14, 72, 0.95) 0%, rgba(16, 5, 38, 0.98) 100%);
   border: 2px solid rgba(0, 240, 255, 0.6);
-  color: #00f0ff;
+  color: var(--neon-cyan);
   font-size: 22px;
   font-weight: 900;
   display: flex;
   align-items: center;
   justify-content: center;
+  cursor: pointer;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.2),
     0 4px 0 #072c3d;
@@ -683,7 +718,7 @@ canvas {
 .touch-btn.pedal-gas {
   width: 76px;
   border-color: rgba(57, 255, 20, 0.75);
-  color: #39ff14;
+  color: var(--neon-green);
   font-size: 16px;
   letter-spacing: 1px;
   box-shadow:
@@ -708,17 +743,23 @@ canvas {
   box-shadow: 0 1px 0 rgba(0, 0, 0, 0.5);
 }
 
-/* Адаптация меню и кнопок на компактных мобильных экранах */
-@media (max-width: 680px), (max-height: 460px) {
+/* Адаптация меню и кнопок на компактных мобильных экранах и смартфонах в ландшафте */
+@media (max-width: 680px), (max-height: 520px) {
   .overlay {
     padding: 6px 10px;
   }
-  .game-badge {
+  /* Скрываем декоративные бейджи, но сохраняем бейдж режима на экране итогов */
+  .overlay:not(#gameover-screen) .game-badge {
     display: none;
   }
+  #gameover-mode-tag {
+    font-size: 9.5px;
+    letter-spacing: 1.4px;
+    margin-bottom: 2px;
+  }
   .game-title {
-    font-size: clamp(18px, 4.4vw, 28px);
-    margin-bottom: 4px;
+    font-size: clamp(18px, 4.2vw, 26px);
+    margin-bottom: 3px;
   }
   .game-subtitle,
   .controls-panel,
@@ -748,23 +789,25 @@ canvas {
     gap: 3px;
   }
   .mode-pill {
-    padding: 4px 4px;
+    padding: 4px;
     font-size: 9.5px;
+  }
+  .settings-panel {
+    gap: 4px;
+    margin-bottom: 6px;
   }
   .settings-panel .setup-row {
     gap: 12px;
-    padding: 4px 6px 4px 10px;
+    padding: 3.5px 6px 3.5px 10px;
   }
   .settings-panel .setup-label {
     font-size: 9.5px;
   }
   .settings-panel .setup-options {
     flex: 0 0 156px;
-    width: 156px;
-    max-width: 156px;
   }
   .settings-panel .mode-pill {
-    padding: 3.5px 4px;
+    padding: 3px 4px;
     font-size: 9px;
   }
   .dev-settings-toggle {
@@ -781,9 +824,7 @@ canvas {
     font-size: 12px;
     border-radius: 10px;
   }
-  .start-actions,
-  .settings-actions,
-  .gameover-actions {
+  .overlay-actions {
     gap: 8px;
   }
   .stats-grid {
@@ -814,13 +855,12 @@ canvas {
     max-width: 100%;
   }
   .settings-panel .setup-row {
-    gap: 4px;
-    padding: 5px 7px;
+    gap: 3px;
+    padding: 4px 7px;
   }
   .settings-panel .setup-options {
     flex: 1 1 auto;
     width: 100%;
-    max-width: 100%;
   }
   .mode-pill {
     font-size: 9px;
@@ -829,14 +869,15 @@ canvas {
   }
 }
 
-/* Ландшафтный режим смартфона */
-@media (max-height: 460px) {
+/* Компактные педали в ландшафтном режиме смартфона */
+@media (max-height: 500px) {
   #app-container {
     padding: 4px;
     gap: 5px;
   }
   #touch-controls {
-    padding: 5px 12px;
+    padding-top: 5px;
+    padding-bottom: 5px;
   }
   .touch-btn {
     width: 58px;

@@ -2,8 +2,13 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <title>SUNSET OVERDRIVE '90 — 3D Аркадная Гонка</title>
+  <!-- Встроенная SVG-иконка предотвращает лишний сетевой запрос 404 /favicon.ico -->
+  <link
+    rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0%25' stop-color='%23ffbe0b'/%3E%3Cstop offset='100%25' stop-color='%23ff2a85'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='28' fill='url(%23g)'/%3E%3Cpath d='M6 40h52v4H6zm4 8h44v4H10z' fill='%2316092b'/%3E%3C/svg%3E"
+  />
   <link rel="stylesheet" href="css/styles.css" />
 </head>
 <body>
@@ -11,10 +16,28 @@
     <!-- Верхняя панель над игровым экраном (для сенсорных устройств) -->
     <div id="top-bar">
       <div class="top-bar-left">
-        <button id="mobile-menu-btn" class="top-bar-btn menu-exit-btn invisible" type="button">⌂ МЕНЮ</button>
-        <button id="mobile-pause-btn" class="top-bar-btn pause-toggle-btn invisible" type="button">⏸ ПАУЗА</button>
+        <button
+          id="mobile-menu-btn"
+          class="top-bar-btn menu-exit-btn invisible"
+          type="button"
+          tabindex="-1"
+          data-i18n="mobileMenuBtn"
+        >⌂ МЕНЮ</button>
+        <button
+          id="mobile-pause-btn"
+          class="top-bar-btn pause-toggle-btn invisible"
+          type="button"
+          tabindex="-1"
+        >⏸ ПАУЗА</button>
       </div>
-      <button id="mobile-mute-btn" class="top-bar-btn" type="button" title="Включить/выключить звук">🔊 ЗВУК: ВКЛ</button>
+      <button
+        id="mobile-mute-btn"
+        class="top-bar-btn mute-btn"
+        type="button"
+        tabindex="-1"
+        aria-label="Включить или выключить звук"
+        data-i18n-aria="muteAria"
+      >🔊 ЗВУК: ВКЛ</button>
     </div>
 
     <div id="game-wrapper">
@@ -22,11 +45,18 @@
       <div class="crt-overlay"></div>
 
       <!-- Кнопка звука в углу (для ПК) -->
-      <button id="desktop-mute-btn" type="button" title="Включить/выключить звук (M)">🔊 ЗВУК: ВКЛ</button>
+      <button
+        id="desktop-mute-btn"
+        class="mute-btn"
+        type="button"
+        tabindex="-1"
+        title="Включить/выключить звук (M)"
+        data-i18n-title="muteTitle"
+      >🔊 ЗВУК: ВКЛ</button>
 
       <!-- Стартовый экран -->
       <div id="start-screen" class="overlay">
-        <div class="game-badge">★ ARCADE RETRO 3D SERIES 1990 ★</div>
+        <div class="game-badge" data-i18n="startBadge">★ ARCADE RETRO 3D SERIES 1990 ★</div>
         <h1 class="game-title">SUNSET OVERDRIVE '90</h1>
         <p id="start-subtitle" class="game-subtitle">
           Мчитесь навстречу неоновому закату, обгоняйте трафик и пересекайте чекпоинты до истечения таймера!
@@ -34,65 +64,71 @@
 
         <div class="setup-panel">
           <div class="setup-row">
-            <span class="setup-label">Режим</span>
+            <span class="setup-label" data-i18n="labelMode">Режим</span>
             <div class="setup-options" id="track-mode-group">
-              <button type="button" class="mode-pill active" data-mode="oneway">➡ ПОПУТНЫЙ</button>
-              <button type="button" class="mode-pill" data-mode="oncoming">⇄ ВСТРЕЧКА</button>
-              <button type="button" class="mode-pill circuit-pill" data-mode="circuit">🏁 КОЛЬЦЕВОЙ</button>
+              <button type="button" class="mode-pill active" data-mode="oneway" data-i18n="modeOneway">➡ ПОПУТНЫЙ</button>
+              <button type="button" class="mode-pill" data-mode="oncoming" data-i18n="modeOncoming">⇄ ВСТРЕЧКА</button>
+              <button type="button" class="mode-pill circuit-pill" data-mode="circuit" data-i18n="modeCircuit">🏁 КОЛЬЦЕВОЙ</button>
             </div>
           </div>
           <div class="setup-row">
-            <span class="setup-label">Сложность</span>
+            <span class="setup-label" data-i18n="labelDifficulty">Сложность</span>
             <div class="setup-options" id="difficulty-group">
-              <button type="button" class="mode-pill active" data-diff="arcade">★ ЛЕГКО</button>
-              <button type="button" class="mode-pill hardcore-pill" data-diff="hardcore">★ НОРМАЛЬНО</button>
+              <button type="button" class="mode-pill active" data-diff="arcade" data-i18n="diffArcade">★ ЛЕГКО</button>
+              <button type="button" class="mode-pill hardcore-pill" data-diff="hardcore" data-i18n="diffHardcore">★★ НОРМАЛЬНО</button>
             </div>
           </div>
         </div>
 
-        <div class="start-actions">
-          <button id="start-btn" class="arcade-btn" type="button">▶ СТАРТ</button>
-          <button id="settings-btn" class="secondary-btn" type="button">⚙ НАСТРОЙКИ</button>
+        <div class="overlay-actions start-actions">
+          <button id="start-btn" class="arcade-btn" type="button" data-i18n="btnStart">▶ СТАРТ</button>
+          <button id="settings-btn" class="secondary-btn" type="button" data-i18n="btnSettings">⚙ НАСТРОЙКИ</button>
         </div>
-        <div class="blink-hint">НАЖМИТЕ ENTER ИЛИ ПРОБЕЛ</div>
-
-        <!-- Метка версии размещена до .controls-panel, чтобы сохранить центрирование :last-child -->
-        <div id="game-version" class="game-version" aria-label="Версия игры">v1.2</div>
+        <div class="blink-hint" data-i18n="hintStart">НАЖМИТЕ ENTER ИЛИ ПРОБЕЛ</div>
 
         <div class="controls-panel">
-          <div><span class="key-cap">W</span><span class="key-cap">↑</span> Газ</div>
-          <div><span class="key-cap">S</span><span class="key-cap">↓</span> Тормоз / Задний ход</div>
-          <div><span class="key-cap">A</span><span class="key-cap">D</span> / <span class="key-cap">←</span><span class="key-cap">→</span> Руль</div>
-          <div><span class="key-cap">ESC</span><span class="key-cap">P</span> Пауза</div>
-          <div><span class="key-cap">M</span> Звук</div>
+          <div><span class="key-cap">W</span><span class="key-cap">↑</span> <span data-i18n="ctrlGas">Газ</span></div>
+          <div><span class="key-cap">S</span><span class="key-cap">↓</span> <span data-i18n="ctrlBrake">Тормоз / Задний ход</span></div>
+          <div><span class="key-cap">A</span><span class="key-cap">D</span> / <span class="key-cap">←</span><span class="key-cap">→</span> <span data-i18n="ctrlSteer">Руль</span></div>
+          <div><span class="key-cap">ESC</span><span class="key-cap">P</span> <span data-i18n="ctrlPause">Пауза</span></div>
+          <div><span class="key-cap">M</span> <span data-i18n="ctrlSound">Звук</span></div>
         </div>
+
+        <div id="game-version" class="game-version" aria-label="Версия игры" data-i18n-aria="versionAria">v1.3</div>
       </div>
 
       <!-- Экран настроек -->
       <div id="settings-screen" class="overlay hidden">
-        <div class="game-badge">ПАРАМЕТРЫ ГРАФИКИ И ЗВУКА</div>
-        <h2 class="game-title">НАСТРОЙКИ</h2>
+        <div class="game-badge" data-i18n="settingsBadge">ПАРАМЕТРЫ ГРАФИКИ, ЗВУКА И ЯЗЫКА</div>
+        <h2 class="game-title" data-i18n="settingsTitle">НАСТРОЙКИ</h2>
 
         <div class="setup-panel settings-panel">
           <div class="setup-row">
-            <span class="setup-label">Дым и частицы</span>
+            <span class="setup-label" data-i18n="settingLanguage">Язык</span>
+            <div class="setup-options" id="settings-lang-group">
+              <button type="button" class="mode-pill active" data-lang="ru">RU</button>
+              <button type="button" class="mode-pill" data-lang="en">EN</button>
+            </div>
+          </div>
+          <div class="setup-row">
+            <span class="setup-label" data-i18n="settingParticles">Дым и частицы</span>
             <div class="setup-options" id="settings-particles-group">
-              <button type="button" class="mode-pill" data-particles="off">ВЫКЛ</button>
-              <button type="button" class="mode-pill active" data-particles="on">ВКЛ</button>
+              <button type="button" class="mode-pill" data-particles="off" data-i18n="optOff">ВЫКЛ</button>
+              <button type="button" class="mode-pill active" data-particles="on" data-i18n="optOn">ВКЛ</button>
             </div>
           </div>
           <div class="setup-row">
-            <span class="setup-label">Освещение и частицы</span>
+            <span class="setup-label" data-i18n="settingLight">Свет и тени</span>
             <div class="setup-options" id="settings-light-group">
-              <button type="button" class="mode-pill active" data-light="hard">ЖЁСТКИЕ</button>
-              <button type="button" class="mode-pill" data-light="soft">МЯГКИЕ</button>
+              <button type="button" class="mode-pill active" data-light="hard" data-i18n="optHard">ЖЁСТКИЕ</button>
+              <button type="button" class="mode-pill" data-light="soft" data-i18n="optSoft">МЯГКИЕ</button>
             </div>
           </div>
           <div class="setup-row">
-            <span class="setup-label">Звук</span>
+            <span class="setup-label" data-i18n="settingSound">Звук</span>
             <div class="setup-options" id="settings-sound-group">
-              <button type="button" class="mode-pill" data-sound="off">ВЫКЛ</button>
-              <button type="button" class="mode-pill active" data-sound="on">ВКЛ</button>
+              <button type="button" class="mode-pill" data-sound="off" data-i18n="optOff">ВЫКЛ</button>
+              <button type="button" class="mode-pill active" data-sound="on" data-i18n="optOn">ВКЛ</button>
             </div>
           </div>
 
@@ -104,36 +140,37 @@
               aria-expanded="false"
               aria-controls="dev-settings-content"
             >
-              <span class="dev-settings-arrow">▸</span> Тестовые настройки
+              <span class="dev-settings-arrow">▸</span>
+              <span data-i18n="devSettingsToggle">Тестовые настройки</span>
             </button>
             <div id="dev-settings-content" class="dev-settings-content hidden">
               <div class="setup-row dev-setup-row">
-                <span class="setup-label">Счётчик кадров</span>
+                <span class="setup-label" data-i18n="settingFps">Счётчик кадров</span>
                 <div class="setup-options" id="settings-fps-group">
-                  <button type="button" class="mode-pill active" data-fps="off">ВЫКЛ</button>
-                  <button type="button" class="mode-pill" data-fps="on">ВКЛ</button>
+                  <button type="button" class="mode-pill active" data-fps="off" data-i18n="optOff">ВЫКЛ</button>
+                  <button type="button" class="mode-pill" data-fps="on" data-i18n="optOn">ВКЛ</button>
                 </div>
               </div>
             </div>
           </div>
         </div>
 
-        <div class="settings-actions">
-          <button id="settings-back-btn" class="arcade-btn" type="button">← НАЗАД</button>
+        <div class="overlay-actions settings-actions">
+          <button id="settings-back-btn" class="arcade-btn" type="button" data-i18n="btnBack">← НАЗАД</button>
         </div>
-        <div class="blink-hint">ESC / ENTER — НАЗАД В МЕНЮ</div>
+        <div class="blink-hint" data-i18n="hintSettings">ESC / ENTER — НАЗАД В МЕНЮ</div>
       </div>
 
       <!-- Экран паузы -->
       <div id="pause-screen" class="overlay hidden">
-        <div class="game-badge">ЗАЕЗД ПРИОСТАНОВЛЕН</div>
-        <h2 class="game-title">ПАУЗА</h2>
+        <div class="game-badge" data-i18n="pauseBadge">ЗАЕЗД ПРИОСТАНОВЛЕН</div>
+        <h2 class="game-title" data-i18n="pauseTitle">ПАУЗА</h2>
 
-        <div class="gameover-actions">
-          <button id="resume-btn" class="arcade-btn" type="button">▶ ПРОДОЛЖИТЬ</button>
-          <button id="pause-menu-btn" class="secondary-btn" type="button">⌂ В ГЛАВНОЕ МЕНЮ</button>
+        <div class="overlay-actions gameover-actions">
+          <button id="resume-btn" class="arcade-btn" type="button" data-i18n="btnResume">▶ ПРОДОЛЖИТЬ</button>
+          <button id="pause-menu-btn" class="secondary-btn" type="button" data-i18n="btnMainMenu">⌂ В ГЛАВНОЕ МЕНЮ</button>
         </div>
-        <div class="blink-hint">ESC / P / ENTER — ПРОДОЛЖИТЬ</div>
+        <div class="blink-hint" data-i18n="hintPause">ESC / P / ENTER — ПРОДОЛЖИТЬ</div>
       </div>
 
       <!-- Экран окончания заезда -->
@@ -144,40 +181,40 @@
 
         <div class="stats-grid">
           <div class="stat-card">
-            <div id="stat-label-1" class="stat-label">Итоговый счёт</div>
+            <div id="stat-label-1" class="stat-label" data-i18n="statFinalScore">Итоговый счёт</div>
             <div id="final-score" class="stat-value highlight">0</div>
           </div>
           <div class="stat-card">
-            <div id="stat-label-2" class="stat-label">Лучший рекорд</div>
+            <div id="stat-label-2" class="stat-label" data-i18n="statBestRecord">Лучший рекорд</div>
             <div id="best-score" class="stat-value">0</div>
           </div>
           <div class="stat-card">
-            <div id="stat-label-3" class="stat-label">Дистанция</div>
+            <div id="stat-label-3" class="stat-label" data-i18n="statDistance">Дистанция</div>
             <div id="final-distance" class="stat-value">0.00 км</div>
           </div>
           <div class="stat-card">
-            <div id="stat-label-4" class="stat-label">Чекпоинты / Макс. км/ч</div>
+            <div id="stat-label-4" class="stat-label" data-i18n="statExtra">Чекпоинты / Макс. км/ч</div>
             <div id="final-extra" class="stat-value">0 / 0 км/ч</div>
           </div>
         </div>
 
-        <div class="gameover-actions">
-          <button id="restart-btn" class="arcade-btn" type="button">↻ ИГРАТЬ СНОВА</button>
-          <button id="menu-btn" class="secondary-btn" type="button">⌂ В ГЛАВНОЕ МЕНЮ</button>
+        <div class="overlay-actions gameover-actions">
+          <button id="restart-btn" class="arcade-btn" type="button" data-i18n="btnRestart">↻ ИГРАТЬ СНОВА</button>
+          <button id="menu-btn" class="secondary-btn" type="button" data-i18n="btnMainMenu">⌂ В ГЛАВНОЕ МЕНЮ</button>
         </div>
-        <div class="blink-hint">ENTER / ПРОБЕЛ — РЕСТАРТ • ESC — МЕНЮ</div>
+        <div class="blink-hint" data-i18n="hintGameover">ENTER / ПРОБЕЛ — РЕСТАРТ • ESC — МЕНЮ</div>
       </div>
     </div>
 
     <!-- Внешняя сенсорная панель управления под игровым экраном -->
     <div id="touch-controls">
       <div class="touch-group">
-        <button id="btn-left" class="touch-btn" type="button" aria-label="Влево">◀</button>
-        <button id="btn-right" class="touch-btn" type="button" aria-label="Вправо">▶</button>
+        <button id="btn-left" class="touch-btn" type="button" tabindex="-1" aria-label="Влево" data-i18n-aria="touchLeft">◀</button>
+        <button id="btn-right" class="touch-btn" type="button" tabindex="-1" aria-label="Вправо" data-i18n-aria="touchRight">▶</button>
       </div>
       <div class="touch-group">
-        <button id="btn-brake" class="touch-btn pedal-brake" type="button">СТОП / R</button>
-        <button id="btn-gas" class="touch-btn pedal-gas" type="button">ГАЗ</button>
+        <button id="btn-brake" class="touch-btn pedal-brake" type="button" tabindex="-1" data-i18n="touchBrake">СТОП / R</button>
+        <button id="btn-gas" class="touch-btn pedal-gas" type="button" tabindex="-1" data-i18n="touchGas">ГАЗ</button>
       </div>
     </div>
   </div>

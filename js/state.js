@@ -13,19 +13,139 @@ import {
   MIN_ALLOWED_MAX_KMH,
   MAX_HARDCORE_COLLISIONS
 } from './config.js';
+import { MathUtil } from './utils.js';
+
+// Верхний предел активных частиц (исключает просадки FPS при интенсивном дыме и искрах)
+const MAX_PARTICLES = 260;
 
 export function queryTouchDevice() {
   return window.matchMedia('(pointer: coarse), (hover: none), (max-width: 900px)').matches;
 }
 
+/**
+ * Определяет узкий/портретный экран по реальному соотношению сторон окна
+ * (смартфоны в ландшафтной ориентации сохраняют широкий обзор 16:9)
+ */
 export function isNarrowScreen() {
-  return window.innerWidth < window.innerHeight || window.innerWidth <= 768;
+  const aspect = window.innerWidth / Math.max(1, window.innerHeight);
+  return aspect < 1.35;
 }
 
 export function getActiveAspectRatio() {
   return isNarrowScreen()
     ? GAME_CONFIG.screen.mobileAspectRatio
     : GAME_CONFIG.screen.aspectRatio;
+}
+
+function createPlayerScreenAnchors(logicalWidth) {
+  const cx = logicalWidth * 0.5;
+  const centerY = LOGICAL_HEIGHT - GAME_CONFIG.playerVisuals.carCenterBottomOffsetPx;
+  const tireY = LOGICAL_HEIGHT - GAME_CONFIG.playerVisuals.rearTireBottomOffsetPx;
+  return {
+    rearCenterX: cx,
+    rearCenterY: centerY + 8,
+    rearGroundY: tireY + 2,
+    centerX: cx,
+    centerY: centerY,
+    hoodY: centerY - 16,
+    carW: 120,
+    carH: 66,
+    leftWheelX: cx - 45,
+    leftWheelY: tireY,
+    rightWheelX: cx + 45,
+    rightWheelY: tireY,
+    exhaustLeftX: cx - 30,
+    exhaustRightX: cx + 30,
+    exhaustY: tireY - 6
+  };
+}
+
+/**
+ * Единый источник начальных значений параметров заезда (используется и при старте, и в resetRunState)
+ */
+function createInitialRunState() {
+  const startFov = BASE_FOV - 4;
+  return {
+    isPaused: false,
+    isSlipstreaming: false,
+
+    // Позиция, физика и статистика игрока
+    position: 0,
+    playerX: 0,
+    playerVX: 0,
+    speed: 0,
+    steerVisual: 0,
+    // Мировые координаты машины игрока на момент завершения заезда (камера продолжает путь без неё)
+    stoppedPlayerZ: 0,
+    stoppedPlayerX: 0,
+    stoppedPlayerYaw: 0,
+    playerCarPassedByCamera: false,
+
+    // Динамика 3D-камеры
+    cameraPitch: 0,
+    cameraLagX: 0,
+    cameraRoll: 0,
+    currentFov: startFov,
+    activeCameraDepth: 1 / Math.tan((startFov * 0.5) * Math.PI / 180),
+
+    // Таймеры и статистика
+    timeLeft: GAME_CONFIG.gameplay.initialTimeSec,
+    score: 0,
+    distanceMeters: 0,
+    checkpointsPassed: 0,
+    maxKmhReached: 0,
+
+    // Кольцевой заезд
+    circuitCurrentLap: 1,
+    circuitTotalLaps: GAME_CONFIG.circuit.totalLaps,
+    playerProgressZ: 0,
+    raceElapsedTime: 0,
+    currentLapStartTime: 0,
+    bestLapTime: null,
+    bestLapAvgKmh: null,
+    playerRank: 1,
+    raceCountdownTimer: 0,
+    lastCountdownDigit: 0,
+    rivalsFinishedCount: 0,
+    raceFinishCountdown: 0,
+
+    // Прогресс вперёд и защита одометра от заднего хода
+    netForwardZ: PLAYER_Z + PLAYER_CENTER_OFFSET_Z,
+    maxNetForwardZ: PLAYER_Z + PLAYER_CENTER_OFFSET_Z,
+    passedCheckpointUids: new Set(),
+
+    // Повреждения, перегрев и таймеры эффектов
+    collisionCount: 0,
+    collisionsLeft: MAX_HARDCORE_COLLISIONS,
+    visualDamage: 0,
+    frontDamage: 0,
+    leftDamage: 0,
+    rightDamage: 0,
+    rearDamage: 0,
+    // Зафиксированная сторона повреждения спойлера (0 — целый, -1 — левая, 1 — правая)
+    spoilerDamageSide: 0,
+    engineMisfireTimer: 0,
+    engineMisfireCooldown: 0,
+    engineHeat: 0,
+    isOverheated: false,
+    heatWarnCooldown: 0,
+    spriteHitCooldown: 0,
+    guardrailSoundCooldown: 0,
+    offRoadWarnCooldown: 0,
+    impactShake: 0,
+    timePenaltyFlash: 0,
+
+    // Параллакс фона
+    skyOffset: 0,
+    hillOffset: 0,
+    cityOffset: 0,
+
+    // Эффекты и центральный баннер уведомлений
+    particles: [],
+    bannerText: '',
+    bannerColor: '#ffbe0b',
+    bannerTimer: 0
+  };
 }
 
 const initialAspect = getActiveAspectRatio();
@@ -42,15 +162,14 @@ export const state = {
 
   // Режимы и таймеры цикла
   gameState: STATE.TITLE,
-  isPaused: false,
   gameMode: GAME_CONFIG.gameplay.defaultTrackMode,
   difficulty: GAME_CONFIG.gameplay.defaultDifficulty,
   animClockMs: 0,
   frameCounter: 0,
   fpsValue: 0,
-
-  // Пользовательские настройки (графика и звук)
+  // Пользовательские настройки (язык, графика и звук)
   settings: {
+    language: GAME_CONFIG.settings.language,
     particlesEnabled: GAME_CONFIG.settings.particlesEnabled,
     lightStyle: GAME_CONFIG.settings.lightStyle,
     soundEnabled: GAME_CONFIG.settings.soundEnabled,
@@ -62,108 +181,21 @@ export const state = {
   trackLength: 0,
   cars: [],
   rivals: [],
-  particles: [],
   stars: [],
   skidMarksList: [],
   prevSkidSample: null,
 
-  // Экранные якоря 3D-модели машины игрока
-  playerScreenAnchors: {
-    rearCenterX: initialLogicalWidth * 0.5,
-    rearCenterY: LOGICAL_HEIGHT - 36,
-    rearGroundY: LOGICAL_HEIGHT - 16,
-    centerX: initialLogicalWidth * 0.5,
-    centerY: LOGICAL_HEIGHT - 44,
-    hoodY: LOGICAL_HEIGHT - 60,
-    carW: 120,
-    carH: 66,
-    leftWheelX: initialLogicalWidth * 0.5 - 45,
-    leftWheelY: LOGICAL_HEIGHT - 18,
-    rightWheelX: initialLogicalWidth * 0.5 + 45,
-    rightWheelY: LOGICAL_HEIGHT - 18,
-    exhaustLeftX: initialLogicalWidth * 0.5 - 30,
-    exhaustRightX: initialLogicalWidth * 0.5 + 30,
-    exhaustY: LOGICAL_HEIGHT - 28
-  },
-
-  // Позиция, физика и статистика игрока
-  position: 0,
-  playerX: 0,
-  playerVX: 0,
-  speed: 0,
-  steerVisual: 0,
-  // Мировые координаты машины игрока на момент завершения заезда (камера продолжает путь без неё)
-  stoppedPlayerZ: 0,
-  stoppedPlayerX: 0,
-  stoppedPlayerYaw: 0,
-  playerCarPassedByCamera: false,
-  timeLeft: GAME_CONFIG.gameplay.initialTimeSec,
-  score: 0,
+  // Постоянные рекорды и кэш миникарты
   bestScore: 0,
   bestLapRecordKmh: null,
-  distanceMeters: 0,
-  checkpointsPassed: 0,
-  maxKmhReached: 0,
-
-  // Динамика 3D-камеры
-  cameraPitch: 0,
-  cameraLagX: 0,
-  cameraRoll: 0,
-  currentFov: BASE_FOV - 4,
-  activeCameraDepth: 1 / Math.tan(((BASE_FOV - 4) / 2) * Math.PI / 180),
-
-  // Кольцевой заезд
   circuitSeedId: 1000,
-  circuitTotalLaps: GAME_CONFIG.circuit.totalLaps,
-  circuitCurrentLap: 1,
-  playerProgressZ: 0,
-  raceElapsedTime: 0,
-  currentLapStartTime: 0,
-  bestLapTime: null,
-  bestLapAvgKmh: null,
-  playerRank: 1,
-  raceCountdownTimer: 0,
-  lastCountdownDigit: 0,
-  rivalsFinishedCount: 0,
-  raceFinishCountdown: 0,
-  isSlipstreaming: false,
   minimapCacheKey: '',
 
-  // Прогресс вперед в режимах трафика и для защиты одометра
-  netForwardZ: PLAYER_Z + PLAYER_CENTER_OFFSET_Z,
-  maxNetForwardZ: PLAYER_Z + PLAYER_CENTER_OFFSET_Z,
-  passedCheckpointUids: new Set(),
+  // Экранные якоря 3D-модели машины игрока
+  playerScreenAnchors: createPlayerScreenAnchors(initialLogicalWidth),
 
-  // Повреждения, перегрев и таймеры эффектов
-  collisionCount: 0,
-  collisionsLeft: MAX_HARDCORE_COLLISIONS,
-  visualDamage: 0,
-  frontDamage: 0,
-  leftDamage: 0,
-  rightDamage: 0,
-  rearDamage: 0,
-  // Зафиксированная сторона повреждения спойлера (0 — целый, -1 — левая, 1 — правая)
-  spoilerDamageSide: 0,
-  engineMisfireTimer: 0,
-  engineMisfireCooldown: 0,
-  engineHeat: 0,
-  isOverheated: false,
-  heatWarnCooldown: 0,
-  spriteHitCooldown: 0,
-  guardrailSoundCooldown: 0,
-  offRoadWarnCooldown: 0,
-  impactShake: 0,
-  timePenaltyFlash: 0,
-
-  // Параллакс фона
-  skyOffset: 0,
-  hillOffset: 0,
-  cityOffset: 0,
-
-  // Центральный баннер уведомлений
-  bannerText: '',
-  bannerColor: '#ffbe0b',
-  bannerTimer: 0,
+  // Поля текущего заезда
+  ...createInitialRunState(),
 
   // Состояние ввода
   input: {
@@ -194,8 +226,7 @@ export function getBestScoreStorageKey() {
 }
 
 /**
- * Раздельный ключ рекорда средней скорости круга по уровню сложности.
- * Также автоматически изолирует новые физически точные рекорды от старых завышенных записей.
+ * Раздельный ключ рекорда средней скорости круга по уровню сложности
  */
 export function getBestLapStorageKey() {
   return `${GAME_CONFIG.storage.bestLapSpeedKey}_${state.difficulty}`;
@@ -213,10 +244,9 @@ export function loadSavedRecords() {
   try {
     const lapKey = getBestLapStorageKey();
     const savedLapKmh = parseFloat(localStorage.getItem(lapKey) || '0');
-    if (savedLapKmh > 0 && isFinite(savedLapKmh)) {
+    if (savedLapKmh > 0 && Number.isFinite(savedLapKmh)) {
       state.bestLapRecordKmh = savedLapKmh;
     } else {
-      // Явно сбрасываем значение, чтобы при переключении сложности не залипал чужой рекорд
       state.bestLapRecordKmh = null;
     }
   } catch (e) {
@@ -229,6 +259,9 @@ export function loadSettings() {
     const raw = localStorage.getItem(GAME_CONFIG.storage.settingsKey);
     if (!raw) return;
     const parsed = JSON.parse(raw);
+    if (parsed.language === 'ru' || parsed.language === 'en') {
+      state.settings.language = parsed.language;
+    }
     if (typeof parsed.particlesEnabled === 'boolean') {
       state.settings.particlesEnabled = parsed.particlesEnabled;
     }
@@ -251,12 +284,12 @@ export function saveSettings() {
 }
 
 export function isOncomingBonusActive() {
-  return (
-    state.gameMode === 'oncoming' &&
-    state.playerX < -0.06 &&
-    Math.abs(state.playerX) <= OFF_ROAD_THRESHOLD_X &&
-    state.speed / MAX_SPEED > 0.45
-  );
+  if (state.gameMode !== 'oncoming') return false;
+  if (state.playerX >= -0.06 || Math.abs(state.playerX) > OFF_ROAD_THRESHOLD_X) return false;
+
+  // Порог бонуса масштабируется от текущего лимита скорости, чтобы на повреждённой машине в «Легко» бонус оставался доступен
+  const currentMaxSpeed = MAX_SPEED * (getCurrentMaxAllowedKmh() / BASE_MAX_KMH);
+  return currentMaxSpeed > 0 && state.speed > currentMaxSpeed * 0.45;
 }
 
 export function getSunX() {
@@ -264,7 +297,8 @@ export function getSunX() {
 }
 
 export function getPlayerWorldZ() {
-  return (((state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z) % state.trackLength) + state.trackLength) % state.trackLength;
+  if (state.trackLength <= 0) return 0;
+  return MathUtil.wrap(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z, state.trackLength);
 }
 
 export function getCurrentMaxAllowedKmh() {
@@ -282,30 +316,14 @@ export function showBanner(text, color = '#ffbe0b', duration = 2.0) {
 }
 
 export function findSegment(z) {
-  if (!state.segments.length) return null;
-  const wrappedZ = ((z % state.trackLength) + state.trackLength) % state.trackLength;
-  const idx = Math.floor(wrappedZ / SEGMENT_LENGTH) % state.segments.length;
+  const len = state.segments.length;
+  if (!len || !Number.isFinite(z)) return null;
+  const idx = ((Math.floor(z / SEGMENT_LENGTH) % len) + len) % len;
   return state.segments[idx];
 }
 
 export function resetPlayerScreenAnchors() {
-  const cx = state.logicalWidth * 0.5;
-  const a = state.playerScreenAnchors;
-  a.rearCenterX = cx;
-  a.rearCenterY = LOGICAL_HEIGHT - 36;
-  a.rearGroundY = LOGICAL_HEIGHT - 16;
-  a.centerX = cx;
-  a.centerY = LOGICAL_HEIGHT - 44;
-  a.hoodY = LOGICAL_HEIGHT - 60;
-  a.carW = 120;
-  a.carH = 66;
-  a.leftWheelX = cx - 45;
-  a.leftWheelY = LOGICAL_HEIGHT - 18;
-  a.rightWheelX = cx + 45;
-  a.rightWheelY = LOGICAL_HEIGHT - 18;
-  a.exhaustLeftX = cx - 30;
-  a.exhaustRightX = cx + 30;
-  a.exhaustY = LOGICAL_HEIGHT - 28;
+  Object.assign(state.playerScreenAnchors, createPlayerScreenAnchors(state.logicalWidth));
 }
 
 export function clearSkidMarks() {
@@ -332,15 +350,21 @@ export function spawnParticles(
   expandRate = 0
 ) {
   if (!state.settings.particlesEnabled) return;
-  for (let i = 0; i < count; i++) {
+  const available = MAX_PARTICLES - state.particles.length;
+  if (available <= 0) return;
+
+  const spawnCount = Math.min(count, available);
+  for (let i = 0; i < spawnCount; i++) {
+    const life = lifeRange[0] + Math.random() * (lifeRange[1] - lifeRange[0]);
     state.particles.push({
       x: x + (Math.random() - 0.5) * 18,
       y: y + (Math.random() - 0.5) * 8,
       vx: (Math.random() - 0.5) * vxSpread,
       vy: -vyBase * (0.45 + Math.random() * 0.75),
       size: sizeRange[0] + Math.random() * (sizeRange[1] - sizeRange[0]),
-      life: lifeRange[0] + Math.random() * (lifeRange[1] - lifeRange[0]),
-      maxLife: lifeRange[1],
+      life: life,
+      // maxLife равен фактическому времени жизни частицы, чтобы затухание прозрачности всегда шло от 1.0 до 0.0
+      maxLife: life,
       color: color,
       gravity: gravity,
       expandRate: expandRate
@@ -349,71 +373,7 @@ export function spawnParticles(
 }
 
 export function resetRunState() {
-  state.isPaused = false;
-  state.isSlipstreaming = false;
-
-  state.position = 0;
-  state.playerX = 0;
-  state.playerVX = 0;
-  state.speed = 0;
-  state.steerVisual = 0;
-  state.stoppedPlayerZ = 0;
-  state.stoppedPlayerX = 0;
-  state.stoppedPlayerYaw = 0;
-  state.playerCarPassedByCamera = false;
-
-  state.cameraPitch = 0;
-  state.cameraLagX = 0;
-  state.cameraRoll = 0;
-  state.currentFov = BASE_FOV - 4;
-  state.activeCameraDepth = 1 / Math.tan((state.currentFov / 2) * Math.PI / 180);
-
-  state.timeLeft = GAME_CONFIG.gameplay.initialTimeSec;
-  state.score = 0;
-  state.distanceMeters = 0;
-  state.checkpointsPassed = 0;
-  state.maxKmhReached = 0;
-
-  state.circuitCurrentLap = 1;
-  state.circuitTotalLaps = GAME_CONFIG.circuit.totalLaps;
-  state.playerProgressZ = 0;
-  state.raceElapsedTime = 0;
-  state.currentLapStartTime = 0;
-  state.bestLapTime = null;
-  state.bestLapAvgKmh = null;
-  state.playerRank = 1;
-  state.raceCountdownTimer = 0;
-  state.lastCountdownDigit = 0;
-  state.rivalsFinishedCount = 0;
-  state.raceFinishCountdown = 0;
-
-  state.netForwardZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
-  state.maxNetForwardZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
-  state.passedCheckpointUids = new Set();
-
-  state.collisionCount = 0;
-  state.collisionsLeft = MAX_HARDCORE_COLLISIONS;
-  state.visualDamage = 0;
-  state.frontDamage = 0;
-  state.leftDamage = 0;
-  state.rightDamage = 0;
-  state.rearDamage = 0;
-  state.spoilerDamageSide = 0;
-  state.engineMisfireTimer = 0;
-  state.engineMisfireCooldown = 0;
-  state.engineHeat = 0;
-  state.isOverheated = false;
-  state.heatWarnCooldown = 0;
-  state.spriteHitCooldown = 0;
-  state.guardrailSoundCooldown = 0;
-  state.offRoadWarnCooldown = 0;
-  state.impactShake = 0;
-  state.timePenaltyFlash = 0;
-
-  state.particles = [];
-  state.bannerText = '';
-  state.bannerTimer = 0;
-
+  Object.assign(state, createInitialRunState());
   resetPlayerScreenAnchors();
   clearSkidMarks();
 }

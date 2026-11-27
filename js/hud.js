@@ -17,8 +17,124 @@ import {
   getCurrentMaxAllowedKmh,
   isOncomingBonusActive
 } from './state.js';
+import { getLang, getNumberLocale, t } from './i18n.js';
+
+// Единый стек шрифтов, синхронизированный с css/styles.css
+const UI_FONT = "'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif";
+// Порог подсветки крутого поворота на миникарте (синхронизирован с js/track.js)
+const SHARP_CURVE_THRESHOLD = 5.8;
 
 let minimapCacheCanvas = null;
+
+// Переиспользуемый объект позы на миникарте (0 аллокаций за кадр)
+const _mapPose = { mapX: 0, mapY: 0, mapHeading: 0 };
+
+// Кэш линейного градиента шкалы скорости (пересоздаётся только при смене ширины экрана)
+let cachedSpeedGrad = null;
+let cachedSpeedGradX = -1;
+let cachedSpeedGradW = -1;
+
+// Кэш привязки счётчика FPS к реальным CSS-габаритам кнопки звука на ПК
+let desktopMuteBtnEl = null;
+let cachedFpsLayoutKey = '';
+let cachedDesktopFpsRightPad = 10;
+let cachedDesktopFpsY = 30;
+
+/**
+ * Общий хелпер отрисовки скруглённой HUD-карточки с заливкой и рамкой
+ */
+function drawHudCard(ctx, x, y, w, h, radius, fillColor, strokeColor = null, lineWidth = 1.5) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, radius);
+  if (fillColor) {
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+  }
+  if (strokeColor) {
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = lineWidth;
+    ctx.stroke();
+  }
+}
+
+/**
+ * Общий хелпер шкалы температуры и перегрева двигателя (для режима «Нормально»)
+ */
+function drawEngineHeatMeter(ctx, x, textY, barY, width) {
+  ctx.fillStyle = state.isOverheated ? '#ff2a85' : '#00f0ff';
+  ctx.font = `800 10.5px ${UI_FONT}`;
+  ctx.textAlign = 'left';
+  ctx.fillText(
+    state.isOverheated ? t('hudOverheat') : t('hudEngineTemp', { pct: Math.round(state.engineHeat) }),
+    x,
+    textY
+  );
+
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+  ctx.fillRect(x, barY, width, 7);
+
+  const heatColor = state.isOverheated
+    ? '#ff2a85'
+    : (state.engineHeat > 75 ? '#ffbe0b' : '#00f0ff');
+  ctx.fillStyle = heatColor;
+  ctx.fillRect(x, barY, width * MathUtil.clamp(state.engineHeat / 100, 0, 1), 7);
+}
+
+/**
+ * Векторная иконка Check Engine (ISO 7000 / MIL), как на приборной панели реального автомобиля
+ */
+function drawCheckEngineIcon(ctx, cx, cy, scale, isLit) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(scale, scale);
+
+  const strokeColor = isLit ? '#ffaa00' : 'rgba(255, 130, 0, 0.42)';
+  const fillColor = isLit ? 'rgba(255, 158, 0, 0.26)' : 'rgba(255, 110, 0, 0.08)';
+
+  ctx.strokeStyle = strokeColor;
+  ctx.fillStyle = fillColor;
+  ctx.lineWidth = 1.55;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+
+  // Основной силуэт блока двигателя с поддоном и задним фланцем
+  ctx.beginPath();
+  ctx.moveTo(-7.8, -3.0);
+  ctx.lineTo(-5.8, -4.0);
+  ctx.lineTo(3.6, -4.0);
+  ctx.lineTo(5.2, -2.0);
+  ctx.lineTo(7.4, -2.0);
+  ctx.lineTo(7.4, -0.4);
+  ctx.lineTo(9.2, -0.4);
+  ctx.lineTo(9.2, -2.4);
+  ctx.lineTo(11.0, -2.4);
+  ctx.lineTo(11.0, 5.2);
+  ctx.lineTo(9.2, 5.2);
+  ctx.lineTo(9.2, 3.2);
+  ctx.lineTo(7.4, 3.2);
+  ctx.lineTo(7.4, 5.2);
+  ctx.lineTo(-2.8, 5.2);
+  ctx.lineTo(-5.2, 3.2);
+  ctx.lineTo(-7.8, 3.2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Верхняя крышка (клапанная крышка / горловина) и передняя планка вентилятора слева
+  ctx.beginPath();
+  ctx.moveTo(-4.6, -6.2);
+  ctx.lineTo(2.4, -6.2);
+  ctx.moveTo(-1.1, -6.2);
+  ctx.lineTo(-1.1, -4.0);
+
+  ctx.moveTo(-10.6, -2.6);
+  ctx.lineTo(-10.6, 3.8);
+  ctx.moveTo(-10.6, 0.6);
+  ctx.lineTo(-7.8, 0.6);
+  ctx.stroke();
+
+  ctx.restore();
+}
 
 /**
  * Интерполяция позиции и направления на миникарте по мировой координате Z
@@ -28,20 +144,20 @@ function getInterpolatedMapPose(worldZ) {
   if (!seg || state.trackLength <= 0) return null;
   const segments = state.segments;
   const nextSeg = segments[(seg.index + 1) % segments.length];
-  const wrappedZ = ((worldZ % state.trackLength) + state.trackLength) % state.trackLength;
-  const t = MathUtil.percentRemaining(wrappedZ, SEGMENT_LENGTH);
-  const mapX = MathUtil.lerp(seg.mapX, nextSeg.mapX, t);
-  const mapY = MathUtil.lerp(seg.mapY, nextSeg.mapY, t);
+  const t = MathUtil.percentRemaining(worldZ, SEGMENT_LENGTH);
+
+  _mapPose.mapX = MathUtil.lerp(seg.mapX, nextSeg.mapX, t);
+  _mapPose.mapY = MathUtil.lerp(seg.mapY, nextSeg.mapY, t);
   const dAngle = Math.atan2(
     Math.sin(nextSeg.mapHeading - seg.mapHeading),
     Math.cos(nextSeg.mapHeading - seg.mapHeading)
   );
-  const mapHeading = seg.mapHeading + dAngle * t;
-  return { mapX, mapY, mapHeading };
+  _mapPose.mapHeading = seg.mapHeading + dAngle * t;
+  return _mapPose;
 }
 
 /**
- * Однократная отрисовка статической подложки и контура кольцевой трассы в offscreen-канвас
+ * Однократная отрисовка статической подложки и плавного контура кольцевой трассы в offscreen-канвас
  */
 function buildCircuitMinimapCache(boxSize, isCompact) {
   if (!minimapCacheCanvas) {
@@ -60,15 +176,10 @@ function buildCircuitMinimapCache(boxSize, isCompact) {
 
   mctx.clearRect(0, 0, boxSize, boxSize);
 
-  // Отступ 1px по периметру предотвращает обрезку внешней половины обводки (lineWidth 1.5) границами offscreen-канваса
-  mctx.fillStyle = 'rgba(13, 2, 33, 0.80)';
-  mctx.strokeStyle = 'rgba(57, 255, 20, 0.55)';
-  mctx.lineWidth = 1.5;
-  mctx.beginPath();
-  mctx.roundRect(1, 1, boxSize - 2, boxSize - 2, 11);
-  mctx.fill();
-  mctx.stroke();
+  // Отступ 1px по периметру предотвращает обрезку внешней половины обводки границами offscreen-канваса
+  drawHudCard(mctx, 1, 1, boxSize - 2, boxSize - 2, 11, 'rgba(13, 2, 33, 0.80)', 'rgba(57, 255, 20, 0.55)', 1.5);
 
+  // Неоновая подложка контура трассы
   mctx.strokeStyle = 'rgba(255, 42, 133, 0.45)';
   mctx.lineWidth = isCompact ? 6 : 7;
   mctx.lineJoin = 'round';
@@ -84,20 +195,31 @@ function buildCircuitMinimapCache(boxSize, isCompact) {
   mctx.closePath();
   mctx.stroke();
 
+  // Базовая линия трека одним замкнутым проходом (без узелков на стыках отдельных сегментов)
+  mctx.strokeStyle = '#00f0ff';
   mctx.lineWidth = isCompact ? 2.8 : 3.2;
-  mctx.lineJoin = 'round';
-  mctx.lineCap = 'round';
+  mctx.stroke();
+
+  // Объединённые непрерывные дуги крутых поворотов поверх базовой линии
+  mctx.strokeStyle = '#ffbe0b';
+  mctx.beginPath();
+  let inSharpArc = false;
   for (let i = 0; i < segments.length; i++) {
     const s1 = segments[i];
-    const s2 = segments[(i + 1) % segments.length];
-    const isSharpTurn = Math.abs(s1.curve) > 5.8;
-    mctx.strokeStyle = isSharpTurn ? '#ffbe0b' : '#00f0ff';
-    mctx.beginPath();
-    mctx.moveTo(offsetX + s1.mapX * mapSize, offsetY + s1.mapY * mapSize);
-    mctx.lineTo(offsetX + s2.mapX * mapSize, offsetY + s2.mapY * mapSize);
-    mctx.stroke();
+    if (Math.abs(s1.curve) > SHARP_CURVE_THRESHOLD) {
+      const s2 = segments[(i + 1) % segments.length];
+      if (!inSharpArc) {
+        mctx.moveTo(offsetX + s1.mapX * mapSize, offsetY + s1.mapY * mapSize);
+        inSharpArc = true;
+      }
+      mctx.lineTo(offsetX + s2.mapX * mapSize, offsetY + s2.mapY * mapSize);
+    } else {
+      inSharpArc = false;
+    }
   }
+  mctx.stroke();
 
+  // Маркер линии старта / финиша
   const startSeg = segments[0];
   const sx = offsetX + startSeg.mapX * mapSize;
   const sy = offsetY + startSeg.mapY * mapSize;
@@ -110,14 +232,14 @@ function buildCircuitMinimapCache(boxSize, isCompact) {
   mctx.stroke();
 
   mctx.fillStyle = '#a992d1';
-  mctx.font = '800 9px sans-serif';
+  mctx.font = `800 9px ${UI_FONT}`;
   mctx.textAlign = 'center';
   mctx.textBaseline = 'alphabetic';
-  mctx.fillText(`ТРЕК #${state.circuitSeedId}`, boxSize * 0.5, boxSize - 6);
+  mctx.fillText(t('hudTrackNum', { seed: state.circuitSeedId }), boxSize * 0.5, boxSize - 6);
 }
 
 /**
- * Отрисовка миникарты и маркеров гонщиков в кольцевом режиме
+ * Отрисовка миникарты и маркеров гонщиков в кольцевом режиме (левый нижний угол)
  */
 function renderCircuitMinimap(ctx) {
   if (state.gameMode !== 'circuit' || !state.segments.length) return;
@@ -125,15 +247,14 @@ function renderCircuitMinimap(ctx) {
   const LOGICAL_WIDTH = state.logicalWidth;
   const isCompact = state.cachedIsTouch || LOGICAL_WIDTH <= 780;
   const boxSize = isCompact ? 126 : 152;
-  const boxX = LOGICAL_WIDTH - boxSize - 14;
-  // Увеличенный вертикальный отступ на ПК (54px) исключает наложение кнопки звука поверх миникарты при сжатии окна
-  const boxY = isCompact ? 14 : 54;
+  const boxX = 14;
+  const boxY = LOGICAL_HEIGHT - boxSize - 14;
   const pad = isCompact ? 16 : 20;
   const mapSize = boxSize - pad * 2;
   const offsetX = boxX + pad;
   const offsetY = boxY + pad - 3;
 
-  const cacheKey = `${state.circuitSeedId}_${boxSize}_${isCompact ? 1 : 0}`;
+  const cacheKey = `${state.circuitSeedId}_${boxSize}_${getLang()}`;
   if (!minimapCacheCanvas || state.minimapCacheKey !== cacheKey) {
     buildCircuitMinimapCache(boxSize, isCompact);
     state.minimapCacheKey = cacheKey;
@@ -184,26 +305,50 @@ function renderCircuitMinimap(ctx) {
 }
 
 /**
- * Компактный счётчик кадров (FPS) в левом нижнем углу экрана
+ * Компактный счётчик кадров (FPS) в правом верхнем углу экрана (вплотную под кнопкой звука на ПК)
  */
 function renderFpsCounter(ctx) {
   if (!state.settings.showFps) return;
 
   const fps = Math.max(0, state.fpsValue || 0);
   const fpsColor = fps >= 50 ? '#39ff14' : (fps >= 30 ? '#ffbe0b' : '#ff2a85');
-  const boxX = 14;
-  const boxY = LOGICAL_HEIGHT - 36;
   const boxW = 78;
   const boxH = 22;
 
+  let boxX = state.logicalWidth - boxW - 14;
+  let boxY = 14;
+
+  if (!state.cachedIsTouch) {
+    if (!desktopMuteBtnEl && typeof document !== 'undefined') {
+      desktopMuteBtnEl = document.getElementById('desktop-mute-btn');
+    }
+    const btnW = desktopMuteBtnEl ? desktopMuteBtnEl.offsetWidth : 0;
+    const btnH = desktopMuteBtnEl ? desktopMuteBtnEl.offsetHeight : 0;
+    const layoutKey = `${window.innerWidth}_${window.innerHeight}_${state.logicalWidth}_${btnW}_${btnH}`;
+    if (layoutKey !== cachedFpsLayoutKey) {
+      cachedFpsLayoutKey = layoutKey;
+      const canvasEl = ctx.canvas;
+      const cssW = (canvasEl && canvasEl.clientWidth) || state.logicalWidth;
+      const cssH = (canvasEl && canvasEl.clientHeight) || LOGICAL_HEIGHT;
+      const scaleX = state.logicalWidth / Math.max(1, cssW);
+      const scaleY = LOGICAL_HEIGHT / Math.max(1, cssH);
+
+      if (desktopMuteBtnEl && btnH > 0) {
+        const btnBottomCss = desktopMuteBtnEl.offsetTop + btnH;
+        const btnRightCss = Math.max(0, cssW - (desktopMuteBtnEl.offsetLeft + desktopMuteBtnEl.offsetWidth));
+        cachedDesktopFpsY = Math.round((btnBottomCss + 6) * scaleY);
+        cachedDesktopFpsRightPad = Math.round(btnRightCss * scaleX);
+      } else {
+        cachedDesktopFpsY = Math.round(44 * scaleY);
+        cachedDesktopFpsRightPad = Math.round(10 * scaleX);
+      }
+    }
+    boxX = state.logicalWidth - boxW - cachedDesktopFpsRightPad;
+    boxY = cachedDesktopFpsY;
+  }
+
   ctx.save();
-  ctx.fillStyle = 'rgba(13, 2, 33, 0.72)';
-  ctx.strokeStyle = 'rgba(184, 163, 224, 0.35)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.roundRect(boxX, boxY, boxW, boxH, 6);
-  ctx.fill();
-  ctx.stroke();
+  drawHudCard(ctx, boxX, boxY, boxW, boxH, 6, 'rgba(13, 2, 33, 0.72)', 'rgba(184, 163, 224, 0.35)', 1);
 
   ctx.font = '800 11px monospace';
   ctx.textAlign = 'left';
@@ -227,299 +372,274 @@ export function renderHUD(ctx) {
   const LOGICAL_WIDTH = state.logicalWidth;
   ctx.save();
   ctx.textBaseline = 'alphabetic';
+  // Табличная ширина цифр устраняет горизонтальное дрожание таймеров и спидометра
+  if ('fontVariantNumeric' in ctx) {
+    ctx.fontVariantNumeric = 'tabular-nums';
+  }
   const isCompact = state.cachedIsTouch || LOGICAL_WIDTH <= 780;
 
   if (state.gameMode === 'circuit') {
     const leftBoxW = isCompact ? 184 : 215;
-    ctx.fillStyle = 'rgba(13, 2, 33, 0.78)';
-    ctx.strokeStyle = 'rgba(57, 255, 20, 0.55)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.roundRect(14, 14, leftBoxW, 76, 10);
-    ctx.fill();
-    ctx.stroke();
+    drawHudCard(ctx, 14, 14, leftBoxW, 76, 10, 'rgba(13, 2, 33, 0.78)', 'rgba(57, 255, 20, 0.55)', 1.5);
 
     ctx.fillStyle = '#39ff14';
-    ctx.font = '800 11px sans-serif';
+    ctx.font = `800 11px ${UI_FONT}`;
     ctx.textAlign = 'left';
-    ctx.fillText('ПОЗИЦИЯ', 24, 33);
+    ctx.fillText(t('hudPosition'), 24, 33);
 
     const totalRacers = state.rivals.length + 1;
     ctx.fillStyle = state.playerRank === 1 ? '#ffbe0b' : '#ffffff';
-    ctx.font = '900 23px sans-serif';
+    ctx.font = `900 23px ${UI_FONT}`;
     ctx.fillText(`${state.playerRank} / ${totalRacers}`, 24, 58);
 
     const displayLap = Math.min(state.circuitTotalLaps, Math.max(1, state.circuitCurrentLap));
     ctx.fillStyle = '#00f0ff';
-    ctx.font = '800 12px sans-serif';
+    ctx.font = `800 12px ${UI_FONT}`;
     ctx.textAlign = 'right';
-    ctx.fillText(`КРУГ ${displayLap}/${state.circuitTotalLaps}`, 14 + leftBoxW - 10, 56);
+    ctx.fillText(t('hudLap', { cur: displayLap, total: state.circuitTotalLaps }), 14 + leftBoxW - 10, 56);
 
     ctx.fillStyle = '#ffd6e7';
-    ctx.font = '700 11.5px sans-serif';
+    ctx.font = `700 11.5px ${UI_FONT}`;
     ctx.textAlign = 'left';
-    ctx.fillText(`ДИСТАНЦИЯ: ${(state.distanceMeters / 1000).toFixed(2)} км`, 24, 78);
+    ctx.fillText(t('hudDistance', { km: (state.distanceMeters / 1000).toFixed(2) }), 24, 78);
 
     let nextLeftPanelY = 98;
 
     if (state.isSlipstreaming) {
-      ctx.fillStyle = 'rgba(57, 255, 20, 0.90)';
-      ctx.beginPath();
-      ctx.roundRect(14, nextLeftPanelY, leftBoxW, 24, 8);
-      ctx.fill();
+      drawHudCard(ctx, 14, nextLeftPanelY, leftBoxW, 24, 8, 'rgba(57, 255, 20, 0.90)');
       ctx.fillStyle = '#0b1c08';
-      ctx.font = '900 11px sans-serif';
+      ctx.font = `900 11px ${UI_FONT}`;
       ctx.textAlign = 'center';
-      ctx.fillText('⚡ СЛИПСТРИМ +5% ⚡', 14 + leftBoxW * 0.5, nextLeftPanelY + 16);
+      ctx.fillText(t('hudSlipstream'), 14 + leftBoxW * 0.5, nextLeftPanelY + 16);
       ctx.textAlign = 'left';
       nextLeftPanelY += 30;
     }
 
     if (state.difficulty === 'hardcore') {
-      ctx.fillStyle = 'rgba(13, 2, 33, 0.78)';
-      ctx.strokeStyle = 'rgba(255, 190, 11, 0.55)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.roundRect(14, nextLeftPanelY, leftBoxW, 38, 10);
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = state.isOverheated ? '#ff2a85' : '#00f0ff';
-      ctx.font = '800 10.5px sans-serif';
-      ctx.fillText(
-        state.isOverheated ? 'ПЕРЕГРЕВ ДВИГАТЕЛЯ!' : `ТЕМП. МОТОРА: ${Math.round(state.engineHeat)}%`,
-        24,
-        nextLeftPanelY + 16
-      );
-
-      const barInnerW = leftBoxW - 22;
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
-      ctx.fillRect(24, nextLeftPanelY + 23, barInnerW, 7);
-
-      const heatColor = state.isOverheated
-        ? '#ff2a85'
-        : (state.engineHeat > 75 ? '#ffbe0b' : '#00f0ff');
-      ctx.fillStyle = heatColor;
-      ctx.fillRect(24, nextLeftPanelY + 23, barInnerW * (state.engineHeat / 100), 7);
+      drawHudCard(ctx, 14, nextLeftPanelY, leftBoxW, 38, 10, 'rgba(13, 2, 33, 0.78)', 'rgba(255, 190, 11, 0.55)', 1.5);
+      drawEngineHeatMeter(ctx, 24, nextLeftPanelY + 16, nextLeftPanelY + 23, leftBoxW - 20);
     }
 
     const centerW = isCompact ? 164 : 184;
-    ctx.fillStyle = 'rgba(13, 2, 33, 0.80)';
-    ctx.strokeStyle = state.raceFinishCountdown > 0 ? '#ffbe0b' : '#39ff14';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.roundRect(LOGICAL_WIDTH * 0.5 - centerW * 0.5, 14, centerW, 72, 12);
-    ctx.fill();
-    ctx.stroke();
+    drawHudCard(
+      ctx,
+      LOGICAL_WIDTH * 0.5 - centerW * 0.5,
+      14,
+      centerW,
+      72,
+      12,
+      'rgba(13, 2, 33, 0.80)',
+      state.raceFinishCountdown > 0 ? '#ffbe0b' : '#39ff14',
+      2
+    );
 
     ctx.fillStyle = state.raceFinishCountdown > 0 ? '#ffbe0b' : '#39ff14';
-    ctx.font = '800 10.5px sans-serif';
+    ctx.font = `800 10.5px ${UI_FONT}`;
     ctx.textAlign = 'center';
     ctx.fillText(
-      state.raceFinishCountdown > 0 ? `ДО ФИНИША: ${state.raceFinishCountdown.toFixed(1)}с` : 'ВРЕМЯ ЗАЕЗДА',
+      state.raceFinishCountdown > 0
+        ? t('hudFinishIn', { sec: state.raceFinishCountdown.toFixed(1) })
+        : t('hudRaceTime'),
       LOGICAL_WIDTH * 0.5,
       30
     );
 
     ctx.fillStyle = '#ffffff';
-    ctx.font = isCompact ? '900 22px sans-serif' : '900 24px sans-serif';
+    ctx.font = isCompact ? `900 22px ${UI_FONT}` : `900 24px ${UI_FONT}`;
     ctx.fillText(formatRaceTime(state.raceElapsedTime), LOGICAL_WIDTH * 0.5, 56);
 
     ctx.fillStyle = '#ffbe0b';
-    ctx.font = '700 10px sans-serif';
+    ctx.font = `700 10px ${UI_FONT}`;
     const bestLapStr = state.bestLapTime !== null ? formatRaceTime(state.bestLapTime) : '--:--.--';
-    ctx.fillText(`ЛУЧШИЙ: ${bestLapStr}`, LOGICAL_WIDTH * 0.5, 76);
+    ctx.fillText(t('hudBestLap', { time: bestLapStr }), LOGICAL_WIDTH * 0.5, 76);
 
     if (state.raceCountdownTimer > 0) {
       const countNum = Math.max(1, Math.ceil((state.raceCountdownTimer / GAME_CONFIG.circuit.countdownSec) * 3));
-      ctx.fillStyle = 'rgba(13, 2, 33, 0.84)';
-      ctx.strokeStyle = '#ffbe0b';
-      ctx.lineWidth = 2.5;
-      ctx.beginPath();
-      ctx.roundRect(LOGICAL_WIDTH * 0.5 - 70, 108, 140, 62, 14);
-      ctx.fill();
-      ctx.stroke();
+      drawHudCard(ctx, LOGICAL_WIDTH * 0.5 - 70, 108, 140, 62, 14, 'rgba(13, 2, 33, 0.84)', '#ffbe0b', 2.5);
 
       ctx.fillStyle = countNum === 1 ? '#39ff14' : '#ffbe0b';
-      ctx.font = '900 38px sans-serif';
+      ctx.font = `900 38px ${UI_FONT}`;
       ctx.textAlign = 'center';
       ctx.fillText(`${countNum}`, LOGICAL_WIDTH * 0.5, 151);
     }
 
     renderCircuitMinimap(ctx);
   } else {
-    ctx.fillStyle = 'rgba(13, 2, 33, 0.72)';
-    ctx.strokeStyle = 'rgba(0, 240, 255, 0.45)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.roundRect(14, 14, 215, 76, 10);
-    ctx.fill();
-    ctx.stroke();
+    const leftPanelW = 215;
+    const innerPad = 12;
+    const innerW = leftPanelW - innerPad * 2;
+
+    drawHudCard(ctx, 14, 14, leftPanelW, 76, 10, 'rgba(13, 2, 33, 0.72)', 'rgba(0, 240, 255, 0.45)', 1.5);
 
     ctx.fillStyle = '#00f0ff';
-    ctx.font = '800 11px sans-serif';
+    ctx.font = `800 11px ${UI_FONT}`;
     ctx.textAlign = 'left';
-    ctx.fillText('СЧЁТ', 26, 33);
+    ctx.fillText(t('hudScore'), 14 + innerPad, 33);
 
     ctx.fillStyle = '#ffffff';
-    ctx.font = '900 24px sans-serif';
-    ctx.fillText(Math.floor(state.score).toLocaleString('ru-RU'), 26, 58);
+    ctx.font = `900 24px ${UI_FONT}`;
+    ctx.fillText(Math.floor(state.score).toLocaleString(getNumberLocale()), 14 + innerPad, 58);
 
     ctx.fillStyle = '#ffd6e7';
-    ctx.font = '700 12px sans-serif';
-    ctx.fillText(`ДИСТАНЦИЯ: ${(state.distanceMeters / 1000).toFixed(2)} км`, 26, 78);
+    ctx.font = `700 12px ${UI_FONT}`;
+    ctx.fillText(t('hudDistance', { km: (state.distanceMeters / 1000).toFixed(2) }), 14 + innerPad, 78);
 
     const showOncomingBadge = isOncomingBonusActive();
     if (showOncomingBadge) {
-      ctx.fillStyle = 'rgba(255, 190, 11, 0.92)';
-      ctx.beginPath();
-      ctx.roundRect(14, 98, 162, 26, 8);
-      ctx.fill();
+      drawHudCard(ctx, 14, 98, 162, 26, 8, 'rgba(255, 190, 11, 0.92)');
       ctx.fillStyle = '#140326';
-      ctx.font = '900 12px sans-serif';
+      ctx.font = `900 12px ${UI_FONT}`;
       ctx.textAlign = 'center';
-      ctx.fillText('★ 2X ВСТРЕЧКА ★', 95, 115);
+      ctx.fillText(t('hudOncoming2x'), 95, 115);
       ctx.textAlign = 'left';
     }
 
     if (state.difficulty === 'hardcore') {
       const panelY = showOncomingBadge ? 132 : 98;
-      ctx.fillStyle = 'rgba(13, 2, 33, 0.78)';
-      ctx.strokeStyle = 'rgba(255, 190, 11, 0.55)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.roundRect(14, panelY, 215, 66, 10);
-      ctx.fill();
-      ctx.stroke();
+      drawHudCard(ctx, 14, panelY, leftPanelW, 66, 10, 'rgba(13, 2, 33, 0.78)', 'rgba(255, 190, 11, 0.55)', 1.5);
 
       ctx.fillStyle = '#ffbe0b';
-      ctx.font = '800 11px sans-serif';
-      ctx.fillText(`ПРОЧНОСТЬ: ${state.collisionsLeft}/${MAX_HARDCORE_COLLISIONS}`, 26, panelY + 18);
-
-      for (let i = 0; i < MAX_HARDCORE_COLLISIONS; i++) {
-        ctx.fillStyle = i < state.collisionsLeft ? '#39ff14' : 'rgba(255, 255, 255, 0.14)';
-        ctx.fillRect(26 + i * 38, panelY + 24, 33, 8);
-      }
-
-      ctx.fillStyle = state.isOverheated ? '#ff2a85' : '#00f0ff';
+      ctx.font = `800 11px ${UI_FONT}`;
       ctx.fillText(
-        state.isOverheated ? 'ПЕРЕГРЕВ ДВИГАТЕЛЯ!' : `ТЕМП. МОТОРА: ${Math.round(state.engineHeat)}%`,
-        26,
-        panelY + 47
+        t('hudDurability', { cur: state.collisionsLeft, max: MAX_HARDCORE_COLLISIONS }),
+        14 + innerPad,
+        panelY + 18
       );
 
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
-      ctx.fillRect(26, panelY + 52, 188, 7);
+      // Динамический расчёт ячеек прочности по ширине панели (не вылезает при изменении MAX_HARDCORE_COLLISIONS)
+      const cellGap = 5;
+      const cellW = (innerW - cellGap * Math.max(0, MAX_HARDCORE_COLLISIONS - 1)) / Math.max(1, MAX_HARDCORE_COLLISIONS);
+      for (let i = 0; i < MAX_HARDCORE_COLLISIONS; i++) {
+        ctx.fillStyle = i < state.collisionsLeft ? '#39ff14' : 'rgba(255, 255, 255, 0.14)';
+        ctx.fillRect(14 + innerPad + i * (cellW + cellGap), panelY + 24, cellW, 8);
+      }
 
-      const heatColor = state.isOverheated
-        ? '#ff2a85'
-        : (state.engineHeat > 75 ? '#ffbe0b' : '#00f0ff');
-      ctx.fillStyle = heatColor;
-      ctx.fillRect(26, panelY + 52, 188 * (state.engineHeat / 100), 7);
+      drawEngineHeatMeter(ctx, 14 + innerPad, panelY + 47, panelY + 52, innerW);
     }
 
     const isLowTime = state.timeLeft <= 10.0;
     const hasPenaltyFlash = state.timePenaltyFlash > 0;
-    ctx.fillStyle = hasPenaltyFlash
-      ? 'rgba(170, 12, 58, 0.92)'
-      : (isLowTime ? 'rgba(120, 8, 45, 0.85)' : 'rgba(13, 2, 33, 0.78)');
-    ctx.strokeStyle = hasPenaltyFlash
-      ? '#ff4d8d'
-      : (isLowTime ? '#ff2a85' : '#ffbe0b');
-    ctx.lineWidth = hasPenaltyFlash ? 2.5 : 2;
-    ctx.beginPath();
-    ctx.roundRect(LOGICAL_WIDTH * 0.5 - 78, 14, 156, 68, 12);
-    ctx.fill();
-    ctx.stroke();
+    drawHudCard(
+      ctx,
+      LOGICAL_WIDTH * 0.5 - 78,
+      14,
+      156,
+      68,
+      12,
+      hasPenaltyFlash
+        ? 'rgba(170, 12, 58, 0.92)'
+        : (isLowTime ? 'rgba(120, 8, 45, 0.85)' : 'rgba(13, 2, 33, 0.78)'),
+      hasPenaltyFlash ? '#ff4d8d' : (isLowTime ? '#ff2a85' : '#ffbe0b'),
+      hasPenaltyFlash ? 2.5 : 2
+    );
 
     ctx.fillStyle = hasPenaltyFlash ? '#ffffff' : (isLowTime ? '#ffd6e7' : '#ffbe0b');
-    ctx.font = '800 11px sans-serif';
+    ctx.font = `800 11px ${UI_FONT}`;
     ctx.textAlign = 'center';
-    ctx.fillText('ВРЕМЯ', LOGICAL_WIDTH * 0.5, 32);
+    ctx.fillText(t('hudTime'), LOGICAL_WIDTH * 0.5, 32);
 
     ctx.fillStyle = (hasPenaltyFlash || (isLowTime && Math.floor(state.animClockMs / 200) % 2 === 0)) ? '#ffbe0b' : '#ffffff';
-    ctx.font = '900 32px sans-serif';
+    ctx.font = `900 32px ${UI_FONT}`;
     ctx.fillText(state.timeLeft.toFixed(1), LOGICAL_WIDTH * 0.5, 67);
 
     if (hasPenaltyFlash) {
       ctx.save();
       ctx.globalAlpha = Math.min(1, state.timePenaltyFlash * 1.4);
-      ctx.fillStyle = '#ff2a85';
-      ctx.beginPath();
-      ctx.roundRect(LOGICAL_WIDTH * 0.5 - 46, 86, 92, 22, 6);
-      ctx.fill();
+      drawHudCard(ctx, LOGICAL_WIDTH * 0.5 - 46, 86, 92, 22, 6, '#ff2a85');
       ctx.fillStyle = '#ffffff';
-      ctx.font = '900 13px sans-serif';
-      ctx.fillText(`-${Math.round(COLLISION_TIME_PENALTY)} СЕК`, LOGICAL_WIDTH * 0.5, 101);
+      ctx.font = `900 13px ${UI_FONT}`;
+      ctx.fillText(t('hudPenaltySec', { sec: Math.round(COLLISION_TIME_PENALTY) }), LOGICAL_WIDTH * 0.5, 101);
       ctx.restore();
     }
   }
 
-  // Правый нижний угол: цифровой спидометр
+  // Правый нижний угол: расширенный цифровой спидометр (исключает наложение 3-значной скорости на плашки)
   const input = state.input;
-  const isReversing = state.speed < -2 || (input.down && !input.up && state.speed <= 2);
+  const isReversing =
+    state.raceCountdownTimer <= 0 &&
+    (state.speed < -2 || (input.down && !input.up && state.speed <= 2));
   const kmh = Math.round((Math.abs(state.speed) / MAX_SPEED) * BASE_MAX_KMH);
   const damageMaxKmh = getCurrentMaxAllowedKmh();
   const barFillRatio = isReversing
     ? MathUtil.clamp(Math.abs(state.speed) / MAX_REVERSE_SPEED, 0, 1)
     : MathUtil.clamp(state.speed / MAX_SPEED, 0, 1);
 
-  ctx.fillStyle = 'rgba(13, 2, 33, 0.82)';
-  ctx.strokeStyle = isReversing ? 'rgba(255, 255, 255, 0.75)' : 'rgba(255, 42, 133, 0.55)';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.roundRect(LOGICAL_WIDTH - 196, LOGICAL_HEIGHT - 94, 182, 80, 12);
-  ctx.fill();
-  ctx.stroke();
+  const speedoW = 194;
+  const speedoH = 80;
+  const speedoX = LOGICAL_WIDTH - speedoW - 14;
+  const speedoY = LOGICAL_HEIGHT - speedoH - 14;
+
+  drawHudCard(
+    ctx,
+    speedoX,
+    speedoY,
+    speedoW,
+    speedoH,
+    12,
+    'rgba(13, 2, 33, 0.82)',
+    isReversing ? 'rgba(255, 255, 255, 0.75)' : 'rgba(255, 42, 133, 0.55)',
+    1.5
+  );
+
+  const badgeX = speedoX + 12;
+  const badgeW = 58;
 
   if (isReversing) {
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.roundRect(LOGICAL_WIDTH - 182, LOGICAL_HEIGHT - 76, 28, 30, 6);
-    ctx.fill();
-
+    drawHudCard(ctx, badgeX, speedoY + 16, 28, 30, 6, '#ffffff');
     ctx.fillStyle = '#0d0221';
-    ctx.font = '900 19px sans-serif';
+    ctx.font = `900 19px ${UI_FONT}`;
     ctx.textAlign = 'center';
-    ctx.fillText('R', LOGICAL_WIDTH - 168, LOGICAL_HEIGHT - 54);
+    ctx.fillText('R', badgeX + 14, speedoY + 38);
   } else if (damageMaxKmh < BASE_MAX_KMH) {
-    ctx.fillStyle = 'rgba(255, 42, 95, 0.25)';
-    ctx.strokeStyle = 'rgba(255, 77, 120, 0.75)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(LOGICAL_WIDTH - 184, LOGICAL_HEIGHT - 83, 62, 18, 5);
-    ctx.fill();
-    ctx.stroke();
+    drawHudCard(
+      ctx,
+      badgeX,
+      speedoY + 10,
+      badgeW,
+      17,
+      5,
+      'rgba(255, 42, 95, 0.25)',
+      'rgba(255, 77, 120, 0.75)',
+      1
+    );
 
     ctx.fillStyle = '#ff6b93';
-    ctx.font = '800 10px sans-serif';
+    ctx.font = `800 10px ${UI_FONT}`;
     ctx.textAlign = 'center';
-    ctx.fillText(`MAX ${damageMaxKmh}`, LOGICAL_WIDTH - 153, LOGICAL_HEIGHT - 71);
+    ctx.fillText(`MAX ${damageMaxKmh}`, badgeX + badgeW * 0.5, speedoY + 22);
 
+    // Приборный значок Check Engine вместо текстовой плашки «МОТОР»
     if (state.gameMode !== 'circuit' && state.visualDamage >= 3) {
-      const blinkEngine = Math.floor(state.animClockMs / 240) % 2 === 0;
-      ctx.fillStyle = blinkEngine ? 'rgba(255, 123, 0, 0.90)' : 'rgba(255, 42, 95, 0.45)';
-      ctx.beginPath();
-      ctx.roundRect(LOGICAL_WIDTH - 184, LOGICAL_HEIGHT - 61, 62, 16, 4);
-      ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.font = '900 9px sans-serif';
-      ctx.fillText('⚠ МОТОР', LOGICAL_WIDTH - 153, LOGICAL_HEIGHT - 50);
+      const blinkEngine = Math.floor(state.animClockMs / 260) % 2 === 0;
+      const lampY = speedoY + 30;
+      const lampH = 22;
+      drawHudCard(
+        ctx,
+        badgeX,
+        lampY,
+        badgeW,
+        lampH,
+        5,
+        blinkEngine ? 'rgba(255, 145, 0, 0.20)' : 'rgba(255, 110, 0, 0.06)',
+        blinkEngine ? 'rgba(255, 174, 0, 0.85)' : 'rgba(255, 130, 0, 0.30)',
+        1
+      );
+      drawCheckEngineIcon(ctx, badgeX + badgeW * 0.5, lampY + lampH * 0.5 + 0.5, 1.12, blinkEngine);
     }
   }
 
   ctx.fillStyle = '#ffffff';
-  ctx.font = '900 34px sans-serif';
+  ctx.font = `900 34px ${UI_FONT}`;
   ctx.textAlign = 'right';
-  ctx.fillText(`${kmh}`, LOGICAL_WIDTH - 68, LOGICAL_HEIGHT - 46);
+  ctx.fillText(`${kmh}`, LOGICAL_WIDTH - 64, LOGICAL_HEIGHT - 46);
 
   ctx.fillStyle = isReversing ? '#ffffff' : '#00f0ff';
-  ctx.font = '800 13px sans-serif';
-  ctx.fillText('КМ/Ч', LOGICAL_WIDTH - 24, LOGICAL_HEIGHT - 46);
+  ctx.font = `800 13px ${UI_FONT}`;
+  ctx.fillText(t('hudKmh'), LOGICAL_WIDTH - 22, LOGICAL_HEIGHT - 46);
 
-  const barX = LOGICAL_WIDTH - 182;
+  const barX = speedoX + 13;
   const barY = LOGICAL_HEIGHT - 32;
-  const barW = 154;
+  const barW = speedoW - 26;
   const barH = 11;
 
   ctx.fillStyle = 'rgba(255, 255, 255, 0.14)';
@@ -553,11 +673,16 @@ export function renderHUD(ctx) {
       ctx.restore();
     }
 
-    const speedGrad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
-    speedGrad.addColorStop(0, '#00f0ff');
-    speedGrad.addColorStop(0.65, '#ffbe0b');
-    speedGrad.addColorStop(1, '#ff2a85');
-    ctx.fillStyle = speedGrad;
+    if (!cachedSpeedGrad || cachedSpeedGradX !== barX || cachedSpeedGradW !== barW) {
+      const grad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
+      grad.addColorStop(0, '#00f0ff');
+      grad.addColorStop(0.65, '#ffbe0b');
+      grad.addColorStop(1, '#ff2a85');
+      cachedSpeedGrad = grad;
+      cachedSpeedGradX = barX;
+      cachedSpeedGradW = barW;
+    }
+    ctx.fillStyle = cachedSpeedGrad;
     ctx.fillRect(barX, barY, barW * barFillRatio, barH);
 
     if (allowedRatio < 1) {
@@ -574,16 +699,13 @@ export function renderHUD(ctx) {
     const maxBannerW = LOGICAL_WIDTH - 48;
     const bannerY = 224;
     ctx.globalAlpha = alpha;
-    ctx.font = isCompact ? '900 18px sans-serif' : '900 22px sans-serif';
+    ctx.font = isCompact ? `900 18px ${UI_FONT}` : `900 22px ${UI_FONT}`;
     ctx.textAlign = 'center';
 
     const measuredW = Math.min(maxBannerW, ctx.measureText(state.bannerText).width);
     const pillW = measuredW + 28;
     const pillH = isCompact ? 30 : 34;
-    ctx.fillStyle = 'rgba(13, 2, 33, 0.78)';
-    ctx.beginPath();
-    ctx.roundRect(LOGICAL_WIDTH * 0.5 - pillW * 0.5, bannerY - pillH * 0.68, pillW, pillH, 9);
-    ctx.fill();
+    drawHudCard(ctx, LOGICAL_WIDTH * 0.5 - pillW * 0.5, bannerY - pillH * 0.68, pillW, pillH, 9, 'rgba(13, 2, 33, 0.78)');
 
     ctx.fillStyle = '#140326';
     ctx.fillText(state.bannerText, LOGICAL_WIDTH * 0.5 + 2, bannerY + 2, maxBannerW);

@@ -3,24 +3,53 @@
  */
 export function initCanvasPolyfills() {
   if (typeof CanvasRenderingContext2D !== 'undefined' && !CanvasRenderingContext2D.prototype.roundRect) {
-    CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, r) {
+    CanvasRenderingContext2D.prototype.roundRect = function (x, y, w, h, radii = 0) {
       const safeW = Math.max(0, w);
       const safeH = Math.max(0, h);
-      const rawR = Array.isArray(r) ? r[0] : (r || 0);
-      const radius = Math.max(0, Math.min(rawR, safeW / 2, safeH / 2));
-      this.beginPath();
-      this.moveTo(x + radius, y);
-      this.arcTo(x + safeW, y, x + safeW, y + safeH, radius);
-      this.arcTo(x + safeW, y + safeH, x, y + safeH, radius);
-      this.arcTo(x, y + safeH, x, y, radius);
-      this.arcTo(x, y, x + safeW, y, radius);
+      const maxR = Math.min(safeW * 0.5, safeH * 0.5);
+      const clampR = (val) => Math.max(0, Math.min(Number(val) || 0, maxR));
+
+      let tl = 0;
+      let tr = 0;
+      let br = 0;
+      let bl = 0;
+
+      if (Array.isArray(radii)) {
+        const len = radii.length;
+        if (len === 1) {
+          tl = tr = br = bl = clampR(radii[0]);
+        } else if (len === 2) {
+          tl = br = clampR(radii[0]);
+          tr = bl = clampR(radii[1]);
+        } else if (len === 3) {
+          tl = clampR(radii[0]);
+          tr = bl = clampR(radii[1]);
+          br = clampR(radii[2]);
+        } else if (len >= 4) {
+          tl = clampR(radii[0]);
+          tr = clampR(radii[1]);
+          br = clampR(radii[2]);
+          bl = clampR(radii[3]);
+        }
+      } else {
+        tl = tr = br = bl = clampR(radii);
+      }
+
+      // Соответствует спецификации Canvas 2D: добавляет подпуть без сброса текущего пути через beginPath()
+      this.moveTo(x + tl, y);
+      this.arcTo(x + safeW, y, x + safeW, y + safeH, tr);
+      this.arcTo(x + safeW, y + safeH, x, y + safeH, br);
+      this.arcTo(x, y + safeH, x, y, bl);
+      this.arcTo(x, y, x + safeW, y, tl);
       this.closePath();
       return this;
     };
   }
 }
 
-const MAX_SHADE_CACHE_SIZE = 512;
+// Двухуровневый кэш оттенков: parseInt выполняется 1 раз на базовый цвет, попадание в кэш — 0 аллокаций строк
+const MAX_SHADE_BASE_COLORS = 128;
+const MAX_SHADE_FACTOR_INDEX = 300;
 const shadeCache = new Map();
 
 export const MathUtil = {
@@ -30,6 +59,10 @@ export const MathUtil = {
   lerp(a, b, t) {
     return a + (b - a) * t;
   },
+  wrap(val, max) {
+    if (!max) return 0;
+    return ((val % max) + max) % max;
+  },
   percentRemaining(n, total) {
     if (!total) return 0;
     return (((n % total) + total) % total) / total;
@@ -38,58 +71,67 @@ export const MathUtil = {
     return arr[Math.floor(Math.random() * arr.length)];
   },
   overlap(x1, w1, x2, w2, percent = 1) {
-    const half = percent / 2;
-    const min1 = x1 - w1 * half;
-    const max1 = x1 + w1 * half;
-    const min2 = x2 - w2 * half;
-    const max2 = x2 + w2 * half;
-    return !(max1 < min2 || min1 > max2);
+    return Math.abs(x1 - x2) <= (w1 + w2) * percent * 0.5;
   },
   easeIn(a, b, percent) {
-    return a + (b - a) * Math.pow(percent, 2);
+    return a + (b - a) * percent * percent;
   },
   easeInOut(a, b, percent) {
-    return a + (b - a) * ((-Math.cos(percent * Math.PI) / 2) + 0.5);
+    return a + (b - a) * ((-Math.cos(percent * Math.PI) * 0.5) + 0.5);
   },
   exponentialFog(distance, density) {
-    return 1 - (1 / Math.pow(Math.E, distance * distance * density));
+    return 1 - Math.exp(-distance * distance * density);
   },
   shadeHex(hex, factor) {
     if (typeof hex !== 'string') return hex;
-    // Квантуем коэффициент до сотых, чтобы кэш не переполнялся и не сбрасывался от дробных float
-    const qFactor = Math.round(factor * 100) / 100;
-    const key = `${hex}_${qFactor}`;
-    const cached = shadeCache.get(key);
-    if (cached) return cached;
 
-    const clean = hex.replace('#', '');
-    if (clean.length !== 6) return hex;
-    const num = parseInt(clean, 16);
-    if (Number.isNaN(num)) return hex;
+    const safeFactor = Number.isFinite(factor) ? Math.max(0, factor) : 1;
+    const qInt = Math.round(safeFactor * 100);
 
-    const r = Math.min(255, Math.max(0, Math.round(((num >> 16) & 255) * qFactor)));
-    const g = Math.min(255, Math.max(0, Math.round(((num >> 8) & 255) * qFactor)));
-    const b = Math.min(255, Math.max(0, Math.round((num & 255) * qFactor)));
+    let entry = shadeCache.get(hex);
+    if (!entry) {
+      const clean = hex.charCodeAt(0) === 35 ? hex.slice(1) : hex;
+      if (clean.length !== 6) return hex;
+      const num = parseInt(clean, 16);
+      if (Number.isNaN(num)) return hex;
+
+      entry = {
+        r: (num >> 16) & 255,
+        g: (num >> 8) & 255,
+        b: num & 255,
+        shades: []
+      };
+      if (shadeCache.size >= MAX_SHADE_BASE_COLORS) {
+        shadeCache.clear();
+      }
+      shadeCache.set(hex, entry);
+    }
+
+    if (qInt <= MAX_SHADE_FACTOR_INDEX) {
+      const cached = entry.shades[qInt];
+      if (cached !== undefined) return cached;
+    }
+
+    const qFactor = qInt * 0.01;
+    const r = Math.min(255, Math.round(entry.r * qFactor));
+    const g = Math.min(255, Math.round(entry.g * qFactor));
+    const b = Math.min(255, Math.round(entry.b * qFactor));
     const res = `rgb(${r},${g},${b})`;
 
-    // Мягкое вытеснение самой старой записи вместо полной очистки кэша
-    if (shadeCache.size >= MAX_SHADE_CACHE_SIZE) {
-      const oldestKey = shadeCache.keys().next().value;
-      if (oldestKey !== undefined) {
-        shadeCache.delete(oldestKey);
-      }
+    if (qInt <= MAX_SHADE_FACTOR_INDEX) {
+      entry.shades[qInt] = res;
     }
-    shadeCache.set(key, res);
     return res;
   }
 };
 
 export function formatRaceTime(sec) {
   if (!Number.isFinite(sec)) return '00:00.00';
-  const clamped = Math.max(0, sec);
-  const mins = Math.floor(clamped / 60);
-  const secs = Math.floor(clamped % 60);
-  const hundredths = Math.floor((clamped - Math.floor(clamped)) * 100);
+  // Целочисленный перевод в сотые доли секунды устраняет потерю 0.01с из-за погрешности IEEE-754
+  const totalCs = Math.floor(Math.max(0, sec) * 100 + 1e-6);
+  const mins = Math.floor(totalCs / 6000);
+  const secs = Math.floor((totalCs % 6000) / 100);
+  const hundredths = totalCs % 100;
   const mm = String(mins).padStart(2, '0');
   const ss = String(secs).padStart(2, '0');
   const cc = String(hundredths).padStart(2, '0');

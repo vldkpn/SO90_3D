@@ -7,7 +7,6 @@ import {
   PROJ_HALF_WIDTH,
   PLAYER_LEN_Z,
   PLAYER_WIDTH_NORM,
-  SAFE_BUMPER_GAP_Z,
   TRAFFIC_SCAN_DIST_Z,
   ONCOMING_DETECT_DIST_Z,
   ONCOMING_HORN_DIST_Z,
@@ -31,24 +30,40 @@ import {
   spawnParticles
 } from './state.js';
 import { recordSkidMarks } from './track.js';
+import { t } from './i18n.js';
 
-export function getLaneConfigs() {
-  if (state.gameMode === 'oncoming') {
-    return [
-      { laneX: -0.66, dir: -1 },
-      { laneX: -0.23, dir: -1 },
-      { laneX:  0.23, dir:  1 },
-      { laneX:  0.66, dir:  1 }
-    ];
-  }
-  return [
-    { laneX: -0.64, dir: 1 },
-    { laneX:  0.00, dir: 1 },
-    { laneX:  0.64, dir: 1 }
-  ];
+// Кэшированные конфигурации полос (без ежекадровых аллокаций)
+const LANES_ONCOMING = [
+  { laneX: -0.66, dir: -1 },
+  { laneX: -0.23, dir: -1 },
+  { laneX:  0.23, dir:  1 },
+  { laneX:  0.66, dir:  1 }
+];
+
+const LANES_ONEWAY = [
+  { laneX: -0.64, dir: 1 },
+  { laneX:  0.00, dir: 1 },
+  { laneX:  0.64, dir: 1 }
+];
+
+// Базовая минимальная дистанция чистого асфальта между бамперами (~0.75 корпуса) и динамический интервал по скорости
+const MIN_CLEAR_BUMPER_GAP_Z = SEGMENT_LENGTH * 0.95;
+const MAX_CLEAR_BUMPER_GAP_Z = SEGMENT_LENGTH * 3.15;
+const HEADWAY_TIME_SEC = 0.055;
+
+const PLATE_LETTERS = 'ABCDEFGHJKLMNPRSTUVWXYZ';
+
+function generateTrafficPlate() {
+  const letter = PLATE_LETTERS[Math.floor(Math.random() * PLATE_LETTERS.length)];
+  const digits = String(100 + Math.floor(Math.random() * 900));
+  return `${letter}${digits}`;
 }
 
-function pickBalancedLane(lanes) {
+export function getLaneConfigs() {
+  return state.gameMode === 'oncoming' ? LANES_ONCOMING : LANES_ONEWAY;
+}
+
+function pickBalancedLane(lanes, requiredDir = 0) {
   const counts = new Array(lanes.length).fill(0);
   for (let i = 0; i < state.cars.length; i++) {
     const idx = state.cars[i].laneIndex;
@@ -58,28 +73,47 @@ function pickBalancedLane(lanes) {
   }
   let minCount = Infinity;
   for (let i = 0; i < counts.length; i++) {
+    if (requiredDir !== 0 && lanes[i].dir !== requiredDir) continue;
     if (counts[i] < minCount) minCount = counts[i];
   }
   const candidates = [];
   for (let i = 0; i < counts.length; i++) {
+    if (requiredDir !== 0 && lanes[i].dir !== requiredDir) continue;
     if (counts[i] <= minCount + 1) candidates.push(i);
   }
-  return MathUtil.randomChoice(candidates);
+  return candidates.length > 0 ? MathUtil.randomChoice(candidates) : 0;
 }
 
-export function spawnSingleCar(targetZ, avoidPlayerZone = false, preferredLaneIdx = null) {
+function abortLaneChange(car, lanes, cooldown) {
+  const fallbackLane = lanes[car.prevLaneIndex] || lanes[car.laneIndex];
+  if (fallbackLane) {
+    car.laneIndex = car.prevLaneIndex;
+    car.targetX = fallbackLane.laneX * ROAD_WIDTH;
+  }
+  car.signalPreDelay = 0;
+  car.signalHoldAfter = 0;
+  car.turnSignal = 0;
+  car.laneChangeTimer = 0;
+  car.laneCooldown = cooldown;
+}
+
+export function spawnSingleCar(targetZ, avoidPlayerZone = false, preferredLaneIdx = null, allowBehindCamera = false) {
   const segments = state.segments;
   if (!segments.length) return false;
 
   const lanes = getLaneConfigs();
-  const laneIndex = preferredLaneIdx !== null ? preferredLaneIdx : pickBalancedLane(lanes);
+  const requiredDir = allowBehindCamera ? 1 : 0;
+  const laneIndex = preferredLaneIdx !== null ? preferredLaneIdx : pickBalancedLane(lanes, requiredDir);
   const lane = lanes[laneIndex];
+  if (!lane || (requiredDir !== 0 && lane.dir !== requiredDir)) return false;
+
   const archetype = MathUtil.randomChoice(CAR_TYPES);
 
   const wrappedZ = ((targetZ % state.trackLength) + state.trackLength) % state.trackLength;
   if (avoidPlayerZone) {
     const dzFromPlayer = getShortestTrackDz(state.position, wrappedZ, state.trackLength);
-    if (dzFromPlayer > -90 * SEGMENT_LENGTH && dzFromPlayer < (DRAW_DISTANCE + 8) * SEGMENT_LENGTH) {
+    const minRejectZ = allowBehindCamera ? -18 * SEGMENT_LENGTH : -90 * SEGMENT_LENGTH;
+    if (dzFromPlayer > minRejectZ && dzFromPlayer < (DRAW_DISTANCE + 8) * SEGMENT_LENGTH) {
       return false;
     }
   }
@@ -153,6 +187,7 @@ export function spawnSingleCar(targetZ, avoidPlayerZone = false, preferredLaneId
     type: archetype.type,
     primary: archetype.primary,
     secondary: archetype.secondary,
+    plate: generateTrafficPlate(),
     segment: seg
   };
 
@@ -163,8 +198,10 @@ export function spawnSingleCar(targetZ, avoidPlayerZone = false, preferredLaneId
 
 function removeCarAt(index) {
   const car = state.cars[index];
-  const segIdx = car.segment.cars.indexOf(car);
-  if (segIdx !== -1) car.segment.cars.splice(segIdx, 1);
+  if (car && car.segment) {
+    const segIdx = car.segment.cars.indexOf(car);
+    if (segIdx !== -1) car.segment.cars.splice(segIdx, 1);
+  }
   state.cars.splice(index, 1);
 }
 
@@ -184,7 +221,17 @@ export function resetTraffic(count) {
   }
 }
 
-export function resetCircuitRivals() {
+/**
+ * Координаты слота на стартовой решётке (8 машин в 2 шахматных ряда: левый -0.38 и правый +0.38)
+ */
+export function getCircuitGridSlotPose(slotIndex) {
+  const gridCol = slotIndex % 2 === 0 ? -0.38 : 0.38;
+  // Шаг 1.55 сегмента гарантирует, что машина позади в том же ряду не перекрывает обзор машины игрока на старте
+  const backFromStartLine = (1.8 + slotIndex * 1.55) * SEGMENT_LENGTH;
+  return { gridCol, backFromStartLine };
+}
+
+export function resetCircuitRivals(playerGridSlot = null) {
   state.cars = [];
   state.rivals = [];
   for (let i = 0; i < state.segments.length; i++) {
@@ -193,11 +240,18 @@ export function resetCircuitRivals() {
 
   const rivalDefs = GAME_CONFIG.circuit.rivals;
   const count = Math.min(GAME_CONFIG.circuit.rivalsCount || rivalDefs.length, rivalDefs.length);
+  const totalGridSlots = count + 1;
+  const reservedPlayerSlot =
+    Number.isInteger(playerGridSlot) && playerGridSlot >= 0 && playerGridSlot < totalGridSlots
+      ? playerGridSlot
+      : -1;
 
+  let slotCursor = 0;
   for (let i = 0; i < count; i++) {
+    if (slotCursor === reservedPlayerSlot) slotCursor++;
+    const slotIndex = slotCursor++;
     const def = rivalDefs[i];
-    const gridCol = i % 2 === 0 ? -0.38 : 0.38;
-    const backFromStartLine = (1.8 + i * 1.1) * SEGMENT_LENGTH;
+    const { gridCol, backFromStartLine } = getCircuitGridSlotPose(slotIndex);
     const startProgressZ = -backFromStartLine;
     const wrappedZ = (((state.trackLength + startProgressZ) % state.trackLength) + state.trackLength) % state.trackLength;
     const seg = findSegment(wrappedZ);
@@ -263,11 +317,22 @@ export function maintainTrafficDensity() {
     INITIAL_TRAFFIC_COUNT + Math.floor(state.distanceMeters / METERS_PER_EXTRA_CAR)
   );
 
+  // В демо-режиме или при медленной езде/остановке часть попутных машин спавнится позади камеры,
+  // чтобы поток естественно догонял игрока и шоссе не пустело на стартовом экране
+  const activeCamSpeed = state.gameState === STATE.PLAYING ? state.speed : MAX_SPEED * 0.26;
+  const slowCamera = activeCamSpeed < MAX_SPEED * 0.36;
+
   let tries = 0;
   while (state.cars.length < targetCount && tries < 10) {
     tries++;
-    const spawnZ = state.position + (DRAW_DISTANCE + 14 + Math.random() * 145) * SEGMENT_LENGTH;
-    spawnSingleCar(spawnZ, true);
+    const spawnBehind = slowCamera && Math.random() < (state.gameMode === 'oncoming' ? 0.32 : 0.55);
+    if (spawnBehind) {
+      const behindZ = state.position - (22 + Math.random() * 52) * SEGMENT_LENGTH;
+      spawnSingleCar(behindZ, true, null, true);
+    } else {
+      const spawnZ = state.position + (DRAW_DISTANCE + 14 + Math.random() * 145) * SEGMENT_LENGTH;
+      spawnSingleCar(spawnZ, true, null, false);
+    }
   }
 }
 
@@ -277,7 +342,8 @@ function canChangeToLane(car, targetLaneIdx, lanes, playerWorldZ, checkPlayerObs
 
   const targetX = targetLane.laneX * ROAD_WIDTH;
   const laneHalfMargin = ROAD_WIDTH * 0.26;
-  const mergeDuration = 0.72;
+  const mergeDuration = 0.78;
+  const carLen = car.lenZ || SEGMENT_LENGTH * 1.3;
 
   for (let j = 0; j < state.cars.length; j++) {
     const other = state.cars[j];
@@ -288,8 +354,11 @@ function canChangeToLane(car, targetLaneIdx, lanes, playerWorldZ, checkPlayerObs
     if (!inTargetNow && !movingIntoTarget) continue;
 
     const relDz = getShortestTrackDz(car.z, other.z, state.trackLength) * car.dir;
+    const bodySpan = (carLen + (other.lenZ || SEGMENT_LENGTH * 1.3)) * 0.5;
+    const rearMargin = bodySpan + SEGMENT_LENGTH * 1.35;
+    const frontMargin = bodySpan + SEGMENT_LENGTH * 1.75;
 
-    if (relDz > -SEGMENT_LENGTH * 1.8 && relDz < SEGMENT_LENGTH * 2.3) {
+    if (relDz > -rearMargin && relDz < frontMargin) {
       return false;
     }
 
@@ -297,7 +366,7 @@ function canChangeToLane(car, targetLaneIdx, lanes, playerWorldZ, checkPlayerObs
     const futureRelDz = relDz - (car.speed - otherForwardVel) * mergeDuration;
     const minDz = Math.min(relDz, futureRelDz);
     const maxDz = Math.max(relDz, futureRelDz);
-    if (maxDz > -SEGMENT_LENGTH * 1.55 && minDz < SEGMENT_LENGTH * 1.95) {
+    if (maxDz > -(bodySpan + SEGMENT_LENGTH * 1.15) && minDz < (bodySpan + SEGMENT_LENGTH * 1.45)) {
       return false;
     }
   }
@@ -336,23 +405,34 @@ function canChangeToLane(car, targetLaneIdx, lanes, playerWorldZ, checkPlayerObs
 }
 
 function hasImmediateSideConflict(car, nextX, playerWorldZ, checkPlayerObstacle = true) {
-  const longitudinalBox = SEGMENT_LENGTH * 1.35;
-  for (let j = 0; j < state.cars.length; j++) {
-    const other = state.cars[j];
-    if (other === car) continue;
-    const dz = Math.abs(getShortestTrackDz(car.z, other.z, state.trackLength));
-    if (dz < longitudinalBox) {
-      const minLat = (car.w + other.w) * 0.52 * ROAD_WIDTH;
-      if (Math.abs(nextX - other.x) < minLat) {
-        return true;
+  const segments = state.segments;
+  const totalSegs = segments.length;
+  const baseIdx = car.segment ? car.segment.index : -1;
+  const carLen = car.lenZ || SEGMENT_LENGTH * 1.3;
+
+  if (baseIdx >= 0 && totalSegs > 0) {
+    for (let offset = -3; offset <= 3; offset++) {
+      const segCars = segments[(baseIdx + offset + totalSegs) % totalSegs].cars;
+      for (let j = 0; j < segCars.length; j++) {
+        const other = segCars[j];
+        if (other === car) continue;
+        const bodySpan = (carLen + (other.lenZ || SEGMENT_LENGTH * 1.3)) * 0.5;
+        const dz = Math.abs(getShortestTrackDz(car.z, other.z, state.trackLength));
+        if (dz < bodySpan + 45) {
+          const minLat = (car.w + other.w) * 0.54 * ROAD_WIDTH;
+          if (Math.abs(nextX - other.x) < minLat) {
+            return true;
+          }
+        }
       }
     }
   }
 
   if (checkPlayerObstacle) {
     const playerDz = Math.abs(getShortestTrackDz(car.z, playerWorldZ, state.trackLength));
-    if (playerDz < longitudinalBox) {
-      const minPlayerLat = (car.w + PLAYER_WIDTH_NORM) * 0.54 * ROAD_WIDTH;
+    const playerBodySpan = (carLen + PLAYER_LEN_Z) * 0.5;
+    if (playerDz < playerBodySpan + 45) {
+      const minPlayerLat = (car.w + PLAYER_WIDTH_NORM) * 0.55 * ROAD_WIDTH;
       if (Math.abs(nextX - state.playerX * ROAD_WIDTH) < minPlayerLat) {
         return true;
       }
@@ -377,6 +457,7 @@ export function moveCarToSegment(car) {
 export function updateCircuitRivals(dt, isDemo = false) {
   const rivals = state.rivals;
   const segments = state.segments;
+  const totalSegs = segments.length;
   const trackLength = state.trackLength;
   const playerWorldZ = getPlayerWorldZ();
   const isHardcoreCircuit = state.difficulty === 'hardcore';
@@ -391,15 +472,20 @@ export function updateCircuitRivals(dt, isDemo = false) {
     if (r.mistakeCooldown > 0) r.mistakeCooldown = Math.max(0, r.mistakeCooldown - dt);
     if (r.bumpCooldown > 0) r.bumpCooldown = Math.max(0, r.bumpCooldown - dt);
 
+    // Разделяем обзор: дальний (1..24) — для скорости в повороте, ближний (1..7) — для руления в S-связках
     let maxAheadCurve = 0;
-    let signedAheadCurve = 0;
-    if (r.segment) {
+    let steerCurve = 0;
+    let maxNearAbsCurve = 0;
+    if (r.segment && totalSegs > 0) {
       for (let look = 1; look <= 24; look++) {
-        const s = segments[(r.segment.index + look) % segments.length];
+        const s = segments[(r.segment.index + look) % totalSegs];
         const absC = Math.abs(s.curve);
         if (absC > maxAheadCurve) {
           maxAheadCurve = absC;
-          signedAheadCurve = s.curve;
+        }
+        if (look <= 7 && absC > maxNearAbsCurve) {
+          maxNearAbsCurve = absC;
+          steerCurve = s.curve;
         }
       }
     }
@@ -440,16 +526,38 @@ export function updateCircuitRivals(dt, isDemo = false) {
       }
     }
 
-    const cornerBrakeSensitivity = isHardcoreCircuit ? 0.028 : 0.036;
-    let cornerFactor = MathUtil.clamp(1.0 - Math.max(0, maxAheadCurve - 2.2) * cornerBrakeSensitivity, 0.54, 1.0);
+    const cornerBrakeSensitivity = isHardcoreCircuit ? 0.036 : 0.044;
+    let cornerFactor = MathUtil.clamp(1.0 - Math.max(0, maxAheadCurve - 2.2) * cornerBrakeSensitivity, 0.50, 1.0);
     if (r.mistakeType === 'late_brake') {
-      cornerFactor = Math.min(1.0, cornerFactor + 0.24 * r.mistakeSeverity);
+      cornerFactor = Math.min(1.0, cornerFactor + 0.22 * r.mistakeSeverity);
     } else if (r.mistakeType === 'early_apex') {
       cornerFactor *= 0.88;
     }
 
     const rawTargetSpeed = MAX_SPEED * r.skill * diffSpeedMult * paceBoost * cornerFactor;
-    const targetSpeed = Math.min(MAX_SPEED * 0.995, rawTargetSpeed);
+    let targetSpeed = Math.min(MAX_SPEED * 0.995, rawTargetSpeed);
+
+    // Контроль безопасной дистанции, если прямо впереди идёт другой соперник в том же створе
+    let closestDirectGap = Infinity;
+    let directLeaderSpeed = targetSpeed;
+    const rLen = r.lenZ || PLAYER_LEN_Z;
+    for (let j = 0; j < rivals.length; j++) {
+      if (i === j) continue;
+      const other = rivals[j];
+      const dz = getShortestTrackDz(r.z, other.z, trackLength);
+      if (dz > 35 && dz < SEGMENT_LENGTH * 3.4) {
+        const latDiff = Math.abs((r.x - other.x) / ROAD_WIDTH);
+        if (latDiff < (r.w + other.w) * 0.55 && dz < closestDirectGap) {
+          closestDirectGap = dz;
+          directLeaderSpeed = other.speed;
+        }
+      }
+    }
+    const rivalSafeCenterGap = rLen + SEGMENT_LENGTH * 0.72;
+    if (closestDirectGap < rivalSafeCenterGap) {
+      const gapErr = closestDirectGap - rivalSafeCenterGap;
+      targetSpeed = Math.min(targetSpeed, Math.max(0, directLeaderSpeed + gapErr * 1.4));
+    }
 
     if (r.speed > targetSpeed + 80) {
       r.braking = true;
@@ -463,13 +571,13 @@ export function updateCircuitRivals(dt, isDemo = false) {
     if (r.aiDecisionTimer <= 0) {
       r.aiDecisionTimer = 0.14 + Math.random() * 0.12;
 
-      let desiredNormX = MathUtil.clamp(-signedAheadCurve * 0.068 + r.lineBias * 0.35, -0.70, 0.70);
+      let desiredNormX = MathUtil.clamp(-steerCurve * 0.068 + r.lineBias * 0.35, -0.70, 0.70);
 
       if (r.mistakeType === 'wide_entry' || r.mistakeType === 'late_brake') {
-        const outsideDir = signedAheadCurve >= 0 ? -1 : 1;
+        const outsideDir = steerCurve >= 0 ? -1 : 1;
         desiredNormX = MathUtil.clamp(outsideDir * (0.76 + 0.24 * r.mistakeSeverity), -0.96, 0.96);
       } else if (r.mistakeType === 'early_apex') {
-        const insideDir = signedAheadCurve >= 0 ? 1 : -1;
+        const insideDir = steerCurve >= 0 ? 1 : -1;
         desiredNormX = MathUtil.clamp(insideDir * (0.82 + 0.22 * r.mistakeSeverity), -0.98, 0.98);
       }
 
@@ -575,7 +683,7 @@ export function updateCircuitRivals(dt, isDemo = false) {
       r.speed > MAX_SPEED * 0.35 &&
       (r.braking || r.mistakeType === 'late_brake')
     ) {
-      const rearZ = (((r.z - (r.lenZ || PLAYER_LEN_Z) * 0.42) % trackLength) + trackLength) % trackLength;
+      const rearZ = (((r.z - rLen * 0.42) % trackLength) + trackLength) % trackLength;
       recordSkidMarks(rearZ, rivalNormX, 0.44, Math.max(18, dzMove), r);
     } else {
       r.prevSkidSample = null;
@@ -588,7 +696,10 @@ export function updateCircuitRivals(dt, isDemo = false) {
       if (state.rivalsFinishedCount === 1) {
         state.raceFinishCountdown = GAME_CONFIG.circuit.finishGraceSec;
         showBanner(
-          `${r.name} ФИНИШИРОВАЛ ПЕРВЫМ! У ВАС ${Math.round(state.raceFinishCountdown)} СЕК!`,
+          t('bannerRivalFinishedFirst', {
+            name: r.name,
+            sec: Math.round(state.raceFinishCountdown)
+          }),
           '#ffbe0b',
           2.4
         );
@@ -596,14 +707,20 @@ export function updateCircuitRivals(dt, isDemo = false) {
     }
   }
 
-  // Взаимодействие между ботами
-  const minGapZ = SEGMENT_LENGTH * 1.125;
+  // Взаимодействие между ботами (габариты соответствуют реальной длине кузова lenZ)
   for (let i = 0; i < rivals.length; i++) {
     const a = rivals[i];
+    const aLen = a.lenZ || PLAYER_LEN_Z;
     for (let j = i + 1; j < rivals.length; j++) {
       const b = rivals[j];
+      const bLen = b.lenZ || PLAYER_LEN_Z;
+      const bodySpan = (aLen + bLen) * 0.5;
+      const minGapZ = bodySpan + 16;
+
       const dz = getShortestTrackDz(a.z, b.z, trackLength);
-      if (Math.abs(dz) >= minGapZ) continue;
+      const absDz = Math.abs(dz);
+      if (absDz >= minGapZ) continue;
+
       const minLat = (a.w + b.w) * 0.54 * ROAD_WIDTH;
       const dx = a.x - b.x;
       if (Math.abs(dx) >= minLat) continue;
@@ -621,7 +738,7 @@ export function updateCircuitRivals(dt, isDemo = false) {
         a.vx += pushSign * 0.75;
         b.vx -= pushSign * 0.75;
 
-        if (Math.abs(dz) >= SEGMENT_LENGTH * 0.675) {
+        if (absDz >= bodySpan * 0.65) {
           const leader = dz < 0 ? a : b;
           const trailer = dz < 0 ? b : a;
           trailer.speed *= 0.76;
@@ -632,7 +749,7 @@ export function updateCircuitRivals(dt, isDemo = false) {
           b.speed *= 0.86;
         }
 
-        // Проверяем актуальность проекции сегмента, чтобы искры не появлялись в устаревших точках экрана
+        // Проверяем видимость контакта над линией отсечения холма ДО вертикального сдвига искр
         const dzFromPlayer = getShortestTrackDz(playerWorldZ, a.z, trackLength);
         if (
           dzFromPlayer > 0 &&
@@ -641,10 +758,12 @@ export function updateCircuitRivals(dt, isDemo = false) {
           a.segment.projectedFrame >= state.frameCounter - 1
         ) {
           const screenScale = a.segment.p1.screen.scale || 0;
-          const screenX = a.segment.p1.screen.x + screenScale * a.x * PROJ_HALF_WIDTH;
-          const screenY = a.segment.p1.screen.y - 12;
-          if (screenScale > 0 && screenX > 0 && screenX < state.logicalWidth && screenY <= a.segment.clip) {
-            spawnParticles(screenX, screenY, 9, '#ffbe0b', 160, 100, [2, 4], [0.2, 0.4]);
+          const baseScreenY = a.segment.p1.screen.y;
+          const midX = (a.x + b.x) * 0.5;
+          const screenX = a.segment.p1.screen.x + screenScale * midX * PROJ_HALF_WIDTH;
+          if (screenScale > 0 && screenX > 0 && screenX < state.logicalWidth && baseScreenY <= a.segment.clip) {
+            const sparkLift = Math.min(18, screenScale * ROAD_WIDTH * PROJ_HALF_WIDTH * 0.06);
+            spawnParticles(screenX, baseScreenY - sparkLift, 9, '#ffbe0b', 160, 100, [2, 4], [0.2, 0.4]);
             if (dzFromPlayer < 26 * SEGMENT_LENGTH) {
               audio.playCrash(0.42);
             }
@@ -652,14 +771,21 @@ export function updateCircuitRivals(dt, isDemo = false) {
         }
       }
 
-      if (Math.abs(dz) < SEGMENT_LENGTH * 0.75) {
+      if (absDz < bodySpan * 0.72) {
         const push = (dx >= 0 ? 1 : -1) * (minLat - Math.abs(dx)) * 0.54;
         a.x = MathUtil.clamp(a.x + push, -ROAD_WIDTH * 1.12, ROAD_WIDTH * 1.12);
         b.x = MathUtil.clamp(b.x - push, -ROAD_WIDTH * 1.12, ROAD_WIDTH * 1.12);
       } else {
         const leader = dz < 0 ? a : b;
         const trailer = dz < 0 ? b : a;
-        trailer.speed = Math.min(trailer.speed, leader.speed * 0.94);
+        trailer.speed = Math.min(trailer.speed, leader.speed * 0.92);
+        trailer.braking = true;
+        if (absDz < bodySpan) {
+          const sep = bodySpan - absDz;
+          trailer.z = (((trailer.z - sep) % trackLength) + trackLength) % trackLength;
+          trailer.progressZ -= sep;
+          moveCarToSegment(trailer);
+        }
       }
     }
   }
@@ -667,12 +793,13 @@ export function updateCircuitRivals(dt, isDemo = false) {
 
 export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
   if (state.gameMode === 'circuit') {
-    // Любое состояние, отличное от PLAYING (включая GAMEOVER), переводит ботов в безопасный демо-режим
     updateCircuitRivals(dt, !checkPlayerObstacle || state.gameState !== STATE.PLAYING);
     return;
   }
 
   const cars = state.cars;
+  const segments = state.segments;
+  const totalSegs = segments.length;
   const trackLength = state.trackLength;
   const playerWorldZ = getPlayerWorldZ();
   const lanes = getLaneConfigs();
@@ -697,7 +824,7 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
       if (car.speed > 0) {
         car.speed = Math.max(0, car.speed - car.brakeForce * dt);
         if (car.speed > 0) {
-          car.z = (car.z + car.dir * car.speed * dt + trackLength) % trackLength;
+          car.z = (((car.z + car.dir * car.speed * dt) % trackLength) + trackLength) % trackLength;
           moveCarToSegment(car);
         }
       }
@@ -719,16 +846,7 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
     if (isChangingLane) {
       car.laneChangeTimer += dt;
       if (car.laneChangeTimer > 2.1) {
-        const fallbackLane = lanes[car.prevLaneIndex] || lanes[car.laneIndex];
-        if (fallbackLane) {
-          car.laneIndex = car.prevLaneIndex;
-          car.targetX = fallbackLane.laneX * ROAD_WIDTH;
-        }
-        car.signalPreDelay = 0;
-        car.signalHoldAfter = 0;
-        car.turnSignal = 0;
-        car.laneChangeTimer = 0;
-        car.laneCooldown = 0.6;
+        abortLaneChange(car, lanes, 0.6);
       }
     } else {
       car.laneChangeTimer = 0;
@@ -738,15 +856,7 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
       car.signalPreDelay = Math.max(0, car.signalPreDelay - dt);
       car.latVel = MathUtil.lerp(car.latVel || 0, 0, Math.min(1, dt * 10));
       if (hasImmediateSideConflict(car, (car.x + car.targetX) * 0.5, playerWorldZ, checkPlayerObstacle)) {
-        const fallbackLane = lanes[car.prevLaneIndex];
-        if (fallbackLane) {
-          car.laneIndex = car.prevLaneIndex;
-          car.targetX = fallbackLane.laneX * ROAD_WIDTH;
-        }
-        car.signalPreDelay = 0;
-        car.turnSignal = 0;
-        car.laneChangeTimer = 0;
-        car.laneCooldown = 0.45;
+        abortLaneChange(car, lanes, 0.45);
       }
     } else if (isChangingLane) {
       const diff = car.targetX - car.x;
@@ -756,18 +866,18 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
       const candidateX = car.x + car.latVel * dt;
 
       const prevLane = lanes[car.prevLaneIndex];
-      const totalSpan = prevLane ? Math.abs(car.targetX - prevLane.laneX * ROAD_WIDTH) : ROAD_WIDTH * 0.5;
-      const movedSpan = prevLane ? Math.abs(car.x - prevLane.laneX * ROAD_WIDTH) : totalSpan;
-      const progressRatio = totalSpan > 1 ? (movedSpan / totalSpan) : 1;
+      const totalSpan = prevLane ? Math.abs(car.targetX - prevLane.laneX * ROAD_WIDTH) : 0;
+      const isRealLaneMerge = totalSpan > 1;
+      const movedSpan = prevLane ? Math.abs(car.x - prevLane.laneX * ROAD_WIDTH) : 0;
+      const progressRatio = isRealLaneMerge ? (movedSpan / totalSpan) : 0;
 
       if (progressRatio < 0.85 && hasImmediateSideConflict(car, candidateX, playerWorldZ, checkPlayerObstacle)) {
-        if (prevLane) {
-          car.laneIndex = car.prevLaneIndex;
-          car.targetX = prevLane.laneX * ROAD_WIDTH;
+        if (isRealLaneMerge) {
+          abortLaneChange(car, lanes, 0.5);
+        } else {
+          // Если машина смещалась не в новую полосу (а была оттеснена от остова), просто гасим боковую скорость без дрожания
+          car.latVel = 0;
         }
-        car.turnSignal = 0;
-        car.laneChangeTimer = 0;
-        car.laneCooldown = 0.5;
       } else {
         car.x = candidateX;
         if (Math.abs(car.x - car.targetX) <= 3.0 && Math.abs(car.latVel) < 42) {
@@ -775,7 +885,7 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
           car.latVel = 0;
           car.prevLaneIndex = car.laneIndex;
           car.laneChangeTimer = 0;
-          car.signalHoldAfter = 0.24;
+          car.signalHoldAfter = isRealLaneMerge ? 0.24 : 0;
         }
       }
     } else {
@@ -802,25 +912,35 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
       : 0;
     car.yaw = MathUtil.lerp(car.yaw || 0, targetYaw, Math.min(1, dt * 10.5));
 
+    // Локальное сканирование препятствий впереди только по окну сегментов (-1..+11 по направлению движения)
     let closestGap = Infinity;
     let obstacleSpeed = 0;
+    let obstacleLenZ = SEGMENT_LENGTH * 1.3;
     let blockedByOncomingPlayer = false;
 
-    for (let j = 0; j < cars.length; j++) {
-      const other = cars[j];
-      if (other === car) continue;
-      const forwardDist = getShortestTrackDz(car.z, other.z, trackLength) * car.dir;
-      if (forwardDist > 10 && forwardDist < TRAFFIC_SCAN_DIST_Z) {
-        const minLatNorm = (car.w + other.w) * 0.60;
-        const dCurrCurr = Math.abs((car.x - other.x) / ROAD_WIDTH);
-        const dTargCurr = Math.abs((car.targetX - other.x) / ROAD_WIDTH);
-        const dCurrTarg = Math.abs((car.x - other.targetX) / ROAD_WIDTH);
-        const dTargTarg = Math.abs((car.targetX - other.targetX) / ROAD_WIDTH);
-        const effectiveLat = Math.min(dCurrCurr, dTargCurr, dCurrTarg, dTargTarg);
+    const carLen = car.lenZ || SEGMENT_LENGTH * 1.3;
+    const baseSegIdx = car.segment ? car.segment.index : -1;
+    if (baseSegIdx >= 0 && totalSegs > 0) {
+      for (let step = -1; step <= 11; step++) {
+        const segCars = segments[(baseSegIdx + step * car.dir + totalSegs) % totalSegs].cars;
+        for (let j = 0; j < segCars.length; j++) {
+          const other = segCars[j];
+          if (other === car) continue;
+          const forwardDist = getShortestTrackDz(car.z, other.z, trackLength) * car.dir;
+          if (forwardDist > 10 && forwardDist < TRAFFIC_SCAN_DIST_Z) {
+            const minLatNorm = (car.w + other.w) * 0.60;
+            const dCurrCurr = Math.abs((car.x - other.x) / ROAD_WIDTH);
+            const dTargCurr = Math.abs((car.targetX - other.x) / ROAD_WIDTH);
+            const dCurrTarg = Math.abs((car.x - other.targetX) / ROAD_WIDTH);
+            const dTargTarg = Math.abs((car.targetX - other.targetX) / ROAD_WIDTH);
+            const effectiveLat = Math.min(dCurrCurr, dTargCurr, dCurrTarg, dTargTarg);
 
-        if (effectiveLat < minLatNorm && forwardDist < closestGap) {
-          closestGap = forwardDist;
-          obstacleSpeed = other.dir === car.dir ? other.speed : 0;
+            if (effectiveLat < minLatNorm && forwardDist < closestGap) {
+              closestGap = forwardDist;
+              obstacleSpeed = other.dir === car.dir ? other.speed : 0;
+              obstacleLenZ = other.lenZ || SEGMENT_LENGTH * 1.3;
+            }
+          }
         }
       }
     }
@@ -829,23 +949,31 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
       const playerForwardDist = getShortestTrackDz(car.z, playerWorldZ, trackLength) * car.dir;
       const oncomingDetectRange = car.dir === -1 ? ONCOMING_DETECT_DIST_Z : TRAFFIC_SCAN_DIST_Z;
       if (playerForwardDist > 10 && playerForwardDist < oncomingDetectRange) {
-        const minPlayerLat = (car.w + PLAYER_WIDTH_NORM) * 0.65;
         const latCurr = Math.abs((car.x / ROAD_WIDTH) - state.playerX);
         const latTarg = Math.abs((car.targetX / ROAD_WIDTH) - state.playerX);
-        if (Math.min(latCurr, latTarg) < minPlayerLat) {
+        const playerLat = Math.min(latCurr, latTarg);
+
+        // Встречные машины реагируют только при реальном заходе игрока за осевую на встречную половину
+        const isOncomingThreat = car.dir === -1 && state.playerX < -0.05;
+        const brakeLatThreshold = (car.w + PLAYER_WIDTH_NORM) * (car.dir === -1 ? 0.50 : 0.62);
+        const warnLatThreshold = (car.w + PLAYER_WIDTH_NORM) * 0.58;
+
+        if ((car.dir === 1 || isOncomingThreat) && playerLat < brakeLatThreshold) {
           if (playerForwardDist < TRAFFIC_SCAN_DIST_Z && playerForwardDist < closestGap) {
             closestGap = playerForwardDist;
             obstacleSpeed = car.dir === 1 ? Math.max(0, state.speed) : 0;
+            obstacleLenZ = PLAYER_LEN_Z;
             if (car.dir === -1) {
               blockedByOncomingPlayer = true;
             }
           }
-          if (car.dir === -1 && state.gameState === STATE.PLAYING) {
-            car.highBeamFlashTimer = Math.max(car.highBeamFlashTimer, 0.45);
-            if (car.hornCooldown <= 0 && playerForwardDist < ONCOMING_HORN_DIST_Z) {
-              car.hornCooldown = 2.6 + Math.random() * 1.2;
-              audio.playOncomingHorn(car.type);
-            }
+        }
+
+        if (isOncomingThreat && playerLat < warnLatThreshold && state.gameState === STATE.PLAYING) {
+          car.highBeamFlashTimer = Math.max(car.highBeamFlashTimer, 0.45);
+          if (car.hornCooldown <= 0 && playerForwardDist < ONCOMING_HORN_DIST_Z) {
+            car.hornCooldown = 2.6 + Math.random() * 1.2;
+            audio.playOncomingHorn(car.type);
           }
         }
       }
@@ -856,7 +984,9 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
       car.baseSpeed > obstacleSpeed * 1.03;
 
     if (caughtSlowTraffic && !blockedByOncomingPlayer && car.laneCooldown <= 0 && !isChangingLane) {
-      const neighborIndices = [car.laneIndex - 1, car.laneIndex + 1];
+      // Случайный выбор приоритета (левее/правее) устраняет перекос потока в левую полосу
+      const firstShift = Math.random() < 0.5 ? -1 : 1;
+      const neighborIndices = [car.laneIndex + firstShift, car.laneIndex - firstShift];
       let startedLaneChange = false;
 
       for (let k = 0; k < neighborIndices.length; k++) {
@@ -881,27 +1011,45 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
       }
     }
 
+    // Регулятор безопасной дистанции с учётом реальных длин кузовов (lenZ) и скорости лидера
     if (closestGap < TRAFFIC_SCAN_DIST_Z) {
-      const clearGap = closestGap - SAFE_BUMPER_GAP_Z;
-      if (clearGap <= 0) {
+      const bodySpan = (carLen + obstacleLenZ) * 0.5;
+      const targetClearGap = MathUtil.clamp(
+        MIN_CLEAR_BUMPER_GAP_Z + obstacleSpeed * HEADWAY_TIME_SEC,
+        MIN_CLEAR_BUMPER_GAP_Z,
+        MAX_CLEAR_BUMPER_GAP_Z
+      );
+      const desiredCenterGap = bodySpan + targetClearGap;
+      const emergencyCenterGap = bodySpan + 85;
+      const gapError = closestGap - desiredCenterGap;
+
+      if (closestGap <= emergencyCenterGap) {
         car.braking = true;
-        car.brakeHoldTimer = 0.22;
-        car.speed = Math.min(car.speed, obstacleSpeed);
-        if (obstacleSpeed <= 5) car.speed = 0;
+        car.brakeHoldTimer = 0.24;
+        const safeRetreatSpeed = obstacleSpeed <= 5 ? 0 : Math.max(0, obstacleSpeed - MAX_SPEED * 0.08);
+        car.speed = Math.max(safeRetreatSpeed, car.speed - MAX_SPEED * 2.2 * dt);
+        if (obstacleSpeed <= 5 && closestGap <= bodySpan + 45) {
+          car.speed = 0;
+        }
       } else {
-        const desiredSpeed = obstacleSpeed + clearGap * 1.45;
-        if (car.speed > desiredSpeed + 45) {
+        const desiredSpeed = gapError >= 0
+          ? obstacleSpeed + gapError * 1.15
+          : Math.max(0, obstacleSpeed + gapError * 1.45);
+
+        if (car.speed > desiredSpeed + 35) {
           car.braking = true;
           car.brakeHoldTimer = 0.22;
-          const decelRate = MAX_SPEED * (clearGap < 340 ? 1.25 : 0.75);
-          car.speed = Math.max(obstacleSpeed, car.speed - decelRate * dt);
-          if (obstacleSpeed <= 5 && clearGap < 45) {
-            car.speed = Math.max(0, car.speed - MAX_SPEED * 1.4 * dt);
-          }
+          const closingVel = Math.max(0, car.speed - obstacleSpeed);
+          const safeRunway = Math.max(40, closestGap - emergencyCenterGap);
+          const kinematicDecel = (closingVel * closingVel) / (2 * safeRunway);
+          const decelRate = Math.max(
+            MAX_SPEED * (gapError < 260 ? 1.25 : 0.78),
+            Math.min(MAX_SPEED * 2.4, kinematicDecel * 1.18)
+          );
+          car.speed = Math.max(desiredSpeed, car.speed - decelRate * dt);
         } else if (car.speed > desiredSpeed && car.brakeHoldTimer > 0) {
           car.braking = true;
-          const decelRate = MAX_SPEED * 0.45;
-          car.speed = Math.max(obstacleSpeed, car.speed - decelRate * dt);
+          car.speed = Math.max(desiredSpeed, car.speed - MAX_SPEED * 0.45 * dt);
         } else {
           if (car.brakeHoldTimer <= 0) {
             car.braking = false;
@@ -919,60 +1067,96 @@ export function updateTrafficOnly(dt, checkPlayerObstacle = false) {
     }
 
     if (car.speed > 0) {
-      car.z = (car.z + car.dir * car.speed * dt + trackLength) % trackLength;
+      car.z = (((car.z + car.dir * car.speed * dt) % trackLength) + trackLength) % trackLength;
       moveCarToSegment(car);
     }
   }
 
-  // Пост-проход непересечения между машинами трафика
-  const minLongitudinalGap = SEGMENT_LENGTH * 1.425;
+  // Локальный пост-проход непересечения (O(N) по окну ±2 сегмента, без телепортаций при перестроении)
+  const movedForReindex = [];
+  for (let i = 0; i < cars.length; i++) {
+    cars[i]._pairOrder = i;
+  }
+
   for (let i = 0; i < cars.length; i++) {
     const a = cars[i];
+    if (!a.segment || totalSegs === 0) continue;
+    const aLen = a.lenZ || SEGMENT_LENGTH * 1.3;
     const aChanging = Math.abs(a.x - a.targetX) > 3;
-    for (let j = i + 1; j < cars.length; j++) {
-      const b = cars[j];
-      const bChanging = Math.abs(b.x - b.targetX) > 3;
-      const dz = getShortestTrackDz(a.z, b.z, trackLength);
-      const absDz = Math.abs(dz);
-      if (absDz >= minLongitudinalGap) continue;
 
-      const minLat = (a.w + b.w) * 0.54 * ROAD_WIDTH;
-      const dx = a.x - b.x;
-      const absDx = Math.abs(dx);
-      if (absDx >= minLat) continue;
+    for (let offset = -2; offset <= 2; offset++) {
+      const segCars = segments[(a.segment.index + offset + totalSegs) % totalSegs].cars;
+      for (let j = 0; j < segCars.length; j++) {
+        const b = segCars[j];
+        if (b._pairOrder <= a._pairOrder) continue;
 
-      const latOverlap = minLat - absDx;
-      const longOverlap = minLongitudinalGap - absDz;
+        const bLen = b.lenZ || SEGMENT_LENGTH * 1.3;
+        const bodySpan = (aLen + bLen) * 0.5;
+        const minLongitudinalGap = bodySpan + 26;
 
-      if (!aChanging && !bChanging && absDz < SEGMENT_LENGTH * 0.9 && latOverlap <= longOverlap * 0.7) {
-        const pushSign = dx >= 0 ? 1 : -1;
-        const halfPush = latOverlap * 0.52;
-        if (!a.damagedByPlayer) {
-          a.x = MathUtil.clamp(a.x + pushSign * halfPush, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
+        const dz = getShortestTrackDz(a.z, b.z, trackLength);
+        const absDz = Math.abs(dz);
+        if (absDz >= minLongitudinalGap) continue;
+
+        const minLat = (a.w + b.w) * 0.54 * ROAD_WIDTH;
+        const dx = a.x - b.x;
+        const absDx = Math.abs(dx);
+        if (absDx >= minLat) continue;
+
+        // Оба автомобиля уже разбиты и стоят — не двигаем остовы
+        if (a.damagedByPlayer && b.damagedByPlayer) continue;
+
+        const bChanging = Math.abs(b.x - b.targetX) > 3;
+        const latOverlap = minLat - absDx;
+        const longOverlap = minLongitudinalGap - absDz;
+
+        if ((aChanging || bChanging) && absDz < bodySpan * 0.95) {
+          // При боковом конфликте во время перестроения отменяем манёвр и разводим по X без прыжка по Z
+          if (aChanging && !a.damagedByPlayer) abortLaneChange(a, lanes, 0.55);
+          if (bChanging && !b.damagedByPlayer) abortLaneChange(b, lanes, 0.55);
+          const pushSign = dx >= 0 ? 1 : -1;
+          const halfPush = latOverlap * 0.55;
+          if (!a.damagedByPlayer) a.x = MathUtil.clamp(a.x + pushSign * halfPush, -ROAD_WIDTH * 0.84, ROAD_WIDTH * 0.84);
+          if (!b.damagedByPlayer) b.x = MathUtil.clamp(b.x - pushSign * halfPush, -ROAD_WIDTH * 0.84, ROAD_WIDTH * 0.84);
+        } else if (!aChanging && !bChanging && absDz < bodySpan * 0.72 && latOverlap <= longOverlap * 0.75) {
+          const pushSign = dx >= 0 ? 1 : -1;
+          const halfPush = latOverlap * 0.52;
+          if (!a.damagedByPlayer) {
+            a.x = MathUtil.clamp(a.x + pushSign * halfPush, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
+          }
+          if (!b.damagedByPlayer) {
+            b.x = MathUtil.clamp(b.x - pushSign * halfPush, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
+          }
+        } else if (a.dir === b.dir) {
+          const aIsAhead = dz * a.dir < 0;
+          const leader = aIsAhead ? a : b;
+          const trailer = aIsAhead ? b : a;
+          if (!trailer.damagedByPlayer) {
+            trailer.speed = Math.min(trailer.speed, leader.speed * 0.92);
+            trailer.braking = true;
+            trailer.brakeHoldTimer = 0.25;
+            // Жёсткую правку Z применяем только при реальном пересечении бамперов
+            if (absDz < bodySpan + 12) {
+              trailer.z = (((leader.z - leader.dir * (bodySpan + 14)) % trackLength) + trackLength) % trackLength;
+              movedForReindex.push(trailer);
+            }
+          }
+        } else if (a.damagedByPlayer || b.damagedByPlayer) {
+          const activeCar = a.damagedByPlayer ? b : a;
+          const wreckedCar = a.damagedByPlayer ? a : b;
+          const pushSign = activeCar.x >= wreckedCar.x ? 1 : -1;
+          activeCar.x = MathUtil.clamp(
+            activeCar.x + pushSign * latOverlap * 0.65,
+            -ROAD_WIDTH * 0.88,
+            ROAD_WIDTH * 0.88
+          );
+          activeCar.latVel = 0;
         }
-        if (!b.damagedByPlayer) {
-          b.x = MathUtil.clamp(b.x - pushSign * halfPush, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
-        }
-      } else if (a.dir === b.dir) {
-        const aIsAhead = dz * a.dir < 0;
-        const leader = aIsAhead ? a : b;
-        const trailer = aIsAhead ? b : a;
-        if (!trailer.damagedByPlayer) {
-          trailer.z = (leader.z - leader.dir * minLongitudinalGap + trackLength) % trackLength;
-          trailer.speed = Math.min(trailer.speed, leader.speed);
-          trailer.braking = true;
-          moveCarToSegment(trailer);
-        }
-      } else if (a.damagedByPlayer || b.damagedByPlayer) {
-        const activeCar = a.damagedByPlayer ? b : a;
-        const wreckedCar = a.damagedByPlayer ? a : b;
-        const pushSign = activeCar.x >= wreckedCar.x ? 1 : -1;
-        activeCar.x = MathUtil.clamp(
-          activeCar.x + pushSign * latOverlap * 0.65,
-          -ROAD_WIDTH * 0.88,
-          ROAD_WIDTH * 0.88
-        );
       }
     }
+  }
+
+  for (let i = 0; i < movedForReindex.length; i++) {
+    moveCarToSegment(movedForReindex[i]);
   }
 }

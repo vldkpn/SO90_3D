@@ -41,26 +41,49 @@ import {
 } from './state.js';
 import { recordSkidMarks } from './track.js';
 import { maintainTrafficDensity, updateTrafficOnly } from './traffic.js';
+import { t, formatPlaceText } from './i18n.js';
 
 // Смещение опор арок синхронизировано с js/renderer.js (ARCH_TOWER_OFFSET_NORM)
 const ARCH_PILLAR_HITBOX_OFFSET = 1.28;
 
+// Константная таблица ширин хитбоксов придорожных спрайтов (без аллокаций на кадр)
+const SPRITE_HITBOX_WIDTHS = {
+  billboard: 0.24,
+  chevron_left: 0.12,
+  chevron_right: 0.12,
+  palm: 0.08,
+  lamp: 0.06
+};
+
+const ARCH_HIT_TARGETS = [
+  { offset: -ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 },
+  { offset:  ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 }
+];
+
+const _checkedCars = new Set();
+const _visitedSegs = new Set();
+const _segIndicesToCheck = [];
+
+/**
+ * Однопроходное обновление и уплотнение массива частиц за O(N) без splice()
+ */
 function updateParticles(dt) {
   const particles = state.particles;
-  for (let i = particles.length - 1; i >= 0; i--) {
+  let writeIdx = 0;
+  for (let i = 0; i < particles.length; i++) {
     const p = particles[i];
     p.life -= dt;
-    if (p.life <= 0) {
-      particles.splice(i, 1);
-      continue;
-    }
+    if (p.life <= 0) continue;
+
     p.x += p.vx * dt;
     p.y += p.vy * dt;
     p.vy += p.gravity * dt;
     if (p.expandRate !== 0) {
       p.size = Math.max(1, p.size + p.expandRate * dt);
     }
+    particles[writeIdx++] = p;
   }
+  particles.length = writeIdx;
 }
 
 function triggerGameOver(reasonTitle) {
@@ -74,17 +97,29 @@ function applyCollisionTimePenalty(seconds = COLLISION_TIME_PENALTY) {
   state.timePenaltyFlash = 0.95;
   if (state.timeLeft <= 0) {
     state.timeLeft = 0;
-    triggerGameOver('ВРЕМЯ ВЫШЛО!');
+    triggerGameOver(t('goTimeUp'));
     return true;
   }
   return false;
 }
 
-function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗБИТА!', hitContext = {}) {
+/**
+ * Синхронный продольный сдвиг позиции игрока при разрешении коллизий
+ */
+function shiftPlayerZ(delta, trackLength) {
+  state.position = (((state.position + delta) % trackLength) + trackLength) % trackLength;
+  state.netForwardZ += delta;
+  if (state.gameMode === 'circuit') {
+    state.playerProgressZ += delta;
+  }
+}
+
+function registerCollision(damagePoints = 1, fatalReason = null, hitContext = {}) {
   if (state.gameMode === 'circuit') {
     return false;
   }
 
+  const resolvedFatal = fatalReason || t('goCarWrecked');
   // В режиме «Легко» ограничиваем штраф за один удар, отвязывая его от смертельного урона хардкора
   const rawDmg = Math.max(1, damagePoints);
   const dmg = state.difficulty === 'hardcore' ? rawDmg : Math.min(2, rawDmg);
@@ -128,7 +163,7 @@ function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗ�
     state.speed = cappedSpeed;
   }
 
-  // Однократная фиксация стороны повреждения спойлера (после изгиба/отлома сторона больше не меняется)
+  // Однократная фиксация стороны повреждения спойлера
   const lockSpoilerSide = () => {
     if (state.spoilerDamageSide !== 0) return;
     if (side === 'left') {
@@ -148,9 +183,9 @@ function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗ�
       lockSpoilerSide();
     }
     if (applyCollisionTimePenalty(COLLISION_TIME_PENALTY)) return true;
-    const engineWarn = state.visualDamage >= 3 ? ' • ДВИГАТЕЛЬ ПОВРЕЖДЁН!' : '';
+    const engineWarn = state.visualDamage >= 3 ? t('bannerEngineDamagedSuffix') : '';
     showBanner(
-      `УДАР! -${penaltySec} СЕК • МАКС: ${cappedKmh} КМ/Ч${engineWarn}`,
+      t('bannerHitArcade', { sec: penaltySec, kmh: cappedKmh, engineWarn }),
       '#ff2a85',
       1.9
     );
@@ -168,13 +203,18 @@ function registerCollision(damagePoints = 1, fatalReason = 'МАШИНА РАЗ�
     state.rearDamage = 3;
     state.frontDamage = 3;
     state.timeLeft = Math.max(0, state.timeLeft - COLLISION_TIME_PENALTY);
-    triggerGameOver(fatalReason);
+    triggerGameOver(resolvedFatal);
     return true;
   }
 
   if (applyCollisionTimePenalty(COLLISION_TIME_PENALTY)) return true;
   showBanner(
-    `УДАР! -${penaltySec} СЕК • МАКС: ${cappedKmh} • ПРОЧН.: ${state.collisionsLeft}/${MAX_HARDCORE_COLLISIONS}`,
+    t('bannerHitHardcore', {
+      sec: penaltySec,
+      kmh: cappedKmh,
+      left: state.collisionsLeft,
+      max: MAX_HARDCORE_COLLISIONS
+    }),
     '#ff2a85',
     1.9
   );
@@ -221,15 +261,17 @@ export function updateSimulation(dt) {
     return;
   }
 
+  // Нормированный коэффициент частоты кадров (1.0 при 60 FPS) для независимости частиц от Гц монитора
+  const step60 = dt * 60;
   state.animClockMs += dt * 1000;
 
-  if (state.bannerTimer > 0) state.bannerTimer = Math.max(0, state.bannerTimer - dt);
-  if (state.spriteHitCooldown > 0) state.spriteHitCooldown = Math.max(0, state.spriteHitCooldown - dt);
-  if (state.guardrailSoundCooldown > 0) state.guardrailSoundCooldown = Math.max(0, state.guardrailSoundCooldown - dt);
-  if (state.offRoadWarnCooldown > 0) state.offRoadWarnCooldown = Math.max(0, state.offRoadWarnCooldown - dt);
-  if (state.heatWarnCooldown > 0) state.heatWarnCooldown = Math.max(0, state.heatWarnCooldown - dt);
-  if (state.impactShake > 0) state.impactShake = Math.max(0, state.impactShake - dt * 3.8);
-  if (state.timePenaltyFlash > 0) state.timePenaltyFlash = Math.max(0, state.timePenaltyFlash - dt * 1.4);
+  state.bannerTimer = Math.max(0, state.bannerTimer - dt);
+  state.spriteHitCooldown = Math.max(0, state.spriteHitCooldown - dt);
+  state.guardrailSoundCooldown = Math.max(0, state.guardrailSoundCooldown - dt);
+  state.offRoadWarnCooldown = Math.max(0, state.offRoadWarnCooldown - dt);
+  state.heatWarnCooldown = Math.max(0, state.heatWarnCooldown - dt);
+  state.impactShake = Math.max(0, state.impactShake - dt * 3.8);
+  state.timePenaltyFlash = Math.max(0, state.timePenaltyFlash - dt * 1.4);
 
   updateParticles(dt);
 
@@ -241,7 +283,7 @@ export function updateSimulation(dt) {
   // Демонстрационный автопилот на стартовом экране (или сцена аварии при поломке)
   if (state.gameState !== STATE.PLAYING) {
     if (state.gameState === STATE.GAMEOVER && state.gameMode !== 'circuit' && state.visualDamage >= MAX_HARDCORE_COLLISIONS) {
-      if (Math.random() < 0.78) {
+      if (Math.random() < 0.78 * step60) {
         spawnParticles(
           anchors.centerX + (Math.random() - 0.5) * anchors.carW * 0.35,
           anchors.hoodY,
@@ -255,7 +297,7 @@ export function updateSimulation(dt) {
           12
         );
       }
-      if (Math.random() < 0.28) {
+      if (Math.random() < 0.28 * step60) {
         spawnParticles(
           anchors.centerX + (Math.random() - 0.5) * anchors.carW * 0.30,
           anchors.centerY,
@@ -274,26 +316,28 @@ export function updateSimulation(dt) {
       return;
     }
 
-    state.position = (state.position + MAX_SPEED * 0.26 * dt) % trackLength;
+    const demoSpeedRatio = 0.26;
+    state.position = (state.position + MAX_SPEED * demoSpeedRatio * dt) % trackLength;
     if (state.gameState === STATE.GAMEOVER) {
       // Камера плавно возвращается к центру трассы, пока машина игрока остаётся стоять на месте
       state.playerX = MathUtil.lerp(state.playerX, 0, Math.min(1, dt * 1.4));
     }
     const demoSeg = findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z);
     if (demoSeg) {
-      state.skyOffset = (state.skyOffset + demoSeg.curve * 0.0018) % 1;
-      state.hillOffset = (state.hillOffset + demoSeg.curve * 0.0045) % 1;
-      state.cityOffset = (state.cityOffset + demoSeg.curve * 0.0085) % 1;
+      // Параллакс в демо-режиме синхронизирован с dt и реальной кривизной трассы
+      const demoCurveScroll = demoSeg.curve * demoSpeedRatio * dt;
+      state.skyOffset = (state.skyOffset + demoCurveScroll * 0.08) % 2;
+      state.hillOffset = (state.hillOffset + demoCurveScroll * 0.22) % 1;
+      state.cityOffset = (state.cityOffset + demoCurveScroll * 0.44) % 1;
     }
     maintainTrafficDensity();
-    // Вне активного заезда трафик и боты идут в безопасном демо-режиме без учёта призрачного игрока
     updateTrafficOnly(dt, false);
     updateCameraDynamics(dt, demoSeg);
     audio.update(0, false, false, false);
     return;
   }
 
-  // Предстартовый отсчет на решетке в кольцевом заезде
+  // Предстартовый отсчёт на решётке в кольцевом заезде
   if (state.gameMode === 'circuit' && state.raceCountdownTimer > 0) {
     state.raceCountdownTimer = Math.max(0, state.raceCountdownTimer - dt);
     const digit = Math.ceil((state.raceCountdownTimer / GAME_CONFIG.circuit.countdownSec) * 3);
@@ -302,22 +346,22 @@ export function updateSimulation(dt) {
       audio.playTone(440, 0.10, 'square', 0.12);
     }
     if (state.raceCountdownTimer === 0) {
-      audio.playTone(880, 0.24, 'square', 0.16);
-      showBanner('СТАРТ! ВПЕРЁД!', '#39ff14', 1.4);
+      audio.playStartBeep();
+      showBanner(t('bannerRaceStart'), '#39ff14', 1.4);
     }
     updateCameraDynamics(dt, findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z));
     audio.update(input.up ? 0.55 : 0.08, false, false, true, true);
     return;
   }
 
-  // 1. Таймер обратного отсчета или секундомер круга
+  // 1. Таймер обратного отсчёта или секундомер круга
   if (state.gameMode === 'circuit') {
     state.raceElapsedTime += dt;
     if (state.raceFinishCountdown > 0) {
       state.raceFinishCountdown = Math.max(0, state.raceFinishCountdown - dt);
       if (state.raceFinishCountdown === 0) {
         computeCircuitRank();
-        triggerGameOver(`ГОНКА ЗАВЕРШЕНА • ${state.playerRank}-Е МЕСТО`);
+        triggerGameOver(t('goRaceOverPlace', { place: formatPlaceText(state.playerRank) }));
         return;
       }
     }
@@ -325,7 +369,7 @@ export function updateSimulation(dt) {
     state.timeLeft -= dt;
     if (state.timeLeft <= 0) {
       state.timeLeft = 0;
-      triggerGameOver('ВРЕМЯ ВЫШЛО!');
+      triggerGameOver(t('goTimeUp'));
       return;
     }
   }
@@ -361,7 +405,7 @@ export function updateSimulation(dt) {
     const showDamageSmoke = state.difficulty === 'hardcore' || state.visualDamage >= 3;
     if (showDamageSmoke) {
       const smokeChance = [0, 0.14, 0.26, 0.44, 0.66, 0.85][Math.min(5, state.visualDamage)];
-      if (Math.random() < smokeChance) {
+      if (Math.random() < smokeChance * step60) {
         const isHeavy = state.visualDamage >= 3;
         const smokeColor = isHeavy
           ? (Math.random() < 0.68 ? 'rgba(34, 31, 44, 0.80)' : 'rgba(92, 88, 106, 0.70)')
@@ -405,7 +449,6 @@ export function updateSimulation(dt) {
   const isEngineMisfiring = state.engineMisfireTimer > 0;
 
   // 2. Система перегрева двигателя в режиме «Нормально»
-  // В кольцевом режиме нагрев ослаблен на 40% для честного баланса против ИИ без перегрева
   if (state.difficulty === 'hardcore') {
     const throttleLoadRatio = damageMaxSpeed > 0 ? Math.max(0, state.speed) / damageMaxSpeed : 0;
     const heatThreshold = state.gameMode === 'circuit' ? 0.93 : 0.90;
@@ -417,12 +460,12 @@ export function updateSimulation(dt) {
       state.engineHeat = Math.min(100, state.engineHeat + dt * heatRate);
       if (state.engineHeat >= 92 && state.heatWarnCooldown <= 0) {
         state.heatWarnCooldown = 2.0;
-        showBanner('ВНИМАНИЕ! ПЕРЕГРЕВ МОТОРА!', '#ffbe0b', 1.3);
+        showBanner(t('bannerHeatWarn'), '#ffbe0b', 1.3);
       }
       if (state.engineHeat >= 100) {
         state.isOverheated = true;
         audio.playOverheat();
-        showBanner('ПЕРЕГРЕВ! МОЩНОСТЬ СНИЖЕНА!', '#ff2a85', 2.4);
+        showBanner(t('bannerOverheated'), '#ff2a85', 2.4);
       }
     } else {
       const coolRate = state.isOverheated
@@ -431,7 +474,7 @@ export function updateSimulation(dt) {
       state.engineHeat = Math.max(0, state.engineHeat - dt * coolRate);
       if (state.isOverheated && state.engineHeat <= GAME_CONFIG.gameplay.engineOverheatRecoverPct) {
         state.isOverheated = false;
-        showBanner('МОТОР ОСТЫЛ — ПОЛНАЯ МОЩНОСТЬ!', '#00f0ff', 1.6);
+        showBanner(t('bannerEngineCooled'), '#00f0ff', 1.6);
       }
     }
   }
@@ -494,16 +537,15 @@ export function updateSimulation(dt) {
 
     if ((isCornerCut || isDeepCornerCut) && state.speed > activeOffRoadLimit * 1.1 && state.offRoadWarnCooldown <= 0) {
       state.offRoadWarnCooldown = 1.6;
-      showBanner(isCornerCut ? 'СРЕЗКА ПОВОРОТА! СБРОС СКОРОСТИ!' : 'ВОЗВРАТ НА ТРАССУ!', '#ffbe0b', 1.2);
+      showBanner(isCornerCut ? t('bannerCornerCut') : t('bannerReturnToTrack'), '#ffbe0b', 1.2);
     }
-    // Ограничиваем замедление снизу лимитом обочины, чтобы скорость не проваливалась и не дёргалась на низком FPS
     if (state.speed > activeOffRoadLimit) {
       state.speed = Math.max(
         activeOffRoadLimit,
         state.speed + OFF_ROAD_DECEL * (isCornerCut ? 1.85 : (isDeepCornerCut ? 1.35 : 1.0)) * dt
       );
     }
-    if (Math.abs(state.speed) > 40 && Math.random() < 0.65) {
+    if (Math.abs(state.speed) > 40 && Math.random() < 0.65 * step60) {
       spawnParticles(
         anchors.rearCenterX + (Math.random() - 0.5) * anchors.carW * 0.75,
         anchors.rearGroundY - 4,
@@ -553,59 +595,49 @@ export function updateSimulation(dt) {
 
   if (Math.abs(state.playerVX) > 0.001) {
     state.playerX += state.playerVX * dt;
-    const gripDamping = Math.pow(0.035, dt);
-    state.playerVX *= gripDamping;
+    state.playerVX *= Math.pow(0.035, dt);
     if (Math.abs(state.playerVX) < 0.01) state.playerVX = 0;
   }
 
-  // Физика защитных отбойников на крутых поворотах
+  // Физика защитных отбойников на крутых поворотах (односторонний удерживатель без запирания снаружи)
   if (state.gameMode === 'circuit' && state.difficulty === 'arcade' && currentSeg) {
     const railInnerEdge = 1.15;
     const railOuterEdge = 1.21;
     const railCenter = (railInnerEdge + railOuterEdge) * 0.5;
-    const visualHalfCarW = 0.12;
+    const visualHalfCarW = PLAYER_WIDTH_NORM * 0.5;
     const carHalfScreenW = anchors.carW * 0.50;
 
-    if (currentSeg.guardrailLeft) {
-      // Сторона определяется по центру автомобиля относительно оси отбойника, чтобы исключить выброс наружу с поребрика
-      const wasInside = prevPlayerX >= -railCenter;
-      if (wasInside && state.playerX - visualHalfCarW < -railInnerEdge) {
-        state.playerX = -railInnerEdge + visualHalfCarW;
-        if (state.playerVX < 0) state.playerVX = Math.abs(state.playerVX) * 0.35;
-        state.speed *= Math.pow(0.84, dt * 6);
-        state.impactShake = Math.max(state.impactShake, 0.22);
-        if (Math.abs(state.speed) > 35) {
-          spawnParticles(anchors.rearCenterX - carHalfScreenW, anchors.rearCenterY, 2, '#ffbe0b', 110, 70, [2, 4], [0.15, 0.32]);
-          if (state.guardrailSoundCooldown <= 0) {
-            state.guardrailSoundCooldown = 0.14;
-            audio.playGuardrailScrape();
-          }
-        }
-      } else if (!wasInside && state.playerX + visualHalfCarW > -railOuterEdge) {
-        state.playerX = -railOuterEdge - visualHalfCarW;
-        if (state.playerVX > 0) state.playerVX = -Math.abs(state.playerVX) * 0.35;
-        state.speed *= Math.pow(0.84, dt * 6);
-      }
-    }
+    for (const side of [-1, 1]) {
+      const hasRail = side < 0 ? currentSeg.guardrailLeft : currentSeg.guardrailRight;
+      if (!hasRail) continue;
 
-    if (currentSeg.guardrailRight) {
-      const wasInside = prevPlayerX <= railCenter;
-      if (wasInside && state.playerX + visualHalfCarW > railInnerEdge) {
-        state.playerX = railInnerEdge - visualHalfCarW;
-        if (state.playerVX > 0) state.playerVX = -Math.abs(state.playerVX) * 0.35;
+      const wasInside = side * prevPlayerX <= railCenter;
+      if (wasInside && side * state.playerX + visualHalfCarW > railInnerEdge) {
+        state.playerX = side * (railInnerEdge - visualHalfCarW);
+        if (side * state.playerVX > 0) {
+          state.playerVX = -side * Math.abs(state.playerVX) * 0.35;
+        }
         state.speed *= Math.pow(0.84, dt * 6);
-        state.impactShake = Math.max(state.impactShake, 0.22);
+        const scrapeIntensity = MathUtil.clamp(Math.abs(state.speed) / (MAX_SPEED * 0.5), 0, 1);
+        state.impactShake = Math.max(state.impactShake, 0.22 * scrapeIntensity);
         if (Math.abs(state.speed) > 35) {
-          spawnParticles(anchors.rearCenterX + carHalfScreenW, anchors.rearCenterY, 2, '#ffbe0b', 110, 70, [2, 4], [0.15, 0.32]);
+          if (Math.random() < Math.min(1, 0.9 * step60)) {
+            spawnParticles(
+              anchors.rearCenterX + side * carHalfScreenW,
+              anchors.rearCenterY,
+              2,
+              '#ffbe0b',
+              110,
+              70,
+              [2, 4],
+              [0.15, 0.32]
+            );
+          }
           if (state.guardrailSoundCooldown <= 0) {
             state.guardrailSoundCooldown = 0.14;
             audio.playGuardrailScrape();
           }
         }
-      } else if (!wasInside && state.playerX - visualHalfCarW < railOuterEdge) {
-        state.playerX = railOuterEdge + visualHalfCarW;
-        if (state.playerVX < 0) state.playerVX = Math.abs(state.playerVX) * 0.35;
-        state.speed *= Math.pow(0.84, dt * 6);
       }
     }
   }
@@ -616,12 +648,13 @@ export function updateSimulation(dt) {
   const targetSteerVisual = Math.abs(state.speed) > 15 ? steerDir * steerVisualScale : 0;
   state.steerVisual = MathUtil.lerp(state.steerVisual, targetSteerVisual, Math.min(1, dt * 11));
 
-  // 4. Перемещение по трассе, следы торможения и дым из-под колес
+  // 4. Перемещение по трассе, следы торможения и дым из-под колёс
   const deltaZ = state.speed * dt;
-  state.position = (((state.position + deltaZ) % trackLength) + trackLength) % trackLength;
-
   const prevNetForwardZ = state.netForwardZ;
-  state.netForwardZ += deltaZ;
+  const prevProgressZ = state.playerProgressZ;
+  const oldPlayerSeg = currentSeg;
+
+  shiftPlayerZ(deltaZ, trackLength);
 
   // Привязываем следы непосредственно к пятну контакта задних шин 3D-модели
   const rearAxleCamZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z - PLAYER_LEN_Z * 0.38;
@@ -642,7 +675,8 @@ export function updateSimulation(dt) {
         1
       );
 
-      const exactPuffs = 0.35 + smokeRatio * 3.15;
+      // Частотно-независимая генерация дыма (идентично 60 FPS на любых экранах)
+      const exactPuffs = (0.35 + smokeRatio * 3.15) * step60;
       const basePuffs = Math.floor(exactPuffs);
       const extraPuffChance = exactPuffs - basePuffs;
 
@@ -688,12 +722,11 @@ export function updateSimulation(dt) {
     state.prevSkidSample = null;
   }
 
-  const oldPlayerSeg = currentSeg;
-  const newPlayerSeg = findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z);
   if (currentSeg && state.speed !== 0) {
     const signedSpeedRatio = state.speed / MAX_SPEED;
     const curveScroll = currentSeg.curve * signedSpeedRatio * dt;
-    state.skyOffset = (state.skyOffset + curveScroll * 0.08) % 1;
+    // Период 2 для skyOffset обеспечивает бесшовный цикл и для солнца (период 1), и для звёзд (0.5x -> период 2)
+    state.skyOffset = (state.skyOffset + curveScroll * 0.08) % 2;
     state.hillOffset = (state.hillOffset + curveScroll * 0.22) % 1;
     state.cityOffset = (state.cityOffset + curveScroll * 0.44) % 1;
   }
@@ -701,13 +734,235 @@ export function updateSimulation(dt) {
   const currentKmh = Math.round((Math.abs(state.speed) / MAX_SPEED) * BASE_MAX_KMH);
   if (state.speed > 0 && currentKmh > state.maxKmhReached) state.maxKmhReached = currentKmh;
 
+  // 5. Обновление трафика / соперников
+  maintainTrafficDensity();
+  updateTrafficOnly(dt, true);
+
+  // 6. Непрерывные (swept) коллизии с машинами (отскок пропорционален скорости контакта)
+  let playerWorldZ = getPlayerWorldZ();
+  const collisionCenterSeg = findSegment(playerWorldZ);
+  if (collisionCenterSeg) {
+    const scanSpan = Math.max(3, Math.ceil((Math.abs(state.speed) * dt + MAX_SPEED * dt) / SEGMENT_LENGTH) + 2);
+    _checkedCars.clear();
+    for (let offset = -scanSpan; offset <= scanSpan; offset++) {
+      const segIdx = (collisionCenterSeg.index + offset + segments.length) % segments.length;
+      const seg = segments[segIdx];
+      for (let i = 0; i < seg.cars.length; i++) {
+        const car = seg.cars[i];
+        if (_checkedCars.has(car)) continue;
+        _checkedCars.add(car);
+
+        const baseBlockDistZ = ((PLAYER_LEN_Z + (car.lenZ || SEGMENT_LENGTH * 1.3)) * 0.5) * 0.88;
+        const dz = getShortestTrackDz(playerWorldZ, car.z, trackLength);
+        const relVelZ = state.speed - car.speed * car.dir;
+        const prevDz = dz + relVelZ * dt;
+        const minDz = Math.min(prevDz, dz);
+        const maxDz = Math.max(prevDz, dz);
+
+        if (maxDz > -baseBlockDistZ && minDz < baseBlockDistZ) {
+          const carNormX = car.x / ROAD_WIDTH;
+          if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, carNormX, car.w, 0.90)) {
+            const dx = state.playerX - carNormX;
+            const combinedHalfW = (PLAYER_WIDTH_NORM + car.w) * 0.5;
+            const overlapRatio = Math.abs(dx) / Math.max(0.01, combinedHalfW);
+            const pushSign = dx >= 0 ? 1 : -1;
+            const wasAhead = prevDz > 12;
+
+            // Масштабирование отскока, тряски и искр пропорционально реальной скорости удара
+            const absRelVelZ = Math.abs(relVelZ);
+            const longBounceScale = MathUtil.clamp(absRelVelZ / (MAX_SPEED * 0.55), 0, 1.25);
+            const sideBounceScale = MathUtil.clamp(
+              Math.max(Math.abs(state.speed), absRelVelZ) / (MAX_SPEED * 0.55),
+              0,
+              1.15
+            );
+
+            if (car.isRival) {
+              const isRivalRearBump =
+                overlapRatio < 0.72 &&
+                (prevDz >= baseBlockDistZ * 0.78 || (dz > baseBlockDistZ * 0.55 && state.speed > car.speed));
+              const isRivalBackingHit =
+                overlapRatio < 0.72 &&
+                (prevDz <= -baseBlockDistZ * 0.78 || dz < -baseBlockDistZ * 0.55) &&
+                state.speed < 0;
+
+              if (isRivalRearBump) {
+                const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
+                shiftPlayerZ(-penetration, trackLength);
+                playerWorldZ = getPlayerWorldZ();
+              } else if (isRivalBackingHit) {
+                const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
+                shiftPlayerZ(penetration, trackLength);
+                playerWorldZ = getPlayerWorldZ();
+                state.speed = 0;
+              } else {
+                const minSepX = combinedHalfW * 0.92;
+                state.playerX = MathUtil.clamp(carNormX + pushSign * minSepX, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
+              }
+
+              if (car.hitCooldown <= 0) {
+                const activeScale = (isRivalRearBump || isRivalBackingHit) ? longBounceScale : sideBounceScale;
+                car.hitCooldown = 0.35;
+                state.impactShake = Math.max(state.impactShake, 0.65 * MathUtil.clamp(activeScale, 0.12, 1.0));
+                audio.playCrash(MathUtil.clamp(0.65 * Math.max(0.28, activeScale), 0.18, 0.85));
+
+                if (isRivalRearBump) {
+                  car.speed = Math.min(MAX_SPEED * 0.995, Math.max(car.speed, state.speed * 0.96));
+                  state.speed = Math.min(state.speed * GAME_CONFIG.circuit.rearBumpSlowdownRatio, car.speed * 0.96);
+                  state.playerVX += dx * 1.15 * longBounceScale;
+                } else if (!isRivalBackingHit) {
+                  state.speed *= GAME_CONFIG.circuit.impactSlowdownRatio;
+                  state.playerVX += pushSign * 1.05 * sideBounceScale;
+                  car.vx -= pushSign * 0.85 * sideBounceScale;
+                }
+
+                const sparkCount = Math.round(10 * MathUtil.clamp(activeScale, 0, 1));
+                if (sparkCount > 0) {
+                  spawnParticles(
+                    anchors.centerX - dx * anchors.carW * 1.3,
+                    anchors.centerY,
+                    sparkCount,
+                    '#ffbe0b',
+                    190,
+                    120,
+                    [2, 4.5],
+                    [0.2, 0.45]
+                  );
+                }
+              }
+              continue;
+            }
+
+            const impactSpeedKmh = Math.round((Math.abs(state.speed) / MAX_SPEED) * BASE_MAX_KMH);
+            const isFrontalHit = overlapRatio < 0.65;
+            const isHeadOn = car.dir === -1 && (dz > 12 || wasAhead) && isFrontalHit;
+            const isRearEnd =
+              car.dir === 1 &&
+              overlapRatio < 0.72 &&
+              (prevDz >= baseBlockDistZ * 0.78 || (dz > baseBlockDistZ * 0.55 && state.speed > car.speed));
+            const isBackingHit =
+              overlapRatio < 0.72 &&
+              (prevDz <= -baseBlockDistZ * 0.78 || dz < -baseBlockDistZ * 0.55) &&
+              state.speed < 0;
+            const hitSide = dx > 0.03 ? 'left' : (dx < -0.03 ? 'right' : 'center');
+            const hitZone = isBackingHit ? 'rear' : ((isHeadOn || isRearEnd) ? 'front' : 'side');
+
+            if (isHeadOn || isRearEnd) {
+              const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
+              shiftPlayerZ(-penetration, trackLength);
+              playerWorldZ = getPlayerWorldZ();
+              const carForwardVel = Math.max(0, car.speed * car.dir);
+              if (state.speed > carForwardVel) {
+                state.speed = isHeadOn ? 0 : carForwardVel;
+              }
+            } else if (isBackingHit) {
+              const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
+              shiftPlayerZ(penetration, trackLength);
+              playerWorldZ = getPlayerWorldZ();
+              state.speed = 0;
+            } else {
+              const minSepX = combinedHalfW * 0.92;
+              state.playerX = MathUtil.clamp(carNormX + pushSign * minSepX, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
+              if (car.dir === -1 && state.speed > 0) {
+                state.speed *= 0.72;
+              }
+            }
+
+            if (car.hitCooldown <= 0) {
+              const activeScale = (isHeadOn || isRearEnd || isBackingHit) ? longBounceScale : sideBounceScale;
+              car.hitCooldown = 1.5;
+              state.impactShake = Math.max(state.impactShake, MathUtil.clamp(activeScale, 0.14, 1.0));
+
+              if (isHeadOn) {
+                audio.playCrash(MathUtil.clamp(1.35 * Math.max(0.3, longBounceScale), 0.35, 1.35));
+                car.speed = 0;
+                car.braking = true;
+                car.damagedByPlayer = true;
+                car.targetX = car.x;
+                state.speed = 0;
+                state.playerVX += pushSign * (0.85 + overlapRatio * 0.95) * longBounceScale;
+              } else if (isRearEnd) {
+                audio.playCrash(MathUtil.clamp(1.0 * Math.max(0.25, longBounceScale), 0.25, 1.05));
+                car.braking = true;
+                car.damagedByPlayer = true;
+                car.brakeForce = MAX_SPEED * 0.65;
+                car.targetX = car.x;
+                if (car.dir === 1) {
+                  state.speed = Math.min(state.speed, Math.max(0, car.speed * 0.75));
+                }
+                state.playerVX += pushSign * Math.max(0.95, Math.abs(dx) * 1.9) * longBounceScale;
+              } else if (isBackingHit) {
+                audio.playCrash(MathUtil.clamp(0.65 * Math.max(0.25, longBounceScale), 0.18, 0.75));
+                car.braking = true;
+                car.damagedByPlayer = true;
+                car.brakeForce = MAX_SPEED * 0.65;
+                car.targetX = car.x;
+                state.speed = 0;
+                state.playerVX += dx * 1.2 * longBounceScale;
+              } else {
+                audio.playCrash(MathUtil.clamp(0.75 * Math.max(0.25, sideBounceScale), 0.20, 0.85));
+                car.braking = true;
+                car.damagedByPlayer = true;
+                car.brakeForce = MAX_SPEED * 0.65;
+                state.speed *= 0.80;
+                state.playerVX += pushSign * 1.45 * sideBounceScale;
+                car.x = MathUtil.clamp(car.x - pushSign * 120 * sideBounceScale, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
+                car.targetX = car.x;
+              }
+
+              const sparkCount = Math.round(14 * MathUtil.clamp(activeScale, 0, 1));
+              if (sparkCount > 0) {
+                spawnParticles(
+                  anchors.centerX - dx * anchors.carW * 1.3,
+                  anchors.centerY,
+                  sparkCount,
+                  '#ffbe0b',
+                  220,
+                  140,
+                  [2, 5],
+                  [0.25, 0.55]
+                );
+              }
+
+              const hitContext = { side: hitSide, zone: hitZone };
+              const isOncomingCar = car.dir === -1;
+              if (isOncomingCar) {
+                if (!isHeadOn) {
+                  if (registerCollision(1, t('goCarWrecked'), hitContext)) return;
+                } else {
+                  const instantWreckKmh = GAME_CONFIG.gameplay.headOnInstantWreckKmh;
+                  const oncomingDmg = impactSpeedKmh >= instantWreckKmh
+                    ? MAX_HARDCORE_COLLISIONS
+                    : Math.max(1, Math.floor(impactSpeedKmh / 20));
+                  const fatalMsg = impactSpeedKmh >= instantWreckKmh
+                    ? t('goHeadOnWreck', { kmh: impactSpeedKmh })
+                    : t('goCarWrecked');
+                  if (registerCollision(oncomingDmg, fatalMsg, hitContext)) return;
+                }
+              } else {
+                if (registerCollision(1, t('goCarWrecked'), hitContext)) return;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 7. Фиксация дистанции, очков, кругов и чекпоинтов по итоговой (пост-коллизионной) позиции кадра
+  const newPlayerSeg = findSegment(playerWorldZ);
+  const netFrameDz = state.netForwardZ - prevNetForwardZ;
+
   if (state.gameMode === 'circuit') {
-    state.playerProgressZ += deltaZ;
-    // Защита от накрутки одометра задним ходом в кольцевом режиме + точный перевод в метры
     if (state.netForwardZ > state.maxNetForwardZ) {
       const newForwardDelta = state.netForwardZ - state.maxNetForwardZ;
       state.maxNetForwardZ = state.netForwardZ;
       state.distanceMeters += newForwardDelta / WORLD_UNITS_PER_METER;
+    }
+
+    // Засекаем фактическое начало 1-го круга в момент пересечения линии старта (без лишних 13м решётки)
+    if (prevProgressZ < 0 && state.playerProgressZ >= 0) {
+      state.currentLapStartTime = state.raceElapsedTime;
     }
 
     if (state.playerProgressZ >= state.circuitCurrentLap * trackLength) {
@@ -728,17 +983,31 @@ export function updateSimulation(dt) {
         } else {
           audio.playCheckpoint();
         }
-        triggerGameOver(`ФИНИШ • ${state.playerRank}-Е МЕСТО!`);
+        triggerGameOver(t('goFinishPlace', { place: formatPlaceText(state.playerRank) }));
         return;
       } else {
         audio.playCheckpoint();
         if (state.circuitCurrentLap === state.circuitTotalLaps) {
-          showBanner(`ФИНАЛЬНЫЙ КРУГ! (${state.circuitCurrentLap}/${state.circuitTotalLaps})`, '#ffbe0b', 2.2);
+          showBanner(
+            t('bannerFinalLap', { lap: state.circuitCurrentLap, total: state.circuitTotalLaps }),
+            '#ffbe0b',
+            2.2
+          );
         } else {
-          showBanner(`КРУГ ${state.circuitCurrentLap} / ${state.circuitTotalLaps} • ${formatRaceTime(lapDuration)}`, '#39ff14', 2.0);
+          showBanner(
+            t('bannerLapTime', {
+              lap: state.circuitCurrentLap,
+              total: state.circuitTotalLaps,
+              time: formatRaceTime(lapDuration)
+            }),
+            '#39ff14',
+            2.0
+          );
         }
       }
     }
+
+    computeCircuitRank();
   } else {
     if (state.netForwardZ > state.maxNetForwardZ) {
       const newForwardDelta = state.netForwardZ - state.maxNetForwardZ;
@@ -750,7 +1019,7 @@ export function updateSimulation(dt) {
       state.score += metersDelta * SCORE_PER_METER * (1 + forwardSpeedRatio * 2.5) * scoreMultiplier;
     }
 
-    if (deltaZ > 0 && oldPlayerSeg && newPlayerSeg && oldPlayerSeg !== newPlayerSeg) {
+    if (netFrameDz > 0 && oldPlayerSeg && newPlayerSeg && oldPlayerSeg !== newPlayerSeg) {
       const totalSegs = segments.length;
       let stepIdx = (oldPlayerSeg.index + 1) % totalSegs;
       let safety = 0;
@@ -758,7 +1027,6 @@ export function updateSimulation(dt) {
       while (safety < 15) {
         traversedZ += SEGMENT_LENGTH;
         if (segments[stepIdx].isCheckpoint) {
-          // Устойчивый расчёт номера круга относительно координаты самого чекпоинта (исключает баг на сегменте 0)
           const lapIdx = Math.max(0, Math.round((traversedZ - stepIdx * SEGMENT_LENGTH) / trackLength));
           const isStartLineReverseExploit = stepIdx === 0 && lapIdx < 1;
           const checkpointUid = lapIdx * totalSegs + stepIdx;
@@ -772,7 +1040,7 @@ export function updateSimulation(dt) {
             state.timeLeft = Math.min(GAME_CONFIG.gameplay.maxTimeSec, state.timeLeft + bonusTime);
             state.score += GAME_CONFIG.gameplay.checkpointScoreBonus * state.checkpointsPassed;
             audio.playCheckpoint();
-            showBanner(`ЧЕКПОИНТ! +${bonusTime} СЕК`, '#00f0ff', 2.1);
+            showBanner(t('bannerCheckpoint', { sec: bonusTime }), '#00f0ff', 2.1);
           }
         }
         if (stepIdx === newPlayerSeg.index) break;
@@ -782,294 +1050,88 @@ export function updateSimulation(dt) {
     }
   }
 
-  // 5. Обновление трафика / соперников
-  maintainTrafficDensity();
-  updateTrafficOnly(dt, true);
-  if (state.gameMode === 'circuit') {
-    computeCircuitRank();
-  }
-
-  // 6. Непрерывные (swept) коллизии с машинами
-  const playerWorldZ = getPlayerWorldZ();
-  if (newPlayerSeg) {
-    const scanSpan = Math.max(3, Math.ceil((Math.abs(state.speed) * dt + MAX_SPEED * dt) / SEGMENT_LENGTH) + 2);
-    const checkedCars = new Set();
-    for (let offset = -scanSpan; offset <= scanSpan; offset++) {
-      const segIdx = (newPlayerSeg.index + offset + segments.length) % segments.length;
-      const seg = segments[segIdx];
-      for (let i = 0; i < seg.cars.length; i++) {
-        const car = seg.cars[i];
-        if (checkedCars.has(car)) continue;
-        checkedCars.add(car);
-
-        const baseBlockDistZ = ((PLAYER_LEN_Z + (car.lenZ || SEGMENT_LENGTH * 1.3)) * 0.5) * 0.88;
-        const dz = getShortestTrackDz(playerWorldZ, car.z, trackLength);
-        const relVelZ = state.speed - car.speed * car.dir;
-        const prevDz = dz + relVelZ * dt;
-        const minDz = Math.min(prevDz, dz);
-        const maxDz = Math.max(prevDz, dz);
-
-        // Проверяем пересечение отрезка движения [prevDz -> dz] с габаритом [-baseBlockDistZ, +baseBlockDistZ]
-        if (maxDz > -baseBlockDistZ && minDz < baseBlockDistZ) {
-          const carNormX = car.x / ROAD_WIDTH;
-          if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, carNormX, car.w, 0.90)) {
-            const dx = state.playerX - carNormX;
-            const combinedHalfW = (PLAYER_WIDTH_NORM + car.w) * 0.5;
-            const overlapRatio = Math.abs(dx) / Math.max(0.01, combinedHalfW);
-            const pushSign = dx >= 0 ? 1 : -1;
-            const wasAhead = prevDz > 12;
-            const wasBehind = prevDz < -28;
-
-            if (car.isRival) {
-              const isRivalRearBump = dz > 28 || (prevDz > 28 && state.speed > car.speed);
-              if (isRivalRearBump) {
-                const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
-                state.position = (((state.position - penetration) % trackLength) + trackLength) % trackLength;
-                state.playerProgressZ -= penetration;
-                state.netForwardZ -= penetration;
-              } else if ((dz < -28 || wasBehind) && state.speed < 0) {
-                const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
-                state.position = (((state.position + penetration) % trackLength) + trackLength) % trackLength;
-                state.playerProgressZ += penetration;
-                state.netForwardZ += penetration;
-                state.speed = 0;
-              } else {
-                const minSepX = combinedHalfW * 0.92;
-                state.playerX = MathUtil.clamp(carNormX + pushSign * minSepX, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
-              }
-
-              if (car.hitCooldown <= 0) {
-                car.hitCooldown = 0.35;
-                state.impactShake = 0.65;
-                audio.playCrash(0.65);
-
-                if (isRivalRearBump) {
-                  car.speed = Math.min(MAX_SPEED * 0.995, Math.max(car.speed, state.speed * 0.96));
-                  state.speed = Math.min(state.speed * GAME_CONFIG.circuit.rearBumpSlowdownRatio, car.speed * 0.96);
-                  state.playerVX += dx * 1.15;
-                } else if (dz >= -28 && !wasBehind) {
-                  state.speed *= GAME_CONFIG.circuit.impactSlowdownRatio;
-                  state.playerVX += pushSign * 1.05;
-                  car.vx -= pushSign * 0.85;
-                }
-
-                spawnParticles(
-                  anchors.centerX - dx * anchors.carW * 1.3,
-                  anchors.centerY,
-                  10,
-                  '#ffbe0b',
-                  190,
-                  120,
-                  [2, 4.5],
-                  [0.2, 0.45]
-                );
-              }
-              continue;
-            }
-
-            const impactSpeedKmh = Math.round((Math.abs(state.speed) / MAX_SPEED) * BASE_MAX_KMH);
-            const isFrontalHit = overlapRatio < 0.65;
-            const isHeadOn = car.dir === -1 && (dz > 12 || wasAhead) && isFrontalHit;
-            const isRearEnd = overlapRatio < 0.72 && (dz > 28 || (prevDz > 28 && state.speed > car.speed * car.dir));
-            const isBackingHit = overlapRatio < 0.72 && (dz < -28 || wasBehind) && state.speed < 0;
-            const hitSide = dx > 0.03 ? 'left' : (dx < -0.03 ? 'right' : 'center');
-            const hitZone = isBackingHit ? 'rear' : ((isHeadOn || isRearEnd) ? 'front' : 'side');
-
-            if (dz > 28 || isHeadOn || isRearEnd) {
-              const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ - dz));
-              state.position = (((state.position - penetration) % trackLength) + trackLength) % trackLength;
-              state.netForwardZ -= penetration;
-              const carForwardVel = Math.max(0, car.speed * car.dir);
-              if (state.speed > carForwardVel) {
-                if (isHeadOn) {
-                  state.speed = 0;
-                } else if (car.dir === -1) {
-                  state.speed *= 0.65;
-                  const minSepX = combinedHalfW * 0.94;
-                  state.playerX = MathUtil.clamp(carNormX + pushSign * minSepX, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
-                } else {
-                  state.speed = carForwardVel;
-                }
-              }
-            } else if ((dz < -28 || wasBehind) && state.speed < 0) {
-              const penetration = Math.min(baseBlockDistZ * 2.2, Math.max(0, baseBlockDistZ + dz));
-              state.position = (((state.position + penetration) % trackLength) + trackLength) % trackLength;
-              state.netForwardZ += penetration;
-              state.speed = 0;
-            } else {
-              const minSepX = combinedHalfW * 0.92;
-              state.playerX = MathUtil.clamp(carNormX + pushSign * minSepX, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
-            }
-
-            if (car.hitCooldown <= 0) {
-              car.hitCooldown = 1.5;
-              state.impactShake = 1.0;
-
-              if (isHeadOn) {
-                audio.playCrash(1.35);
-                car.speed = 0;
-                car.braking = true;
-                car.damagedByPlayer = true;
-                car.targetX = car.x;
-                state.speed = 0;
-                state.playerVX += pushSign * (0.85 + overlapRatio * 0.95);
-              } else if (isRearEnd) {
-                audio.playCrash(1.0);
-                car.braking = true;
-                car.damagedByPlayer = true;
-                car.brakeForce = MAX_SPEED * 0.65;
-                car.targetX = car.x;
-                if (car.dir === 1) {
-                  state.speed = Math.min(state.speed, Math.max(0, car.speed * 0.75));
-                }
-                state.playerVX += (dx >= 0 ? 1 : -1) * Math.max(0.95, Math.abs(dx) * 1.9);
-              } else if (isBackingHit) {
-                audio.playCrash(0.65);
-                car.braking = true;
-                car.damagedByPlayer = true;
-                car.brakeForce = MAX_SPEED * 0.65;
-                car.targetX = car.x;
-                state.speed = 0;
-                state.playerVX += dx * 1.2;
-              } else {
-                audio.playCrash(0.75);
-                car.braking = true;
-                car.damagedByPlayer = true;
-                car.brakeForce = MAX_SPEED * 0.65;
-                state.speed *= 0.80;
-                state.playerVX += pushSign * 1.45;
-                car.x = MathUtil.clamp(car.x - pushSign * 120, -ROAD_WIDTH * 0.82, ROAD_WIDTH * 0.82);
-                car.targetX = car.x;
-              }
-
-              spawnParticles(
-                anchors.centerX - dx * anchors.carW * 1.3,
-                anchors.centerY,
-                14,
-                '#ffbe0b',
-                220,
-                140,
-                [2, 5],
-                [0.25, 0.55]
-              );
-
-              const hitContext = { side: hitSide, zone: hitZone };
-              const isOncomingCar = car.dir === -1;
-              if (isOncomingCar) {
-                if (!isHeadOn) {
-                  if (registerCollision(1, 'МАШИНА РАЗБИТА!', hitContext)) return;
-                } else {
-                  const instantWreckKmh = GAME_CONFIG.gameplay.headOnInstantWreckKmh;
-                  const oncomingDmg = impactSpeedKmh >= instantWreckKmh
-                    ? MAX_HARDCORE_COLLISIONS
-                    : Math.max(1, Math.floor(impactSpeedKmh / 20));
-                  const fatalMsg = impactSpeedKmh >= instantWreckKmh
-                    ? `ЛОБОВОЙ УДАР НА ${impactSpeedKmh} КМ/Ч!`
-                    : 'МАШИНА РАЗБИТА!';
-                  if (registerCollision(oncomingDmg, fatalMsg, hitContext)) return;
-                }
-              } else {
-                if (registerCollision(1, 'МАШИНА РАЗБИТА!', hitContext)) return;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // 7. Коллизии с придорожными объектами (с точной swept-проверкой дистанции по Z)
-  if (newPlayerSeg && state.spriteHitCooldown <= 0) {
+  // 8. Коллизии с придорожными объектами (быстрое отсечение на асфальте + swept-проверка по Z)
+  if (newPlayerSeg && state.spriteHitCooldown <= 0 && Math.abs(state.playerX) > 1.05) {
     const totalSegs = segments.length;
-    const segIndicesToCheck = [];
-    const visitedSegs = new Set();
+    _segIndicesToCheck.length = 0;
+    _visitedSegs.clear();
 
     const addCandidateSeg = (idx) => {
       const wrapped = ((idx % totalSegs) + totalSegs) % totalSegs;
-      if (!visitedSegs.has(wrapped)) {
-        visitedSegs.add(wrapped);
-        segIndicesToCheck.push(wrapped);
+      if (!_visitedSegs.has(wrapped)) {
+        _visitedSegs.add(wrapped);
+        _segIndicesToCheck.push(wrapped);
       }
     };
 
-    if (oldPlayerSeg && deltaZ > 0) {
+    if (oldPlayerSeg && netFrameDz !== 0) {
+      const dirStep = netFrameDz > 0 ? 1 : -1;
       let idx = oldPlayerSeg.index;
       let safety = 0;
       while (safety < 15) {
         addCandidateSeg(idx);
         if (idx === newPlayerSeg.index) break;
-        idx = (idx + 1) % totalSegs;
-        safety++;
-      }
-    } else if (oldPlayerSeg && deltaZ < 0) {
-      let idx = oldPlayerSeg.index;
-      let safety = 0;
-      while (safety < 15) {
-        addCandidateSeg(idx);
-        if (idx === newPlayerSeg.index) break;
-        idx = (idx - 1 + totalSegs) % totalSegs;
+        idx = (idx + dirStep + totalSegs) % totalSegs;
         safety++;
       }
     } else {
       addCandidateSeg(newPlayerSeg.index);
     }
 
-    // Проверяем соседние сегменты на случай касания бампером границы сегмента
     addCandidateSeg(newPlayerSeg.index - 1);
     addCandidateSeg(newPlayerSeg.index + 1);
 
     const spriteHalfZ = PLAYER_LEN_Z * 0.45;
     let hitResolved = false;
 
-    for (let s = 0; s < segIndicesToCheck.length && !hitResolved; s++) {
-      const seg = segments[segIndicesToCheck[s]];
+    for (let s = 0; s < _segIndicesToCheck.length && !hitResolved; s++) {
+      const seg = segments[_segIndicesToCheck[s]];
       if (!seg.sprites.length) continue;
 
-      // Проверяем реальное продольное пересечение автомобиля с координатой спрайта seg.p1.world.z
       const dzCurr = getShortestTrackDz(playerWorldZ, seg.p1.world.z, trackLength);
-      const dzPrev = dzCurr + deltaZ;
+      const dzPrev = dzCurr + netFrameDz;
       const minSpriteDz = Math.min(dzCurr, dzPrev);
       const maxSpriteDz = Math.max(dzCurr, dzPrev);
       if (maxSpriteDz <= -spriteHalfZ || minSpriteDz >= spriteHalfZ) continue;
 
       for (let i = 0; i < seg.sprites.length; i++) {
         const sp = seg.sprites[i];
-        let hitTargets = [{ offset: sp.offset, width: 0.08 }];
-        if (sp.type === 'billboard') {
-          hitTargets = [{ offset: sp.offset, width: 0.24 }];
-        } else if (sp.type === 'start_arch' || sp.type === 'checkpoint_arch') {
-          hitTargets = [
-            { offset: -ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 },
-            { offset:  ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 }
-          ];
-        } else if (sp.type === 'chevron_left' || sp.type === 'chevron_right') {
-          hitTargets = [{ offset: sp.offset, width: 0.12 }];
-        } else if (sp.type === 'palm') {
-          hitTargets = [{ offset: sp.offset, width: 0.08 }];
-        } else if (sp.type === 'lamp') {
-          hitTargets = [{ offset: sp.offset, width: 0.06 }];
-        }
+        let collidedOffset = null;
+        let collidedWidth = 0;
 
-        let collidedTarget = null;
-        for (let t = 0; t < hitTargets.length; t++) {
-          if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, hitTargets[t].offset, hitTargets[t].width, 0.90)) {
-            collidedTarget = hitTargets[t];
-            break;
+        if (sp.type === 'start_arch' || sp.type === 'checkpoint_arch') {
+          for (let t = 0; t < ARCH_HIT_TARGETS.length; t++) {
+            const target = ARCH_HIT_TARGETS[t];
+            if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, target.offset, target.width, 0.90)) {
+              collidedOffset = target.offset;
+              collidedWidth = target.width;
+              break;
+            }
+          }
+        } else {
+          const hitW = SPRITE_HITBOX_WIDTHS[sp.type] || 0.08;
+          if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, sp.offset, hitW, 0.90)) {
+            collidedOffset = sp.offset;
+            collidedWidth = hitW;
           }
         }
 
-        if (collidedTarget) {
+        if (collidedOffset !== null) {
           hitResolved = true;
+          const obsBounce = MathUtil.clamp(Math.abs(state.speed) / (MAX_SPEED * 0.55), 0, 1.15);
           state.spriteHitCooldown = 0.45;
-          state.impactShake = 0.95;
-          audio.playCrash(1.0);
+          state.impactShake = Math.max(state.impactShake, 0.95 * MathUtil.clamp(obsBounce, 0.14, 1.0));
+          audio.playCrash(MathUtil.clamp(1.0 * Math.max(0.25, obsBounce), 0.20, 1.05));
 
-          const pushSign = state.playerX >= collidedTarget.offset ? 1 : -1;
-          const minSep = (PLAYER_WIDTH_NORM + collidedTarget.width) * 0.52;
-          state.playerX = MathUtil.clamp(collidedTarget.offset + pushSign * minSep, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
-          state.playerVX = pushSign * 1.1;
+          const pushSign = state.playerX >= collidedOffset ? 1 : -1;
+          const minSep = (PLAYER_WIDTH_NORM + collidedWidth) * 0.52;
+          state.playerX = MathUtil.clamp(collidedOffset + pushSign * minSep, -PLAYER_MAX_LATERAL_X, PLAYER_MAX_LATERAL_X);
+          state.playerVX = pushSign * 1.1 * obsBounce;
 
-          spawnParticles(anchors.centerX, anchors.centerY, 14, '#ffbe0b', 220, 140, [2, 5], [0.25, 0.55]);
+          const sparkCount = Math.round(14 * MathUtil.clamp(obsBounce, 0, 1));
+          if (sparkCount > 0) {
+            spawnParticles(anchors.centerX, anchors.centerY, sparkCount, '#ffbe0b', 220, 140, [2, 5], [0.25, 0.55]);
+          }
 
           if (state.gameMode === 'circuit') {
             state.speed *= GAME_CONFIG.circuit.obstacleSlowdownRatio;
@@ -1087,11 +1149,11 @@ export function updateSimulation(dt) {
                   )
                 );
             const fatalReason = impactKmh >= instantObstacleKmh
-              ? `РАЗБИЛСЯ О ПРЕПЯТСТВИЕ НА ${impactKmh} КМ/Ч!`
-              : 'МАШИНА РАЗБИТА!';
+              ? t('goObstacleWreck', { kmh: impactKmh })
+              : t('goCarWrecked');
             const obstacleHitContext = {
               side: pushSign > 0 ? 'left' : 'right',
-              zone: deltaZ < 0 ? 'rear' : 'front'
+              zone: netFrameDz < 0 ? 'rear' : 'front'
             };
             if (registerCollision(obstacleDmg, fatalReason, obstacleHitContext)) return;
           }
@@ -1101,7 +1163,7 @@ export function updateSimulation(dt) {
     }
   }
 
-  // 8. Камера и звук
+  // 9. Камера и звук
   updateCameraDynamics(dt, newPlayerSeg);
   audio.update(
     Math.abs(state.speed) / MAX_SPEED,

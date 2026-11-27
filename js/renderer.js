@@ -27,14 +27,65 @@ const ARCH_TOWER_OFFSET_NORM = 1.28;
 // Коэффициент сохранения визуального размера придорожных спрайтов без искажения от динамического FOV
 const SPRITE_SCALE_RATIO = 0.84;
 
+// Безопасные ближние плоскости отсечения по Z (устраняют взрыв масштаба и 1-кадровые полосы-артефакты)
+const MIN_SAMPLE_CAM_Z = 24;
+const MIN_GUARDRAIL_CAM_Z = 80;
+const MIN_SPRITE_CAM_Z = 120;
+const MIN_CAR_CAM_Z = 160;
+
 // Кэш повторяемых слоёв фона (горы и город) для снижения нагрузки на CPU
 const MOUNTAIN_TILE_W = 480;
 const MOUNTAIN_TILE_H = 104;
 const CITY_TILE_W = 640;
 const CITY_TILE_H = 104;
 
+// Постоянные массивы разметки и колей (без пересоздания в каждом сегменте)
+const GROOVES_ONCOMING = [-0.66, -0.23, 0.23, 0.66];
+const GROOVES_CIRCUIT = [-0.45, 0.45];
+const GROOVES_ONEWAY = [-0.64, 0, 0.64];
+const LANES_ONCOMING = [-0.45, 0.45];
+const LANES_CIRCUIT = [0];
+const LANES_ONEWAY = [-0.33, 0.33];
+const WHEEL_SIDES = [-WHEEL_TRACK_OFFSET, WHEEL_TRACK_OFFSET];
+
+// Профили 3D-кузовов по типам машин
+const CAR_BODY_PROFILES = {
+  coupe: { tCR: 0.18, tRR: 0.30, tRF: 0.64, tCF: 0.76, roofHalfFrac: 0.315, tAxleNear: 0.22, tAxleFar: 0.82, dtWheel: 0.086, wheelRFrac: 0.215 },
+  sport: { tCR: 0.16, tRR: 0.28, tRF: 0.62, tCF: 0.75, roofHalfFrac: 0.300, tAxleNear: 0.22, tAxleFar: 0.82, dtWheel: 0.088, wheelRFrac: 0.215 },
+  sedan: { tCR: 0.16, tRR: 0.26, tRF: 0.67, tCF: 0.78, roofHalfFrac: 0.330, tAxleNear: 0.21, tAxleFar: 0.82, dtWheel: 0.084, wheelRFrac: 0.210 },
+  van:   { tCR: 0.07, tRR: 0.13, tRF: 0.82, tCF: 0.91, roofHalfFrac: 0.360, tAxleNear: 0.21, tAxleFar: 0.81, dtWheel: 0.078, wheelRFrac: 0.175 }
+};
+
+// Слои полутени для мягкого режима освещения (без нагрузки от ctx.filter)
+const SOFT_SHADOW_LAYERS = [
+  { wPad: 0.095, rExt: 0.085, fExt: 0.090, round: 0.17, color: 'rgba(7, 2, 18, 0.05)' },
+  { wPad: 0.058, rExt: 0.055, fExt: 0.058, round: 0.15, color: 'rgba(7, 2, 18, 0.07)' },
+  { wPad: 0.028, rExt: 0.028, fExt: 0.030, round: 0.13, color: 'rgba(7, 2, 18, 0.10)' },
+  { wPad: 0.004, rExt: 0.008, fExt: 0.008, round: 0.11, color: 'rgba(7, 2, 18, 0.14)' },
+  { wPad: -0.022, rExt: -0.018, fExt: -0.018, round: 0.09, color: 'rgba(7, 2, 18, 0.20)' }
+];
+
+const SOFT_SHADOW_FAR_LAYERS = [
+  { wPad: 0.055, rExt: 0.045, fExt: 0.050, round: 0.14, color: 'rgba(7, 2, 18, 0.14)' },
+  { wPad: -0.005, rExt: 0.000, fExt: 0.000, round: 0.10, color: 'rgba(7, 2, 18, 0.28)' }
+];
+
+// Кэши строк цветов для тумана и следов торможения (0 аллокаций в renderSegment)
+const FOG_COLOR_CACHE = Array.from({ length: 101 }, (_, i) => `rgba(26, 9, 52, ${(i / 100).toFixed(2)})`);
+const SKID_COLOR_CACHE = Array.from({ length: 101 }, (_, i) => `rgba(7, 5, 14, ${(i / 100).toFixed(2)})`);
+
 let mountainTileCanvas = null;
 let cityTileCanvas = null;
+
+const particleColorCache = new Map();
+const softParticleSpriteCache = new Map();
+const SOFT_PARTICLE_TEX_SIZE = 48;
+
+// Переиспользуемые буферы кадра (устраняют ежекадровые аллокации в renderFrame)
+const _foregroundCars = [];
+const _foregroundArchBeams = [];
+const _segArchBeams = [];
+const _segCarsScratch = [];
 
 /**
  * Однократная генерация тайлов гор и неонового города в offscreen-канвасах
@@ -116,8 +167,8 @@ function project(p, cameraX, cameraY, cameraZ, cameraDepth, width, height, roadW
   p.camera.y = (p.world.y || 0) - cameraY;
   p.camera.z = (p.world.z || 0) - cameraZ;
   p.screen.scale = cameraDepth / Math.max(1, p.camera.z);
-  p.screen.x = (width / 2) + (p.screen.scale * p.camera.x * PROJ_HALF_WIDTH);
-  p.screen.y = (height / 2) + pitchOffset - (p.screen.scale * p.camera.y * height / 2);
+  p.screen.x = (width * 0.5) + (p.screen.scale * p.camera.x * PROJ_HALF_WIDTH);
+  p.screen.y = (height * 0.5) + pitchOffset - (p.screen.scale * p.camera.y * height * 0.5);
   p.screen.w = p.screen.scale * roadWidth * PROJ_HALF_WIDTH;
 }
 
@@ -131,13 +182,12 @@ function sampleRoadAtZ(worldZ) {
   const camX = MathUtil.lerp(seg.p1.camera.x, seg.p2.camera.x, t);
   const camY = MathUtil.lerp(seg.p1.camera.y, seg.p2.camera.y, t);
   const camZ = MathUtil.lerp(seg.p1.camera.z, seg.p2.camera.z, t);
-  if (camZ <= state.activeCameraDepth * 0.35) return null;
+  if (camZ <= MIN_SAMPLE_CAM_Z) return null;
 
-  const safeCamZ = Math.max(state.activeCameraDepth * 0.65, camZ);
-  const scale = state.activeCameraDepth / safeCamZ;
+  const scale = state.activeCameraDepth / camZ;
   return {
-    camZ: camZ,
-    scale: scale,
+    camZ,
+    scale,
     roadCenterX: (state.logicalWidth * 0.5) + scale * camX * PROJ_HALF_WIDTH,
     roadY: (LOGICAL_HEIGHT * 0.5) + state.cameraPitch - scale * camY * (LOGICAL_HEIGHT * 0.5),
     clipY: seg.clip
@@ -226,8 +276,8 @@ function renderBackground(ctx) {
 }
 
 function renderPolygon(ctx, x1, y1, x2, y2, x3, y3, x4, y4, color) {
-  const by1 = y1 + 0.65;
-  const by2 = y2 + 0.65;
+  const by1 = y1 + 0.55;
+  const by2 = y2 + 0.55;
   ctx.fillStyle = color;
   ctx.beginPath();
   ctx.moveTo(x1, by1);
@@ -291,53 +341,33 @@ function fillRoundedQuad(ctx, x1, y1, x2, y2, x3, y3, x4, y4, roundFrac, color) 
   ctx.fill();
 }
 
-// Слои полутени для мягкого режима освещения (без нагрузки от ctx.filter)
-const SOFT_SHADOW_LAYERS = [
-  { wPad: 0.120, rPad: 0.060, fPad: 0.045, round: 0.34, color: 'rgba(7, 2, 18, 0.05)' },
-  { wPad: 0.075, rPad: 0.038, fPad: 0.030, round: 0.30, color: 'rgba(7, 2, 18, 0.07)' },
-  { wPad: 0.038, rPad: 0.020, fPad: 0.016, round: 0.26, color: 'rgba(7, 2, 18, 0.10)' },
-  { wPad: 0.008, rPad: 0.006, fPad: 0.006, round: 0.22, color: 'rgba(7, 2, 18, 0.14)' },
-  { wPad: -0.025, rPad: -0.014, fPad: -0.008, round: 0.18, color: 'rgba(7, 2, 18, 0.20)' }
-];
-
-const SOFT_SHADOW_FAR_LAYERS = [
-  { wPad: 0.065, rPad: 0.032, fPad: 0.025, round: 0.28, color: 'rgba(7, 2, 18, 0.14)' },
-  { wPad: -0.010, rPad: 0.000, fPad: 0.000, round: 0.20, color: 'rgba(7, 2, 18, 0.28)' }
-];
-
-const particleColorCache = new Map();
-
 /**
- * Разбор цвета частицы (#hex или rgba) для плавных мягких градиентов
+ * Разбор цвета частицы (#hex или rgba) для плавных мягких спрайтов
  */
 function parseParticleColor(color) {
   const cached = particleColorCache.get(color);
   if (cached) return cached;
 
-  let parsed = { r: 220, g: 220, b: 230, a: 0.7, isLuminous: false };
+  let parsed = { r: 220, g: 220, b: 230, a: 0.7, isLuminous: false, spriteKey: '220,220,230,0' };
   if (typeof color === 'string') {
     if (color.startsWith('#') && color.length === 7) {
       const num = parseInt(color.slice(1), 16);
       if (!Number.isNaN(num)) {
         const lower = color.toLowerCase();
-        parsed = {
-          r: (num >> 16) & 255,
-          g: (num >> 8) & 255,
-          b: num & 255,
-          a: 1.0,
-          isLuminous: lower === '#ffbe0b' || lower === '#ff7b00'
-        };
+        const r = (num >> 16) & 255;
+        const g = (num >> 8) & 255;
+        const b = num & 255;
+        const isLuminous = lower === '#ffbe0b' || lower === '#ff7b00';
+        parsed = { r, g, b, a: 1.0, isLuminous, spriteKey: `${r},${g},${b},${isLuminous ? 1 : 0}` };
       }
     } else if (color.startsWith('rgba(') || color.startsWith('rgb(')) {
       const m = color.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/);
       if (m) {
-        parsed = {
-          r: Math.round(Number(m[1])),
-          g: Math.round(Number(m[2])),
-          b: Math.round(Number(m[3])),
-          a: m[4] !== undefined ? Number(m[4]) : 1.0,
-          isLuminous: false
-        };
+        const r = Math.round(Number(m[1]));
+        const g = Math.round(Number(m[2]));
+        const b = Math.round(Number(m[3]));
+        const a = m[4] !== undefined ? Number(m[4]) : 1.0;
+        parsed = { r, g, b, a, isLuminous: false, spriteKey: `${r},${g},${b},0` };
       }
     }
   }
@@ -347,6 +377,44 @@ function parseParticleColor(color) {
   }
   particleColorCache.set(color, parsed);
   return parsed;
+}
+
+/**
+ * Кэшированный offscreen-спрайт мягкой радиальной частицы (заменяет сотни createRadialGradient/кадр)
+ */
+function getSoftParticleSprite(c) {
+  let sprite = softParticleSpriteCache.get(c.spriteKey);
+  if (sprite) return sprite;
+
+  const size = SOFT_PARTICLE_TEX_SIZE;
+  const half = size * 0.5;
+  const off = document.createElement('canvas');
+  off.width = size;
+  off.height = size;
+  const octx = off.getContext('2d');
+  if (octx) {
+    const grad = octx.createRadialGradient(half, half, half * 0.07, half, half, half);
+    if (c.isLuminous) {
+      grad.addColorStop(0.0, 'rgba(255, 253, 232, 0.96)');
+      grad.addColorStop(0.32, `rgba(${c.r}, ${c.g}, ${c.b}, 0.72)`);
+      grad.addColorStop(0.70, `rgba(${c.r}, ${Math.round(c.g * 0.55)}, 0, 0.22)`);
+      grad.addColorStop(1.0, `rgba(${c.r}, ${Math.round(c.g * 0.4)}, 0, 0.0)`);
+    } else {
+      grad.addColorStop(0.0, `rgba(${c.r}, ${c.g}, ${c.b}, 0.92)`);
+      grad.addColorStop(0.45, `rgba(${c.r}, ${c.g}, ${c.b}, 0.46)`);
+      grad.addColorStop(1.0, `rgba(${c.r}, ${c.g}, ${c.b}, 0.0)`);
+    }
+    octx.fillStyle = grad;
+    octx.beginPath();
+    octx.arc(half, half, half, 0, Math.PI * 2);
+    octx.fill();
+  }
+
+  if (softParticleSpriteCache.size > 64) {
+    softParticleSpriteCache.clear();
+  }
+  softParticleSpriteCache.set(c.spriteKey, off);
+  return off;
 }
 
 /**
@@ -389,9 +457,11 @@ function renderSegment(ctx, seg, fogAlpha = 0) {
   const x2 = seg.p2.screen.x;
   const y2 = seg.p2.screen.y;
   const w2 = seg.p2.screen.w;
+  const sliceH = y1 - y2;
 
+  // Заливаем траву строго от y2 вверх на 0.5px до y1 (без затирания уже нарисованного ближнего полотна)
   ctx.fillStyle = seg.color.grass;
-  ctx.fillRect(-40, y2, LOGICAL_WIDTH + 80, Math.max(1, y1 - y2 + 1.2));
+  ctx.fillRect(-40, y2 - 0.5, LOGICAL_WIDTH + 80, sliceH + 0.5);
 
   const r1 = w1 * 0.15;
   const r2 = w2 * 0.15;
@@ -423,8 +493,8 @@ function renderSegment(ctx, seg, fogAlpha = 0) {
   renderPolygon(ctx, x1 - w1, y1, x1 + w1, y1, x2 + w2, y2, x2 - w2, y2, seg.color.road);
 
   const grooveCenters = state.gameMode === 'oncoming'
-    ? [-0.66, -0.23, 0.23, 0.66]
-    : (state.gameMode === 'circuit' ? [-0.45, 0.45] : [-0.64, 0, 0.64]);
+    ? GROOVES_ONCOMING
+    : (state.gameMode === 'circuit' ? GROOVES_CIRCUIT : GROOVES_ONEWAY);
   const gw1 = w1 * 0.13;
   const gw2 = w2 * 0.13;
   for (let g = 0; g < grooveCenters.length; g++) {
@@ -439,62 +509,42 @@ function renderSegment(ctx, seg, fogAlpha = 0) {
     );
   }
 
-  const edgeW1 = Math.max(1.5, w1 * 0.026);
-  const edgeW2 = Math.max(1.4, w2 * 0.026);
+  const edgeW1 = w1 * 0.026;
+  const edgeW2 = w2 * 0.026;
   renderPolygon(ctx, x1 - w1, y1, x1 - w1 + edgeW1, y1, x2 - w2 + edgeW2, y2, x2 - w2, y2, seg.color.edge);
   renderPolygon(ctx, x1 + w1 - edgeW1, y1, x1 + w1, y1, x2 + w2, y2, x2 + w2 - edgeW2, y2, seg.color.edge);
 
   if (state.gameMode === 'oncoming') {
-    const divW1 = Math.max(1.6, w1 * 0.021);
-    const divW2 = Math.max(1.5, w2 * 0.021);
-    const divGap1 = Math.max(2.6, w1 * 0.035);
-    const divGap2 = Math.max(2.3, w2 * 0.035);
+    const divW1 = w1 * 0.017;
+    const divW2 = w2 * 0.017;
+    const divGap1 = w1 * 0.032;
+    const divGap2 = w2 * 0.032;
     renderPolygon(ctx, x1 - divGap1 - divW1, y1, x1 - divGap1 + divW1, y1, x2 - divGap2 + divW2, y2, x2 - divGap2 - divW2, y2, '#ffbe0b');
     renderPolygon(ctx, x1 + divGap1 - divW1, y1, x1 + divGap1 + divW1, y1, x2 + divGap2 + divW2, y2, x2 + divGap2 - divW2, y2, '#ffbe0b');
 
     if (seg.color.lane) {
-      const lw1 = Math.max(1.8, w1 * 0.024);
-      const lw2 = Math.max(1.6, w2 * 0.024);
-      for (const laneNorm of [-0.45, 0.45]) {
+      const lw1 = w1 * 0.018;
+      const lw2 = w2 * 0.018;
+      for (let i = 0; i < LANES_ONCOMING.length; i++) {
+        const laneNorm = LANES_ONCOMING[i];
         const lx1 = x1 + w1 * laneNorm;
         const lx2 = x2 + w2 * laneNorm;
         renderPolygon(ctx, lx1 - lw1, y1, lx1 + lw1, y1, lx2 + lw2, y2, lx2 - lw2, y2, seg.color.lane);
       }
     }
   } else if (seg.color.lane) {
-    const lw1 = Math.max(1.9, w1 * 0.026);
-    const lw2 = Math.max(1.7, w2 * 0.026);
-    const lanesNorm = state.gameMode === 'circuit' ? [0] : [-0.33, 0.33];
-    for (const laneNorm of lanesNorm) {
+    const lw1 = w1 * 0.020;
+    const lw2 = w2 * 0.020;
+    const lanesNorm = state.gameMode === 'circuit' ? LANES_CIRCUIT : LANES_ONEWAY;
+    for (let i = 0; i < lanesNorm.length; i++) {
+      const laneNorm = lanesNorm[i];
       const lx1 = x1 + w1 * laneNorm;
       const lx2 = x2 + w2 * laneNorm;
       renderPolygon(ctx, lx1 - lw1, y1, lx1 + lw1, y1, lx2 + lw2, y2, lx2 - lw2, y2, seg.color.lane);
     }
   }
 
-  if (seg.skidMarks && seg.skidMarks.length > 0) {
-    for (let i = 0; i < seg.skidMarks.length; i++) {
-      const sm = seg.skidMarks[i];
-      const sx1 = MathUtil.lerp(x1, x2, sm.t1);
-      const sy1 = MathUtil.lerp(y1, y2, sm.t1);
-      const sw1 = MathUtil.lerp(w1, w2, sm.t1);
-
-      const sx2 = MathUtil.lerp(x1, x2, sm.t2);
-      const sy2 = MathUtil.lerp(y1, y2, sm.t2);
-      const sw2 = MathUtil.lerp(w1, w2, sm.t2);
-
-      const hw1 = Math.max(1.3, sw1 * WHEEL_SKID_HALF_W);
-      const hw2 = Math.max(1.1, sw2 * WHEEL_SKID_HALF_W);
-      const trackColor = `rgba(7, 5, 14, ${sm.alpha.toFixed(2)})`;
-
-      for (const wheelSide of [-WHEEL_TRACK_OFFSET, WHEEL_TRACK_OFFSET]) {
-        const cx1 = sx1 + sw1 * (sm.x1 + wheelSide);
-        const cx2 = sx2 + sw2 * (sm.x2 + wheelSide);
-        renderPolygon(ctx, cx1 - hw1, sy1, cx1 + hw1, sy1, cx2 + hw2, sy2, cx2 - hw2, sy2, trackColor);
-      }
-    }
-  }
-
+  // Линия старта/финиша и полоса чекпоинта рисуются ПОД следами шин
   if (seg.isStartFinish) {
     const cols = 12;
     const midY = (y1 + y2) * 0.5;
@@ -513,10 +563,36 @@ function renderSegment(ctx, seg, fogAlpha = 0) {
     renderPolygon(ctx, x1 - w1, y1, x1 + w1, y1, x2 + w2, y2, x2 - w2, y2, '#ffbe0b');
   }
 
-  // Дымка горизонта накладывается поверх всех элементов полотна, включая разметку и чекпоинты
-  if (fogAlpha > 0.01) {
-    ctx.fillStyle = `rgba(26, 9, 52, ${fogAlpha.toFixed(3)})`;
-    ctx.fillRect(-40, y2, LOGICAL_WIDTH + 80, Math.max(1, y1 - y2 + 1.2));
+  if (seg.skidMarks && seg.skidMarks.length > 0) {
+    for (let i = 0; i < seg.skidMarks.length; i++) {
+      const sm = seg.skidMarks[i];
+      const sx1 = MathUtil.lerp(x1, x2, sm.t1);
+      const sy1 = MathUtil.lerp(y1, y2, sm.t1);
+      const sw1 = MathUtil.lerp(w1, w2, sm.t1);
+
+      const sx2 = MathUtil.lerp(x1, x2, sm.t2);
+      const sy2 = MathUtil.lerp(y1, y2, sm.t2);
+      const sw2 = MathUtil.lerp(w1, w2, sm.t2);
+
+      const hw1 = sw1 * WHEEL_SKID_HALF_W;
+      const hw2 = sw2 * WHEEL_SKID_HALF_W;
+      const alphaIdx = MathUtil.clamp(Math.round(sm.alpha * 100), 0, 100);
+      const trackColor = sm.color || SKID_COLOR_CACHE[alphaIdx];
+
+      for (let w = 0; w < 2; w++) {
+        const wheelSide = WHEEL_SIDES[w];
+        const cx1 = sx1 + sw1 * (sm.x1 + wheelSide);
+        const cx2 = sx2 + sw2 * (sm.x2 + wheelSide);
+        renderPolygon(ctx, cx1 - hw1, sy1, cx1 + hw1, sy1, cx2 + hw2, sy2, cx2 - hw2, sy2, trackColor);
+      }
+    }
+  }
+
+  // Дымка горизонта накладывается строго в пределах высоты сегмента (без многократного наслоения)
+  if (fogAlpha > 0.01 && sliceH > 0.05) {
+    const fogIdx = MathUtil.clamp(Math.round(fogAlpha * 100), 1, 100);
+    ctx.fillStyle = FOG_COLOR_CACHE[fogIdx];
+    ctx.fillRect(-40, y2, LOGICAL_WIDTH + 80, sliceH);
   }
 }
 
@@ -527,8 +603,8 @@ function renderRoadHeadlights(ctx) {
 
   const hasDamageSystem = state.gameMode !== 'circuit';
   const flickerPhase = Math.floor(state.animClockMs / 95);
-  const rightBroken = isTotalWreck || (hasDamageSystem && (state.frontDamage >= 3 || state.rightDamage >= 3 || state.visualDamage >= 4));
-  const leftBroken = isTotalWreck || (hasDamageSystem && (state.leftDamage >= 3 || state.visualDamage >= 5));
+  const rightBroken = hasDamageSystem && (state.frontDamage >= 3 || state.rightDamage >= 3 || state.visualDamage >= 4);
+  const leftBroken = hasDamageSystem && state.leftDamage >= 3;
   const leftFlicker = !leftBroken && hasDamageSystem && (state.frontDamage >= 2 || state.leftDamage >= 2 || state.visualDamage >= 4) && (flickerPhase % 4 === 0);
   const rightFlicker = !rightBroken && hasDamageSystem && (state.frontDamage >= 1 || state.rightDamage >= 2) && (flickerPhase % 5 === 2);
   if ((leftBroken || leftFlicker) && (rightBroken || rightFlicker)) return;
@@ -542,9 +618,10 @@ function renderRoadHeadlights(ctx) {
     const effectiveCamX = (state.playerX - state.cameraLagX) * ROAD_WIDTH;
     const scale = state.activeCameraDepth / camZ;
     return {
-      scale: scale,
+      scale,
       roadCenterX: (LOGICAL_WIDTH * 0.5) + scale * (-effectiveCamX) * PROJ_HALF_WIDTH,
-      roadY: (LOGICAL_HEIGHT * 0.5) + state.cameraPitch - scale * (-CAMERA_HEIGHT) * (LOGICAL_HEIGHT * 0.5)
+      roadY: (LOGICAL_HEIGHT * 0.5) + state.cameraPitch - scale * (-CAMERA_HEIGHT) * (LOGICAL_HEIGHT * 0.5),
+      clipY: LOGICAL_HEIGHT
     };
   };
 
@@ -564,7 +641,8 @@ function renderRoadHeadlights(ctx) {
     const camZ = frontBumperCamZ + dZ;
     const s = i === 0 ? frontSample : sampleRoadAtZ(state.position + camZ);
     if (!s || s.scale <= 0) break;
-    if (i > 0 && s.roadY >= minYSoFar - 0.2) break;
+    // Прерываем луч за гребнем холма, чтобы свет фар не просвечивал сквозь рельеф
+    if (i > 0 && (s.roadY >= minYSoFar - 0.2 || s.roadY > s.clipY + 1)) break;
     minYSoFar = s.roadY;
     slices.push({ dZ, scale: s.scale, y: s.roadY });
   }
@@ -615,13 +693,11 @@ function renderRoadHeadlights(ctx) {
 
   const drawSingleHeadlight = (sideSign) => {
     if (isSoftLight) {
-      // Многослойное размытие боковых краёв конуса света без потери 60 FPS
       drawBeamPolygon(sideSign, 1.55, 1.65, 0.055, 0.028, 0.008);
       drawBeamPolygon(sideSign, 1.25, 1.28, 0.068, 0.036, 0.010);
       drawBeamPolygon(sideSign, 0.96, 0.94, 0.080, 0.042, 0.011);
       drawBeamPolygon(sideSign, 0.65, 0.56, 0.085, 0.038, 0.007);
 
-      // Мягкое световое пятно на асфальте непосредственно перед фарой
       const sl0 = slices[0];
       const poolX = (LOGICAL_WIDTH * 0.5) + sl0.scale * (bumperRelCamX + sideSign * lampLateralWorld) * PROJ_HALF_WIDTH;
       const poolR = Math.max(12, sl0.scale * carHalfWWorld * 1.05 * PROJ_HALF_WIDTH);
@@ -665,17 +741,12 @@ function renderGuardrail(ctx, seg) {
     ctx.clip();
   }
 
-  const sides = [];
-  if (seg.guardrailLeft) sides.push(-1);
-  if (seg.guardrailRight) sides.push(1);
-
   const isReflectorSeg = seg.index % 2 === 0;
   const railTopColor = isReflectorSeg ? '#ffe066' : '#f8fafc';
   const railColor = isReflectorSeg ? '#ffbe0b' : '#cbd5e1';
   const railLowerColor = isReflectorSeg ? '#ff2a85' : '#64748b';
 
-  for (let s = 0; s < sides.length; s++) {
-    const dir = sides[s];
+  const drawSideRail = (dir) => {
     const gx1 = x1 + dir * w1 * 1.15;
     const gx2 = x2 + dir * w2 * 1.15;
     const gxOuter1 = x1 + dir * w1 * 1.195;
@@ -697,7 +768,10 @@ function renderGuardrail(ctx, seg) {
     renderPolygon(ctx, gx1, beamBot1, gx1, y1 - h1 * 0.24, gx2, y2 - h2 * 0.24, gx2, beamBot2, railLowerColor);
     renderPolygon(ctx, gx1, beamTop1, gx1, beamBot1, gx2, beamBot2, gx2, beamTop2, railColor);
     renderPolygon(ctx, gx1, beamTop1, gxOuter1, beamTop1, gxOuter2, beamTop2, gx2, beamTop2, railTopColor);
-  }
+  };
+
+  if (seg.guardrailLeft) drawSideRail(-1);
+  if (seg.guardrailRight) drawSideRail(1);
 
   ctx.restore();
 }
@@ -735,13 +809,13 @@ function computeArchLayout(destX, destY, roadHalfPx, isStartFinish) {
     secondaryColor: isStartFinish ? '#ffbe0b' : '#ff2a85',
     darkFrameColor: '#120326',
     sideShadeColor: '#080114',
-    lineW: Math.max(1.2, towerW * 0.14)
+    lineW: MathUtil.clamp(towerW * 0.14, 1.2, 8.0)
   };
 }
 
 function renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, isStartFinish) {
   const L = computeArchLayout(destX, destY, roadHalfPx, isStartFinish);
-  if (L.archH < 5) return;
+  if (L.archH < 5 || destY < -40 || L.topY > LOGICAL_HEIGHT + 40) return;
 
   const shadowLen = roadHalfPx * 0.20;
   fillQuad(ctx, L.leftOuterX, destY, L.leftInnerX + L.sideDepthW, destY, L.leftInnerX + L.sideDepthW + L.towerW * 0.25, destY + shadowLen, L.leftOuterX - L.towerW * 0.15, destY + shadowLen, 'rgba(6, 2, 16, 0.45)');
@@ -836,7 +910,6 @@ function renderOverheadArchPillarsClipped(ctx, scale, destX, destY, clipY, isSta
 function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) {
   if (scale <= 0) return;
   const LOGICAL_WIDTH = state.logicalWidth;
-  // Используем истинную проекционную полуширину дороги без повторного умножения на activeCameraDepth
   const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
   const horizontalBound = roadHalfPx * 1.55;
   if (roadHalfPx < 1.2 || destX + horizontalBound < -40 || destX - horizontalBound > LOGICAL_WIDTH + 40) {
@@ -844,7 +917,8 @@ function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) 
   }
 
   const L = computeArchLayout(destX, destY, roadHalfPx, isStartFinish);
-  if (L.archH < 5) return;
+  const soffitH = Math.max(2, L.bannerH * 0.16);
+  if (L.archH < 5 || L.bannerBottomY + soffitH < -40 || L.topY > LOGICAL_HEIGHT + 40) return;
 
   ctx.save();
   if (clipY !== null && clipY !== undefined) {
@@ -857,7 +931,6 @@ function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) 
   const beamLeftX = L.leftOuterX - beamOverhang;
   const beamWidth = (L.rightOuterX + beamOverhang) - beamLeftX;
 
-  const soffitH = Math.max(2, L.bannerH * 0.16);
   fillQuad(ctx, beamLeftX, L.bannerBottomY, beamLeftX + beamWidth, L.bannerBottomY, beamLeftX + beamWidth - L.sideDepthW, L.bannerBottomY + soffitH, beamLeftX + L.sideDepthW, L.bannerBottomY + soffitH, L.sideShadeColor);
 
   ctx.fillStyle = L.darkFrameColor;
@@ -879,9 +952,8 @@ function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) 
     ctx.fillRect(beamLeftX, L.bannerBottomY - trimH, beamWidth, trimH);
   }
 
-  ctx.strokeStyle = L.accentColor;
   const rawBeaconR = L.towerW * 0.34;
-  const beaconR = Math.max(1.5, rawBeaconR);
+  const beaconR = MathUtil.clamp(rawBeaconR, 1.5, 22);
   const beaconY = L.topY - beaconR * 0.85;
   ctx.fillStyle = L.secondaryColor;
   ctx.beginPath();
@@ -902,12 +974,12 @@ function renderOverheadArchBeam(ctx, scale, destX, destY, clipY, isStartFinish) 
           [0.35, 'rgba(255, 42, 133, 0.48)'],
           [1.0, 'rgba(255, 42, 133, 0.0)']
         ];
-    const haloBaseR = Math.max(1.2, rawBeaconR);
+    const haloBaseR = MathUtil.clamp(rawBeaconR, 1.2, 22);
     drawLightHalo(ctx, L.leftTowerCenterX, beaconY, haloBaseR, L.secondaryColor, haloBaseR * 3.2, beaconSoftStops, beaconHaloFade);
     drawLightHalo(ctx, L.rightTowerCenterX, beaconY, haloBaseR, L.secondaryColor, haloBaseR * 3.2, beaconSoftStops, beaconHaloFade);
   }
 
-  if (L.bannerH >= 10) {
+  if (L.bannerH >= 10 && L.bannerH < 420) {
     const fontSize = Math.floor(L.bannerH * 0.52);
     ctx.fillStyle = isStartFinish ? '#39ff14' : '#ffffff';
     ctx.font = `900 ${fontSize}px sans-serif`;
@@ -923,13 +995,17 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
   if (scale <= 0) return;
 
   const LOGICAL_WIDTH = state.logicalWidth;
-  // Истинная полуширина дороги на экране без лишнего множителя activeCameraDepth
   const roadHalfPx = scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
   const unit = roadHalfPx * SPRITE_SCALE_RATIO;
   const isFullArch = sprite.type === 'start_arch' || sprite.type === 'checkpoint_arch';
   const horizontalBound = isFullArch ? roadHalfPx * 1.55 : unit * 1.25;
 
-  if (roadHalfPx < 1.2 || destX + horizontalBound < -40 || destX - horizontalBound > LOGICAL_WIDTH + 40) {
+  if (
+    roadHalfPx < 1.2 ||
+    destX + horizontalBound < -40 ||
+    destX - horizontalBound > LOGICAL_WIDTH + 40 ||
+    destY - unit * 1.25 > LOGICAL_HEIGHT + 40
+  ) {
     return;
   }
 
@@ -946,14 +1022,14 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
   if (isFullArch) {
     renderOverheadArchPillars(ctx, destX, destY, roadHalfPx, sprite.type === 'start_arch');
   } else if (sprite.type === 'palm') {
-    const trunkW = Math.max(2, unit * 0.055);
+    const trunkW = MathUtil.clamp(unit * 0.055, 2, 42);
     const trunkH = unit * 0.85;
     const topX = destX + (sprite.offset < 0 ? -unit * 0.06 : unit * 0.06);
     const topY = destY - trunkH;
 
     const shadowLen = unit * 0.34;
     ctx.strokeStyle = 'rgba(6, 2, 16, 0.42)';
-    ctx.lineWidth = Math.max(2, trunkW * 1.2);
+    ctx.lineWidth = MathUtil.clamp(trunkW * 1.2, 2, 48);
     ctx.beginPath();
     ctx.moveTo(destX, destY);
     ctx.lineTo(destX + shadowDirX * shadowLen * 12, destY + shadowLen);
@@ -993,14 +1069,14 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
       ctx.stroke();
     }
   } else if (sprite.type === 'lamp') {
-    const poleW = Math.max(2, unit * 0.028);
+    const poleW = MathUtil.clamp(unit * 0.028, 2, 24);
     const poleH = unit * 0.78;
     const armDir = sprite.offset < 0 ? 1 : -1;
     const armLen = unit * 0.18 * armDir;
 
     const shadowLen = unit * 0.28;
     ctx.strokeStyle = 'rgba(6, 2, 16, 0.40)';
-    ctx.lineWidth = Math.max(1.5, poleW * 1.1);
+    ctx.lineWidth = MathUtil.clamp(poleW * 1.1, 1.5, 26);
     ctx.beginPath();
     ctx.moveTo(destX, destY);
     ctx.lineTo(destX + shadowDirX * shadowLen * 10, destY + shadowLen);
@@ -1017,16 +1093,15 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
     const lampX = destX + armLen;
     const lampY = destY - poleH;
     const rawLampR = unit * 0.032;
-    const lampR = Math.max(1.4, rawLampR);
+    const lampR = MathUtil.clamp(rawLampR, 1.4, 24);
     ctx.fillStyle = '#00f0ff';
     ctx.beginPath();
     ctx.arc(lampX, lampY, lampR, 0, Math.PI * 2);
     ctx.fill();
 
-    // Ореол фонаря плавно проявляется ещё на дальней дистанции без резкого «включения» вблизи игрока
     const lampHaloFade = MathUtil.clamp((rawLampR - 0.45) / 2.6, 0, 1);
     if (lampHaloFade > 0.01) {
-      const haloBaseR = Math.max(1.1, rawLampR);
+      const haloBaseR = MathUtil.clamp(rawLampR, 1.1, 24);
       drawLightHalo(ctx, lampX, lampY, haloBaseR * 2.6, 'rgba(0, 240, 255, 0.22)', haloBaseR * 4.4, [
         [0.0, 'rgba(215, 252, 255, 0.72)'],
         [0.35, 'rgba(0, 240, 255, 0.34)'],
@@ -1056,10 +1131,10 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
     ctx.fillStyle = '#14042e';
     ctx.fillRect(bx, by, boardW, boardH);
     ctx.strokeStyle = '#ff2a85';
-    ctx.lineWidth = Math.max(1.5, unit * 0.015);
+    ctx.lineWidth = MathUtil.clamp(unit * 0.015, 1.5, 10);
     ctx.strokeRect(bx, by, boardW, boardH);
 
-    if (boardH > 12) {
+    if (boardH > 12 && boardH < 420) {
       ctx.fillStyle = '#ffbe0b';
       ctx.font = `900 ${Math.floor(boardH * 0.34)}px sans-serif`;
       ctx.textAlign = 'center';
@@ -1086,12 +1161,12 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
     ctx.fillStyle = '#140326';
     ctx.fillRect(sx, sy, signW, signH);
     ctx.strokeStyle = '#ffbe0b';
-    ctx.lineWidth = Math.max(1.2, unit * 0.012);
+    ctx.lineWidth = MathUtil.clamp(unit * 0.012, 1.2, 8);
     ctx.strokeRect(sx, sy, signW, signH);
 
     const dir = sprite.type === 'chevron_right' ? 1 : -1;
     ctx.strokeStyle = '#ff2a85';
-    ctx.lineWidth = Math.max(2, signH * 0.16);
+    ctx.lineWidth = MathUtil.clamp(signH * 0.16, 2, 18);
     ctx.beginPath();
     ctx.moveTo(destX - dir * signW * 0.18, sy + signH * 0.24);
     ctx.lineTo(destX + dir * signW * 0.18, sy + signH * 0.50);
@@ -1105,6 +1180,7 @@ function renderSprite(ctx, sprite, scale, destX, destY, clipY) {
 function render3DCar(ctx, opts) {
   const {
     isPlayer = false,
+    isParkedDetach = false,
     isRival = false,
     type = 'sport',
     dir = 1,
@@ -1128,6 +1204,7 @@ function render3DCar(ctx, opts) {
     signalElapsed = 0,
     name = '',
     num = '',
+    plate = '',
     isTotalWreck = false,
     leftLightBroken = false,
     rightLightBroken = false,
@@ -1146,10 +1223,9 @@ function render3DCar(ctx, opts) {
   const LOGICAL_WIDTH = state.logicalWidth;
   const trackLength = state.trackLength;
   const halfLen = lenZ * 0.5;
-  const minVisibleCamZ = state.activeCameraDepth * 0.75;
-  if (camZ + halfLen <= minVisibleCamZ) return;
+  if (camZ + halfLen <= MIN_CAR_CAM_Z) return;
 
-  const effectiveNearOffset = Math.min(halfLen, Math.max(-halfLen, camZ - minVisibleCamZ));
+  const effectiveNearOffset = Math.min(halfLen, Math.max(-halfLen, camZ - MIN_CAR_CAM_Z));
   const clippedRear = halfLen - effectiveNearOffset;
   const nearFrac = clippedRear / lenZ;
   const visibleSpanFrac = Math.max(0.02, 1 - nearFrac);
@@ -1158,11 +1234,11 @@ function render3DCar(ctx, opts) {
   const zFar = (((centerZ + halfLen) % trackLength) + trackLength) % trackLength;
 
   const fallbackSample = (targetCamZ) => {
-    const safeZ = Math.max(minVisibleCamZ, targetCamZ);
+    const safeZ = Math.max(MIN_CAR_CAM_Z, targetCamZ);
     const effectiveCamX = (state.playerX - state.cameraLagX) * ROAD_WIDTH;
     const scale = state.activeCameraDepth / safeZ;
     return {
-      scale: scale,
+      scale,
       roadCenterX: (LOGICAL_WIDTH * 0.5) + scale * (-effectiveCamX) * PROJ_HALF_WIDTH,
       roadY: (LOGICAL_HEIGHT * 0.5) + state.cameraPitch - scale * (-CAMERA_HEIGHT) * (LOGICAL_HEIGHT * 0.5),
       clipY: LOGICAL_HEIGHT
@@ -1187,27 +1263,31 @@ function render3DCar(ctx, opts) {
   const wFar = w * far.scale * ROAD_WIDTH * PROJ_HALF_WIDTH;
   const hFar = wFar * 0.58 * h;
 
-  if (wNear < 2.2 || Math.max(cxNear + wNear, cxFar + wFar) < -40 || Math.min(cxNear - wNear, cxFar - wFar) > LOGICAL_WIDTH + 40) {
+  if (
+    wNear < 2.2 ||
+    Math.max(cxNear + wNear, cxFar + wFar) < -40 ||
+    Math.min(cxNear - wNear, cxFar - wFar) > LOGICAL_WIDTH + 40 ||
+    Math.min(cyNear - hNear * 1.15, cyFar - hFar * 1.15) > LOGICAL_HEIGHT + 40
+  ) {
     return;
   }
 
   const clipY = near.clipY !== null && near.clipY !== undefined ? near.clipY : LOGICAL_HEIGHT;
 
   ctx.save();
-  if (!isPlayer) {
+  if (!isPlayer || isParkedDetach) {
     ctx.beginPath();
     ctx.rect(-40, 0, LOGICAL_WIDTH + 80, clipY);
     ctx.clip();
   }
 
-  // Перспективно-корректная интерполяция (1/z) вдоль длины автомобиля,
-  // устраняющая визуальное смещение арок и кабины назад к ближнему бамперу
+  // Перспективно-корректная интерполяция (1/z) вдоль длины автомобиля
   const sec = (t) => {
     const u = MathUtil.clamp((t - nearFrac) / visibleSpanFrac, 0, 1);
     const denom = Math.max(1e-6, (1 - u) * far.scale + u * near.scale);
     const uProj = (u * near.scale) / denom;
     return {
-      t: t,
+      t,
       cx: MathUtil.lerp(cxNear, cxFar, uProj),
       cy: MathUtil.lerp(cyNear, cyFar, uProj),
       w: MathUtil.lerp(wNear, wFar, uProj),
@@ -1224,47 +1304,8 @@ function render3DCar(ctx, opts) {
   const GLASS_TOP = 0.92;
   const ROOF_TOP = 0.98;
 
-  let tCR = 0.18;
-  let tRR = 0.30;
-  let tRF = 0.64;
-  let tCF = 0.76;
-  let roofHalfFrac = 0.315;
-  let tAxleNear = 0.22;
-  let tAxleFar = 0.82;
-  let dtWheel = 0.086;
-  let wheelRFrac = 0.215;
-
-  if (isVan) {
-    tCR = 0.07;
-    tRR = 0.13;
-    tRF = 0.82;
-    tCF = 0.91;
-    roofHalfFrac = 0.36;
-    tAxleNear = 0.21;
-    tAxleFar = 0.81;
-    dtWheel = 0.078;
-    wheelRFrac = 0.175;
-  } else if (type === 'sport') {
-    tCR = 0.16;
-    tRR = 0.28;
-    tRF = 0.62;
-    tCF = 0.75;
-    roofHalfFrac = 0.30;
-    tAxleNear = 0.22;
-    tAxleFar = 0.82;
-    dtWheel = 0.088;
-    wheelRFrac = 0.215;
-  } else if (type === 'sedan') {
-    tCR = 0.16;
-    tRR = 0.26;
-    tRF = 0.67;
-    tCF = 0.78;
-    roofHalfFrac = 0.33;
-    tAxleNear = 0.21;
-    tAxleFar = 0.82;
-    dtWheel = 0.084;
-    wheelRFrac = 0.210;
-  }
+  const profile = CAR_BODY_PROFILES[type] || CAR_BODY_PROFILES.coupe;
+  let { tCR, tRR, tRF, tCF, roofHalfFrac, tAxleNear, tAxleFar, dtWheel, wheelRFrac } = profile;
 
   // Зеркалируем продольные пропорции кузова и осей для встречных машин (передок обращён к камере)
   if (dir === -1) {
@@ -1282,7 +1323,6 @@ function render3DCar(ctx, opts) {
     tAxleFar = 1 - origNearAxle;
   }
 
-  // Торец кузова рисуется только пока машина не срезана ближней плоскостью камеры
   const showRearPanel = nearFrac < 0.03;
 
   const s0 = sec(Math.max(0.0, nearFrac));
@@ -1293,7 +1333,7 @@ function render3DCar(ctx, opts) {
   const sCabinFront = sec(Math.max(tCF, nearFrac));
   const s1 = sec(1.0);
 
-  if (isPlayer) {
+  if (isPlayer && !isParkedDetach) {
     const a = state.playerScreenAnchors;
     a.rearCenterX = s0.cx;
     a.rearCenterY = s0.cy - s0.h * 0.36;
@@ -1312,20 +1352,17 @@ function render3DCar(ctx, opts) {
     a.exhaustY = s0.cy - s0.h * (BODY_CLEARANCE + 0.03);
   }
 
-  // 1. Контактная тень под днищем (утоплена чуть внутрь по ширине, чтобы был чётко виден просвет под порогами)
-  const shadowHalfW = 0.450;
+  // 1. Контактная тень под днищем (вытягивается строго вдоль 3D-оси кузова s0 -> s1)
+  const shadowHalfW = 0.505;
+  const invSpan = 1 / Math.max(0.25, visibleSpanFrac);
+  const shadowAxisDx = (s1.cx - s0.cx) * invSpan;
+  const shadowAxisDy = Math.min(-Math.max(1.2, s1.h * 0.18), (s1.cy - s0.cy) * invSpan);
   const rearExtFactor = showRearPanel ? 1 : 0;
-  const rearExtY = rearExtFactor * Math.max(1.5, s0.h * 0.06);
-  const frontExtY = Math.max(0.8, s1.h * 0.04);
-  const rearShiftX = rearExtFactor * MathUtil.clamp((s0.cx - s1.cx) * 0.08, -s0.w * 0.08, s0.w * 0.08);
-  const frontShiftX = MathUtil.clamp((s1.cx - s0.cx) * 0.04, -s1.w * 0.06, s1.w * 0.06);
+  const baseRearExt = rearExtFactor * 0.10;
+  const baseFrontExt = 0.12;
 
-  const shRearCx = s0.cx + rearShiftX;
-  const shRearY = s0.cy + rearExtY;
-  const shRearBaseW = s0.w * (showRearPanel ? 1.01 : 1.0);
-  const shFrontCx = s1.cx + frontShiftX;
-  const shFrontY = s1.cy - frontExtY;
-  const shFrontBaseW = s1.w * 0.99;
+  const shRearBaseW = s0.w * (showRearPanel ? 1.02 : 1.0);
+  const shFrontBaseW = s1.w * 1.01;
 
   if (state.settings.lightStyle === 'soft') {
     const layers = wNear >= 14 ? SOFT_SHADOW_LAYERS : SOFT_SHADOW_FAR_LAYERS;
@@ -1333,19 +1370,27 @@ function render3DCar(ctx, opts) {
       const layer = layers[l];
       const hwNear = shRearBaseW * (shadowHalfW + layer.wPad);
       const hwFar = shFrontBaseW * (shadowHalfW + layer.wPad);
-      const yNear = shRearY + rearExtFactor * s0.h * layer.rPad;
-      const yFar = shFrontY - s1.h * layer.fPad;
+      const rExt = rearExtFactor * (baseRearExt + layer.rExt);
+      const fExt = baseFrontExt + layer.fExt;
+      const rearCx = s0.cx - shadowAxisDx * rExt;
+      const rearY = s0.cy - shadowAxisDy * rExt;
+      const frontCx = s1.cx + shadowAxisDx * fExt;
+      const frontY = s1.cy + shadowAxisDy * fExt;
       fillRoundedQuad(
         ctx,
-        shRearCx - hwNear, yNear,
-        shRearCx + hwNear, yNear,
-        shFrontCx + hwFar, yFar,
-        shFrontCx - hwFar, yFar,
+        rearCx - hwNear, rearY,
+        rearCx + hwNear, rearY,
+        frontCx + hwFar, frontY,
+        frontCx - hwFar, frontY,
         layer.round,
         layer.color
       );
     }
   } else {
+    const shRearCx = s0.cx - shadowAxisDx * baseRearExt;
+    const shRearY = s0.cy - shadowAxisDy * baseRearExt;
+    const shFrontCx = s1.cx + shadowAxisDx * baseFrontExt;
+    const shFrontY = s1.cy + shadowAxisDy * baseFrontExt;
     fillQuad(
       ctx,
       shRearCx - shRearBaseW * shadowHalfW, shRearY,
@@ -1358,9 +1403,9 @@ function render3DCar(ctx, opts) {
 
   const lateralDeltaX = s1.cx - s0.cx;
   const flankOrder = lateralDeltaX >= 0 ? [-1, 1] : [1, -1];
+  const visibleFlankSign = flankOrder[1];
   const axleOrder = [tAxleFar, tAxleNear];
 
-  // Ровный профиль сечения кузова без выпуклых выступов посередине
   const BODY_W_BOT = 0.466;
   const BODY_W_BUMPER_TOP = 0.468;
   const BODY_W_MID = 0.470;
@@ -1374,22 +1419,26 @@ function render3DCar(ctx, opts) {
   const pillarFrameColor = MathUtil.shadeHex(primary, 0.94);
   const innerGlassRoofFrac = roofHalfFrac * 0.80;
 
-  // Back-face culling для боковин кузова: отвёрнутый от камеры борт не рисуется и не вылезает из-за кормы
-  const isFlankVisible = (sideSign) => {
+  const getFlankSpanPx = (sideSign) => {
     const edge0X = s0.cx + sideSign * s0.w * BODY_W_TOP;
     const edge1X = s1.cx + sideSign * s1.w * BODY_W_TOP;
-    return sideSign * (edge1X - edge0X) > 0.35;
+    return sideSign * (edge1X - edge0X);
   };
+
+  const visibleFlankSpanPx = getFlankSpanPx(visibleFlankSign);
+  const showVisibleFlank = visibleFlankSpanPx > 0.35;
 
   // Расчёт точной 3D-геометрии колеса на оси tAxle в перспективе кузова
   const tireOuterFrac = 0.460;
-  const tireWidthFrac = isVan ? 0.140 : 0.155;
+  const tireWidthFrac = (isPlayer || isRival)
+    ? 0.148
+    : (isVan ? 0.128 : (type === 'sport' ? 0.140 : 0.130));
   const tireInnerFrac = tireOuterFrac - tireWidthFrac;
 
   const computeWheelMetrics = (sideSign, tAxle) => {
     if (tAxle < nearFrac) return null;
     const sa = sec(tAxle);
-    const wheelR = Math.max(1.8, sa.h * wheelRFrac);
+    const wheelR = Math.min(sa.h * 0.28, Math.max(0.5, sa.h * wheelRFrac));
     const t1 = Math.max(nearFrac, tAxle - dtWheel);
     const t2 = Math.min(1.0, tAxle + dtWheel);
     const spanT = Math.max(0.01, t2 - t1);
@@ -1409,23 +1458,33 @@ function render3DCar(ctx, opts) {
     return { sa, wheelR, ox, oy, ix, iy, uxOut, uxIn, uy };
   };
 
-  // Отрисовка 3D-цилиндра протектора колеса в позиции его реальной оси (под днищем и за бампером)
+  // Отрисовка 3D-цилиндра протектора колеса строго по высоте и координатам боковой проекции
   const drawWheelTread = (sideSign, tAxle) => {
-    if (wNear < 4) return;
     const m = computeWheelMetrics(sideSign, tAxle);
     if (!m) return;
 
     const H = Math.hypot(m.uy, m.wheelR);
     const cosExt = m.uy / Math.max(1e-4, H);
 
-    const topOutX = m.ox - m.uxOut * cosExt;
+    let topOutX = m.ox - m.uxOut * cosExt;
     const topOutY = m.oy - H;
-    const botOutX = m.ox + m.uxOut * cosExt;
+    let botOutX = m.ox + m.uxOut * cosExt;
     const botOutY = m.oy + H;
-    const topInX = m.ix - m.uxIn * cosExt;
+    let topInX = m.ix - m.uxIn * cosExt;
     const topInY = m.iy - H;
-    const botInX = m.ix + m.uxIn * cosExt;
+    let botInX = m.ix + m.uxIn * cosExt;
     const botInY = m.iy + H;
+
+    // Минимальный анти-субпиксельный порог на предельной дистанции (пропорциональный ширине кузова)
+    const treadW = Math.abs(botOutX - botInX);
+    const minTreadW = Math.min(0.9, m.sa.w * 0.16);
+    if (treadW < minTreadW) {
+      const halfPad = (minTreadW - treadW) * 0.5 * sideSign;
+      botOutX += halfPad;
+      botInX -= halfPad;
+      topOutX += halfPad;
+      topInX -= halfPad;
+    }
 
     if (wNear >= 12 && Math.abs(m.uxIn) > 0.6) {
       ctx.save();
@@ -1437,12 +1496,13 @@ function render3DCar(ctx, opts) {
       ctx.restore();
     }
 
-    fillQuad(ctx, topInX, topInY, topOutX, topOutY, botOutX, botOutY, botInX, botInY, '#090712');
+    const treadColor = wNear < 26 ? '#171326' : '#0b0816';
+    fillQuad(ctx, topInX, topInY, topOutX, topOutY, botOutX, botOutY, botInX, botInY, treadColor);
 
     if (wNear >= 12 && Math.abs(m.uxOut) > 0.6) {
       ctx.save();
       ctx.transform(m.uxOut, m.uy, 0, -m.wheelR, m.ox, m.oy);
-      ctx.fillStyle = '#0e0b19';
+      ctx.fillStyle = '#100c1c';
       ctx.beginPath();
       ctx.arc(0, 0, 1, 0, Math.PI * 2);
       ctx.fill();
@@ -1450,20 +1510,28 @@ function render3DCar(ctx, opts) {
     }
   };
 
-  // Отрисовка перспективных колёсных арок (строго выше линии порога), боковин шин и дисков на видимом борту
+  // Отрисовка перспективных колёсных арок, боковин шин и дисков на видимом борту (сохраняются и на удалении)
   const drawSideWheelsAndArches = (sideSign) => {
-    if (wNear < 9 || !isFlankVisible(sideSign)) return;
+    if (wNear < 4.5 || !showVisibleFlank) return;
 
     const archR = 1.18;
     const ySill = (BODY_CLEARANCE / wheelRFrac) - 1;
     const startAng = Math.asin(MathUtil.clamp(ySill / archR, -0.35, 0.72));
+    const maxFlankRx = visibleFlankSpanPx * 0.24;
 
     for (let a = 0; a < axleOrder.length; a++) {
       const m = computeWheelMetrics(sideSign, axleOrder[a]);
-      if (!m || Math.abs(m.uxOut) < 0.7) continue;
+      if (!m) continue;
+
+      const absUx = Math.abs(m.uxOut);
+      const uxSign = m.uxOut < 0 ? -1 : (m.uxOut > 0 ? 1 : (lateralDeltaX >= 0 ? 1 : -1));
+      const minVisibleRx = Math.min(maxFlankRx, m.wheelR * 0.38);
+      const effUxMag = Math.max(absUx, minVisibleRx);
+      if (effUxMag < 0.35) continue;
+      const effUx = uxSign * effUxMag;
 
       ctx.save();
-      ctx.transform(m.uxOut, m.uy, 0, -m.wheelR, m.ox, m.oy);
+      ctx.transform(effUx, m.uy, 0, -m.wheelR, m.ox, m.oy);
 
       // Полукруглый вырез колёсной арки начинается строго от кромки порога, не закрывая дорожный просвет
       ctx.fillStyle = '#05030a';
@@ -1472,12 +1540,18 @@ function render3DCar(ctx, opts) {
       ctx.closePath();
       ctx.fill();
 
-      if (wNear >= 20 && Math.abs(m.uxOut) >= 1.8) {
+      const prevWheelAlpha = ctx.globalAlpha;
+
+      // Плавное проявление кромки арки без резкого скачка при приближении
+      const archRimAlpha = MathUtil.clamp((wNear - 14) / 14, 0, 1) * MathUtil.clamp((effUxMag - 0.9) / 1.2, 0, 1);
+      if (archRimAlpha > 0.01) {
+        ctx.globalAlpha = prevWheelAlpha * archRimAlpha;
         ctx.strokeStyle = MathUtil.shadeHex(primary, 1.12);
         ctx.lineWidth = 0.065;
         ctx.beginPath();
         ctx.arc(0, 0, archR + 0.03, startAng + 0.14, Math.PI - startAng - 0.14, false);
         ctx.stroke();
+        ctx.globalAlpha = prevWheelAlpha;
       }
 
       // Боковина шины в перспективе
@@ -1486,28 +1560,33 @@ function render3DCar(ctx, opts) {
       ctx.arc(0, 0, 1.0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Диск и ступица
-      if (Math.abs(m.uxOut) >= 1.3 && m.wheelR >= 3.2) {
+      // Плавное масштабирование и проявление диска/колпака и ступицы ещё на дальней дистанции
+      const rimAlpha = MathUtil.clamp((effUxMag - 0.35) / 0.85, 0, 1) * MathUtil.clamp((m.wheelR - 0.85) / 1.35, 0, 1);
+      if (rimAlpha > 0.01) {
+        ctx.globalAlpha = prevWheelAlpha * rimAlpha;
         ctx.fillStyle = '#9aa5b1';
         ctx.beginPath();
         ctx.arc(0, 0, 0.56, 0, Math.PI * 2);
         ctx.fill();
 
-        if (Math.abs(m.uxOut) >= 2.2 && m.wheelR >= 5.0) {
+        const hubAlpha = rimAlpha * MathUtil.clamp((effUxMag - 1.1) / 1.4, 0, 1) * MathUtil.clamp((m.wheelR - 2.2) / 2.2, 0, 1);
+        if (hubAlpha > 0.01) {
+          ctx.globalAlpha = prevWheelAlpha * hubAlpha;
           ctx.fillStyle = '#334155';
           ctx.beginPath();
           ctx.arc(0, 0, 0.22, 0, Math.PI * 2);
           ctx.fill();
         }
+        ctx.globalAlpha = prevWheelAlpha;
       }
 
       ctx.restore();
     }
   };
 
-  // Вспомогательная отрисовка цельной ровной боковины кузова (поднятой на BODY_CLEARANCE над асфальтом)
+  // Отрисовка цельной ровной видимой боковины кузова (поднятой на BODY_CLEARANCE над асфальтом)
   const drawLowerFlank = (sideSign) => {
-    if (!isFlankVisible(sideSign)) return;
+    if (!showVisibleFlank) return;
 
     fillQuad(
       ctx,
@@ -1526,17 +1605,15 @@ function render3DCar(ctx, opts) {
       flankUpperColor
     );
 
-    // Чёткая кромка порога, подчёркивающая дорожный просвет между кузовом и асфальтом
     if (wNear >= 14) {
       ctx.strokeStyle = MathUtil.shadeHex(secondary, 1.18);
-      ctx.lineWidth = Math.max(0.9, wNear * 0.009);
+      ctx.lineWidth = MathUtil.clamp(wNear * 0.009, 0.9, 3.5);
       ctx.beginPath();
       ctx.moveTo(s0.cx + sideSign * s0.w * BODY_W_BOT, s0.cy - s0.h * BODY_CLEARANCE);
       ctx.lineTo(s1.cx + sideSign * s1.w * BODY_W_BOT, s1.cy - s1.h * BODY_CLEARANCE);
       ctx.stroke();
     }
 
-    // Боковые загибы ближнего и дальнего бамперов доходят строго до края колёсных арок
     const rearWrapEndT = Math.min(0.11, Math.max(0.04, tAxleNear - dtWheel * 1.04));
     const sRearBumper = sec(Math.max(rearWrapEndT, nearFrac));
     if (sRearBumper.t > s0.t + 0.004) {
@@ -1564,7 +1641,6 @@ function render3DCar(ctx, opts) {
       );
     }
 
-    // Продольные потёртости краски на повреждённом борту игрока
     if (isPlayer && wNear >= 24 && flankVisibility > 0.14) {
       const sideDmg = sideSign < 0 ? leftDamageLevel : rightDamageLevel;
       if (sideDmg >= 1) {
@@ -1572,14 +1648,14 @@ function render3DCar(ctx, opts) {
         const sScrapeB = sec(Math.max(nearFrac, sideDmg >= 2 ? 0.72 : 0.56));
         if (sScrapeB.t > sScrapeA.t + 0.03) {
           ctx.strokeStyle = 'rgba(220, 228, 242, 0.42)';
-          ctx.lineWidth = Math.max(1.0, wNear * 0.012);
+          ctx.lineWidth = MathUtil.clamp(wNear * 0.012, 1.0, 4.0);
           ctx.beginPath();
           ctx.moveTo(sScrapeA.cx + sideSign * sScrapeA.w * BODY_W_MID, sScrapeA.cy - sScrapeA.h * 0.44);
           ctx.lineTo(sScrapeB.cx + sideSign * sScrapeB.w * BODY_W_MID, sScrapeB.cy - sScrapeB.h * 0.46);
           ctx.stroke();
           if (sideDmg >= 2) {
             ctx.strokeStyle = 'rgba(28, 4, 16, 0.55)';
-            ctx.lineWidth = Math.max(1.0, wNear * 0.010);
+            ctx.lineWidth = MathUtil.clamp(wNear * 0.010, 1.0, 3.5);
             ctx.beginPath();
             ctx.moveTo(sScrapeA.cx + sideSign * sScrapeA.w * BODY_W_BUMPER_TOP, sScrapeA.cy - sScrapeA.h * 0.40);
             ctx.lineTo(sScrapeB.cx + sideSign * sScrapeB.w * BODY_W_BUMPER_TOP, sScrapeB.cy - sScrapeB.h * 0.42);
@@ -1590,14 +1666,14 @@ function render3DCar(ctx, opts) {
     }
 
     ctx.strokeStyle = MathUtil.shadeHex(primary, 1.15);
-    ctx.lineWidth = Math.max(1.0, wNear * 0.011);
+    ctx.lineWidth = MathUtil.clamp(wNear * 0.011, 1.0, 4.0);
     ctx.beginPath();
     ctx.moveTo(s0.cx + sideSign * s0.w * BODY_W_TOP, s0.cy - s0.h * BODY_SHOULDER);
     ctx.lineTo(s1.cx + sideSign * s1.w * BODY_W_TOP, s1.cy - s1.h * BODY_SHOULDER);
     ctx.stroke();
   };
 
-  // Вспомогательная отрисовка верхней боковины кабины и боковых стёкол (поверх капота и дальнего стекла)
+  // Отрисовка верхней боковины кабины и боковых стёкол (поверх капота и дальнего стекла)
   const drawCabinFlankAndWindow = (sideSign) => {
     if (nearFrac >= tCF) return;
 
@@ -1624,7 +1700,7 @@ function render3DCar(ctx, opts) {
       const s = sec(t);
       const hFrac = MathUtil.lerp(BODY_SHOULDER, ROOF_TOP, u);
       const wFrac = MathUtil.lerp(BODY_W_TOP, roofHalfFrac, u);
-      return { x: s.cx + sideSign * s.w * wFrac, y: s.cy - s.h * hFrac, t: t };
+      return { x: s.cx + sideSign * s.w * wFrac, y: s.cy - s.h * hFrac, t };
     };
 
     const uBot = 0.16;
@@ -1682,12 +1758,11 @@ function render3DCar(ctx, opts) {
     }
   };
 
-  // 2. Протекторы всех 4 колёс под днищем (строго на своих осях tAxleFar и tAxleNear, до отрисовки борта и кормы)
+  // 2. Протекторы всех 4 колёс под днищем (до отрисовки борта и кормы)
   for (let a = 0; a < axleOrder.length; a++) {
     drawWheelTread(flankOrder[0], axleOrder[a]);
-    drawWheelTread(flankOrder[1], axleOrder[a]);
+    drawWheelTread(visibleFlankSign, axleOrder[a]);
   }
-  drawLowerFlank(flankOrder[0]);
 
   // 3. Дальние верхние плоскости: капот (или багажник встречки) и дальнее стекло
   fillQuad(ctx, sCabinFront.cx - sCabinFront.w * BODY_W_TOP, sCabinFront.cy - sCabinFront.h * BODY_SHOULDER, sCabinFront.cx + sCabinFront.w * BODY_W_TOP, sCabinFront.cy - sCabinFront.h * BODY_SHOULDER, s1.cx + s1.w * BODY_W_TOP, s1.cy - s1.h * BODY_SHOULDER, s1.cx - s1.w * BODY_W_TOP, s1.cy - s1.h * BODY_SHOULDER, deckColor);
@@ -1697,16 +1772,16 @@ function render3DCar(ctx, opts) {
     fillQuad(ctx, sRoofFront.cx - sRoofFront.w * innerGlassRoofFrac, sRoofFront.cy - sRoofFront.h * GLASS_TOP, sRoofFront.cx + sRoofFront.w * innerGlassRoofFrac, sRoofFront.cy - sRoofFront.h * GLASS_TOP, sCabinFront.cx + sCabinFront.w * 0.375, sCabinFront.cy - sCabinFront.h * GLASS_BOT, sCabinFront.cx - sCabinFront.w * 0.375, sCabinFront.cy - sCabinFront.h * GLASS_BOT, dir === -1 ? '#1d3557' : '#48cae4');
   }
 
-  // 4. Ближняя нижняя боковина и её перспективные колёсные арки с дисками
-  drawLowerFlank(flankOrder[1]);
-  drawSideWheelsAndArches(flankOrder[1]);
+  // 4. Видимая нижняя боковина и её перспективные колёсные арки с дисками
+  drawLowerFlank(visibleFlankSign);
+  drawSideWheelsAndArches(visibleFlankSign);
 
   // 5. Крыша
   if (nearFrac < tRF) {
     fillQuad(ctx, sRoofRear.cx - sRoofRear.w * roofHalfFrac, sRoofRear.cy - sRoofRear.h * ROOF_TOP, sRoofRear.cx + sRoofRear.w * roofHalfFrac, sRoofRear.cy - sRoofRear.h * ROOF_TOP, sRoofFront.cx + sRoofFront.w * roofHalfFrac, sRoofFront.cy - sRoofFront.h * ROOF_TOP, sRoofFront.cx - sRoofFront.w * roofHalfFrac, sRoofFront.cy - sRoofFront.h * ROOF_TOP, roofColor);
   }
 
-  // 6. Видимые боковины кабины и боковые стёкла (рисуются поверх капота, дальнего стекла и крыши)
+  // 6. Видимые боковины кабины и боковые стёкла
   for (let f = 0; f < 2; f++) {
     drawCabinFlankAndWindow(flankOrder[f]);
   }
@@ -1772,7 +1847,6 @@ function render3DCar(ctx, opts) {
   if (nearFrac < tCR) {
     fillQuad(ctx, s0.cx - s0.w * BODY_W_TOP, s0.cy - s0.h * BODY_SHOULDER, s0.cx + s0.w * BODY_W_TOP, s0.cy - s0.h * BODY_SHOULDER, sCabinRear.cx + sCabinRear.w * BODY_W_TOP, sCabinRear.cy - sCabinRear.h * BODY_SHOULDER, sCabinRear.cx - sCabinRear.w * BODY_W_TOP, sCabinRear.cy - sCabinRear.h * BODY_SHOULDER, deckColor);
 
-    // Повреждения крышки багажника игрока: замятые грани металла, потёртости лака и копоть
     if (isPlayer && visualDamageLevel >= 1 && wNear > 24) {
       const deckY0 = s0.cy - s0.h * BODY_SHOULDER;
       const deckY1 = sCabinRear.cy - sCabinRear.h * BODY_SHOULDER;
@@ -1786,7 +1860,6 @@ function render3DCar(ctx, opts) {
 
       const deckMidY = MathUtil.lerp(deckY0, deckY1, 0.52);
 
-      // Грани замятого металла на повреждённой стороне крышки багажника
       if (visualDamageLevel >= 2 || rearDamageLevel >= 1) {
         const dentSide = (spoilerDamageSide !== 0 ? spoilerDamageSide : (leftDamageLevel >= rightDamageLevel ? -1 : 1));
         const dInX0 = s0.cx + dentSide * s0.w * 0.04;
@@ -1801,7 +1874,6 @@ function render3DCar(ctx, opts) {
         ctx.stroke();
       }
 
-      // Лёгкие царапины до грунта по кромкам крыльев
       ctx.strokeStyle = 'rgba(225, 232, 244, 0.36)';
       ctx.lineWidth = 1.1;
       ctx.beginPath();
@@ -1817,29 +1889,25 @@ function render3DCar(ctx, opts) {
     }
   }
 
-  // 9. Ближняя торцевая панель (корма для попутных, передок для встречных) — нависает над утопленными под кузовом колёсами
+  // 9. Ближняя торцевая панель (корма для попутных, передок для встречных)
   if (showRearPanel) {
     const w0 = s0.w;
     const rearTopY = s0.cy - s0.h;
     const trunkLipY = s0.cy - s0.h * BODY_SHOULDER;
 
-    // Вертикальная корма строго повторяет единое сечение кузова (w0) и поднята над дорогой на BODY_CLEARANCE
     fillQuad(ctx, s0.cx - w0 * BODY_W_BOT, s0.cy - s0.h * BODY_CLEARANCE, s0.cx + w0 * BODY_W_BOT, s0.cy - s0.h * BODY_CLEARANCE, s0.cx + w0 * BODY_W_MID, s0.cy - s0.h * BODY_MID, s0.cx - w0 * BODY_W_MID, s0.cy - s0.h * BODY_MID, secondary);
     fillQuad(ctx, s0.cx - w0 * BODY_W_MID, s0.cy - s0.h * BODY_MID, s0.cx + w0 * BODY_W_MID, s0.cy - s0.h * BODY_MID, s0.cx + w0 * BODY_W_TOP, trunkLipY, s0.cx - w0 * BODY_W_TOP, trunkLipY, primary);
 
-    // Тонкий световой акцент на верхней кромке багажника/капота
     if (w0 >= 14) {
       ctx.strokeStyle = MathUtil.shadeHex(primary, 1.18);
-      ctx.lineWidth = Math.max(1.0, s0.h * 0.016);
+      ctx.lineWidth = MathUtil.clamp(s0.h * 0.016, 1.0, 3.5);
       ctx.beginPath();
       ctx.moveTo(s0.cx - w0 * BODY_W_TOP, trunkLipY);
       ctx.lineTo(s0.cx + w0 * BODY_W_TOP, trunkLipY);
       ctx.stroke();
     }
 
-    // Повреждения металлической кормы игрока (рисуются строго ПОД оптикой, бампером и огнями выхлопа)
     if (isPlayer && (visualDamageLevel >= 1 || rearDamageLevel >= 1) && wNear >= 20) {
-      // Щель перекошенной крышки багажника вдоль верхней кромки
       const seamSide = spoilerDamageSide !== 0 ? spoilerDamageSide : (leftDamageLevel >= rightDamageLevel ? -1 : 1);
       const seamGapL = seamSide < 0 ? Math.max(1.6, s0.h * (0.022 + Math.min(3, visualDamageLevel) * 0.008)) : Math.max(0.8, s0.h * 0.012);
       const seamGapR = seamSide > 0 ? Math.max(1.6, s0.h * (0.022 + Math.min(3, visualDamageLevel) * 0.008)) : Math.max(0.8, s0.h * 0.012);
@@ -1852,7 +1920,6 @@ function render3DCar(ctx, opts) {
         'rgba(10, 2, 16, 0.72)'
       );
 
-      // Гранёная вмятина на центральной панели между задними фонарями
       if (visualDamageLevel >= 2 || rearDamageLevel >= 1) {
         const dTopY = s0.cy - s0.h * 0.54;
         const dBotY = s0.cy - s0.h * 0.40;
@@ -1865,14 +1932,13 @@ function render3DCar(ctx, opts) {
         fillQuad(ctx, dPeakX, dPeakY, dRightX, dTopY, dRightX - w0 * 0.02, dBotY, dPeakX - seamSide * w0 * 0.02, dBotY, 'rgba(18, 2, 12, 0.24)');
 
         ctx.strokeStyle = 'rgba(255, 195, 222, 0.36)';
-        ctx.lineWidth = Math.max(1.0, s0.h * 0.016);
+        ctx.lineWidth = MathUtil.clamp(s0.h * 0.016, 1.0, 3.0);
         ctx.beginPath();
         ctx.moveTo(dPeakX, dPeakY);
         ctx.lineTo(seamSide < 0 ? dLeftX : dRightX, dTopY);
         ctx.stroke();
       }
 
-      // Копоть на центральной части кормы при сильном повреждении мотора
       if (visualDamageLevel >= 3) {
         fillQuad(
           ctx,
@@ -1884,12 +1950,11 @@ function render3DCar(ctx, opts) {
         );
       }
 
-      // Потёртости краски до грунта на наружных углах крыльев (вне зоны фонарей)
       const drawQuarterScuff = (sideSign) => {
         const xOuter = s0.cx + sideSign * w0 * 0.456;
         const xInner = s0.cx + sideSign * w0 * 0.410;
         ctx.strokeStyle = 'rgba(218, 226, 240, 0.46)';
-        ctx.lineWidth = Math.max(1.0, s0.h * 0.018);
+        ctx.lineWidth = MathUtil.clamp(s0.h * 0.018, 1.0, 3.0);
         ctx.beginPath();
         ctx.moveTo(xOuter, s0.cy - s0.h * 0.53);
         ctx.lineTo(xInner, s0.cy - s0.h * 0.47);
@@ -1901,7 +1966,6 @@ function render3DCar(ctx, opts) {
       if (rightDamageLevel >= 1) drawQuarterScuff(1);
     }
 
-    // Расчёт провисания заднего бампера при повреждениях игрока
     let leftBumperDrop = 0;
     let rightBumperDrop = 0;
     if (isPlayer && (visualDamageLevel >= 2 || rearDamageLevel >= 1)) {
@@ -1922,7 +1986,6 @@ function render3DCar(ctx, opts) {
       }
     }
 
-    // Бампер строго в габарите кузова и с чистым просветом над дорогой
     fillQuad(
       ctx,
       s0.cx - w0 * BODY_W_BOT, s0.cy - s0.h * BODY_CLEARANCE + leftBumperDrop,
@@ -1932,7 +1995,6 @@ function render3DCar(ctx, opts) {
       '#151124'
     );
 
-    // Потёртости на углах пластикового бампера (вне зоны номера и строго ПОД огнями выхлопа)
     if (isPlayer && (visualDamageLevel >= 1 || rearDamageLevel >= 1) && wNear >= 20) {
       const drawBumperScuff = (sideSign) => {
         const dropFracA = sideSign < 0 ? 0.04 : 0.96;
@@ -1943,7 +2005,7 @@ function render3DCar(ctx, opts) {
         const xInner = s0.cx + sideSign * w0 * 0.335;
 
         ctx.strokeStyle = 'rgba(176, 184, 206, 0.36)';
-        ctx.lineWidth = Math.max(1.0, s0.h * 0.018);
+        ctx.lineWidth = MathUtil.clamp(s0.h * 0.018, 1.0, 3.0);
         ctx.beginPath();
         ctx.moveTo(xOuter, s0.cy - s0.h * (BODY_CLEARANCE + 0.095) + dropA);
         ctx.lineTo(xInner, s0.cy - s0.h * (BODY_CLEARANCE + 0.075) + dropB);
@@ -1956,7 +2018,6 @@ function render3DCar(ctx, opts) {
       if (rightDamageLevel >= 1 || rearDamageLevel >= 2) drawBumperScuff(1);
     }
 
-    // Выхлопные патрубки и пламя (рисуются ПОСЛЕ бампера и его потёртостей — ничего не перекрывает огонь)
     if (isPlayer) {
       const flameY = s0.cy - s0.h * (BODY_CLEARANCE + 0.03);
       const leftPipeX = s0.cx - w0 * 0.26;
@@ -1967,7 +2028,7 @@ function render3DCar(ctx, opts) {
         const pipeRy = Math.max(1.6, s0.h * 0.026);
         ctx.fillStyle = '#090612';
         ctx.strokeStyle = '#475569';
-        ctx.lineWidth = Math.max(1.0, w0 * 0.008);
+        ctx.lineWidth = MathUtil.clamp(w0 * 0.008, 1.0, 2.5);
         ctx.beginPath();
         ctx.ellipse(leftPipeX, flameY, pipeRx, pipeRy, 0, 0, Math.PI * 2);
         ctx.fill();
@@ -2032,72 +2093,56 @@ function render3DCar(ctx, opts) {
       }
     }
 
-    // Оптика и номерной знак рисуются ПОСЛЕ повреждений кузова/бампера и ДО антикрыла
-    const lightW = w0 * 0.155;
+    const isStreetTraffic = !isPlayer && !isRival;
+    // Индивидуальный стиль обрамления оптики по моделям трафика:
+    // фиолетовый van — полная рамка, зелёный sedan — тонкая рамка, голубой coupe и жёлтый sport — без рамки
+    const opticFrameStyle = !isStreetTraffic
+      ? 'none'
+      : (type === 'van' ? 'full' : (type === 'sedan' ? 'thin' : 'none'));
+
+    const turnW = w0 * 0.062;
+    const lightW = isStreetTraffic ? w0 * 0.152 : w0 * 0.155;
     const lightH = s0.h * 0.12;
-    const leftLightX = s0.cx - w0 * 0.395;
-    const rightLightX = s0.cx + w0 * 0.395 - lightW;
     const leftLightY = s0.cy - s0.h * 0.535;
-    const rightLightY = s0.cy - s0.h * 0.535;
+    const rightLightY = leftLightY;
+
+    const leftTurnX = s0.cx - w0 * 0.450;
+    const rightTurnX = s0.cx + w0 * 0.450 - turnW;
+    const leftLightX = isStreetTraffic ? (leftTurnX + turnW) : (s0.cx - w0 * 0.395);
+    const rightLightX = isStreetTraffic ? (rightTurnX - lightW) : (s0.cx + w0 * 0.395 - lightW);
+
+    const leftTailLit = !leftLightBroken && !leftLightFlicker;
+    const rightTailLit = !rightLightBroken && !rightLightFlicker;
+    let leftTurnLit = false;
+    let rightTurnLit = false;
+
+    // --- Проход А: непрозрачная геометрия оптики, номеров и спойлера (до световых ореолов) ---
+    if (isStreetTraffic && opticFrameStyle !== 'none') {
+      // Строго пропорциональная перспектива без пиксельного минимума + раннее плавное проявление на удалении
+      const housingPad = opticFrameStyle === 'full'
+        ? Math.min(2.2, w0 * 0.010)
+        : Math.min(0.95, w0 * 0.005);
+      const frameAlpha = MathUtil.clamp((w0 - 8) / 14, 0, 1);
+      if (frameAlpha > 0.01 && housingPad > 0.04) {
+        const clusterW = turnW + lightW;
+        const prevAlpha = ctx.globalAlpha;
+        ctx.globalAlpha = prevAlpha * frameAlpha;
+        ctx.fillStyle = '#120a20';
+        ctx.fillRect(leftTurnX - housingPad, leftLightY - housingPad, clusterW + housingPad * 2, lightH + housingPad * 2);
+        ctx.fillRect(rightLightX - housingPad, rightLightY - housingPad, clusterW + housingPad * 2, lightH + housingPad * 2);
+        ctx.globalAlpha = prevAlpha;
+      }
+    }
 
     if (dir === -1) {
+      const grilleW = isStreetTraffic ? w0 * 0.37 : w0 * 0.42;
       ctx.fillStyle = '#0d091a';
-      ctx.fillRect(s0.cx - w0 * 0.21, leftLightY + lightH * 0.1, w0 * 0.42, lightH * 0.85);
+      ctx.fillRect(s0.cx - grilleW * 0.5, leftLightY + lightH * 0.1, grilleW, lightH * 0.85);
 
       ctx.fillStyle = damagedByPlayer ? '#241f33' : (highBeamFlashing ? '#e0ffff' : '#ffffff');
       ctx.fillRect(leftLightX, leftLightY, lightW, lightH);
       ctx.fillRect(rightLightX, rightLightY, lightW, lightH);
-
-      // Плавное проявление ореолов встречных фар начиная с дальней дистанции (w0 > 3.5)
-      const headlightHaloFade = MathUtil.clamp((w0 - 3.5) / 14, 0, 1);
-      if (headlightHaloFade > 0.01 && !damagedByPlayer) {
-        const beamRadius = highBeamFlashing ? lightW * 2.55 : lightW * 1.25;
-        const hardBeamColor = highBeamFlashing ? 'rgba(210, 252, 255, 0.55)' : 'rgba(220, 250, 255, 0.22)';
-        const softBeamRadius = highBeamFlashing ? lightW * 3.45 : lightW * 2.1;
-        const softBeamStops = highBeamFlashing
-          ? [
-              [0.0, 'rgba(255, 255, 255, 0.95)'],
-              [0.32, 'rgba(200, 250, 255, 0.62)'],
-              [0.68, 'rgba(120, 235, 255, 0.22)'],
-              [1.0, 'rgba(120, 235, 255, 0.0)']
-            ]
-          : [
-              [0.0, 'rgba(240, 252, 255, 0.72)'],
-              [0.38, 'rgba(180, 242, 255, 0.34)'],
-              [1.0, 'rgba(140, 225, 255, 0.0)']
-            ];
-        drawLightHalo(ctx, leftLightX + lightW * 0.5, leftLightY + lightH * 0.5, beamRadius, hardBeamColor, softBeamRadius, softBeamStops, headlightHaloFade);
-        drawLightHalo(ctx, rightLightX + lightW * 0.5, rightLightY + lightH * 0.5, beamRadius, hardBeamColor, softBeamRadius, softBeamStops, headlightHaloFade);
-
-        const coneFade = MathUtil.clamp((w0 - 10) / 18, 0, 1);
-        if (highBeamFlashing && coneFade > 0.01) {
-          const coneTopY = leftLightY + lightH;
-          const coneBotY = s0.cy + s0.h * 0.35;
-          if (state.settings.lightStyle === 'soft') {
-            ctx.save();
-            ctx.globalCompositeOperation = 'screen';
-            ctx.globalAlpha *= coneFade;
-            const coneGrad = ctx.createLinearGradient(0, coneTopY, 0, coneBotY);
-            coneGrad.addColorStop(0.0, 'rgba(215, 252, 255, 0.26)');
-            coneGrad.addColorStop(0.6, 'rgba(170, 242, 255, 0.10)');
-            coneGrad.addColorStop(1.0, 'rgba(140, 230, 255, 0.0)');
-            fillQuad(ctx, leftLightX, coneTopY, leftLightX + lightW, coneTopY, leftLightX + lightW + w0 * 0.14, coneBotY, leftLightX - w0 * 0.20, coneBotY, coneGrad);
-            fillQuad(ctx, rightLightX, coneTopY, rightLightX + lightW, coneTopY, rightLightX + lightW + w0 * 0.20, coneBotY, rightLightX - w0 * 0.14, coneBotY, coneGrad);
-            ctx.restore();
-          } else {
-            ctx.save();
-            ctx.globalAlpha *= coneFade;
-            fillQuad(ctx, leftLightX + lightW * 0.1, coneTopY, leftLightX + lightW * 0.9, coneTopY, leftLightX + lightW + w0 * 0.10, coneBotY, leftLightX - w0 * 0.14, coneBotY, 'rgba(210, 252, 255, 0.24)');
-            fillQuad(ctx, rightLightX + lightW * 0.1, coneTopY, rightLightX + lightW * 0.9, coneTopY, rightLightX + lightW + w0 * 0.14, coneBotY, rightLightX - w0 * 0.10, coneBotY, 'rgba(210, 252, 255, 0.24)');
-            ctx.restore();
-          }
-        }
-      }
     } else {
-      const leftLit = !leftLightBroken && !leftLightFlicker;
-      const rightLit = !rightLightBroken && !rightLightFlicker;
-
-      // Разбитый фонарь игрока: тёмный корпус с осколком красного стекла и отблеском отражателя внутри рамки
       const drawBrokenTaillight = (lx, ly, isLeft) => {
         ctx.fillStyle = '#18040b';
         ctx.fillRect(lx, ly, lightW, lightH);
@@ -2131,57 +2176,29 @@ function render3DCar(ctx, opts) {
       if (leftLightBroken) {
         drawBrokenTaillight(leftLightX, leftLightY, true);
       } else {
-        ctx.fillStyle = leftLit && braking ? '#ff4d6d' : (leftLit ? '#9e0b28' : '#3d0815');
+        ctx.fillStyle = leftTailLit && braking ? '#ff4d6d' : (leftTailLit ? '#9e0b28' : '#3d0815');
         ctx.fillRect(leftLightX, leftLightY, lightW, lightH);
       }
 
       if (rightLightBroken) {
         drawBrokenTaillight(rightLightX, rightLightY, false);
       } else {
-        ctx.fillStyle = rightLit && braking ? '#ff4d6d' : (rightLit ? '#9e0b28' : '#3d0815');
+        ctx.fillStyle = rightTailLit && braking ? '#ff4d6d' : (rightTailLit ? '#9e0b28' : '#3d0815');
         ctx.fillRect(rightLightX, rightLightY, lightW, lightH);
-      }
-
-      // Плавное проявление ореолов стоп-сигналов начиная с дальней дистанции (w0 > 4)
-      const brakeHaloFade = MathUtil.clamp((w0 - 4.0) / 14, 0, 1);
-      if (braking && brakeHaloFade > 0.01 && (leftLit || rightLit)) {
-        const hardBrakeR = lightW * (isPlayer ? 1.15 : 1.05);
-        const hardBrakeColor = isPlayer ? 'rgba(255, 42, 95, 0.38)' : 'rgba(255, 42, 95, 0.36)';
-        const softBrakeR = lightW * (isPlayer ? 2.15 : 1.9);
-        const softBrakeStops = [
-          [0.0, 'rgba(255, 195, 210, 0.82)'],
-          [0.34, 'rgba(255, 42, 95, 0.50)'],
-          [1.0, 'rgba(255, 20, 75, 0.0)']
-        ];
-        if (leftLit) {
-          drawLightHalo(ctx, leftLightX + lightW * 0.5, leftLightY + lightH * 0.5, hardBrakeR, hardBrakeColor, softBrakeR, softBrakeStops, brakeHaloFade);
-        }
-        if (rightLit) {
-          drawLightHalo(ctx, rightLightX + lightW * 0.5, rightLightY + lightH * 0.5, hardBrakeR, hardBrakeColor, softBrakeR, softBrakeStops, brakeHaloFade);
-        }
       }
     }
 
+    const revW = w0 * 0.085;
+    const revH = lightH * 0.82;
+    const leftRevX = s0.cx - w0 * 0.225;
+    const rightRevX = s0.cx + w0 * 0.225 - revW;
+    const leftRevY = leftLightY + (lightH - revH) * 0.5;
+    const rightRevY = rightLightY + (lightH - revH) * 0.5;
+
     if (isPlayer) {
-      const revW = w0 * 0.085;
-      const revH = lightH * 0.82;
-      const leftRevX = s0.cx - w0 * 0.225;
-      const rightRevX = s0.cx + w0 * 0.225 - revW;
-      const leftRevY = leftLightY + (lightH - revH) * 0.5;
-      const rightRevY = rightLightY + (lightH - revH) * 0.5;
       ctx.fillStyle = reversing ? '#ffffff' : (isTotalWreck ? '#262030' : '#3a2d47');
       ctx.fillRect(leftRevX, leftRevY, revW, revH);
       ctx.fillRect(rightRevX, rightRevY, revW, revH);
-
-      if (reversing) {
-        const revSoftStops = [
-          [0.0, 'rgba(255, 255, 255, 0.90)'],
-          [0.35, 'rgba(200, 245, 255, 0.48)'],
-          [1.0, 'rgba(180, 240, 255, 0.0)']
-        ];
-        drawLightHalo(ctx, leftRevX + revW * 0.5, leftRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, revSoftStops);
-        drawLightHalo(ctx, rightRevX + revW * 0.5, rightRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, revSoftStops);
-      }
 
       const plateW = w0 * 0.19;
       const plateH = s0.h * 0.12;
@@ -2201,58 +2218,107 @@ function render3DCar(ctx, opts) {
       ctx.textBaseline = 'middle';
       ctx.fillText('01', 0, plateH * 0.04);
       ctx.restore();
-    } else {
-      // Отрисовка фонаря поворотника/аварийки строго внутри габарита кормы (w0)
-      const drawAmberSignalGlow = (lampX, lampY, lampW, lampH, blinkOn) => {
-        ctx.fillStyle = blinkOn ? '#ffbe0b' : '#4a2b00';
-        ctx.fillRect(lampX, lampY, lampW, lampH);
+    } else if (isStreetTraffic) {
+      const hazardMode = damagedByPlayer;
+      const hazardOn = hazardMode && (Math.floor(state.animClockMs / 260) % 2 === 0);
+      const signalBlinkOn = !hazardMode && turnSignal !== 0 && (Math.floor(signalElapsed / 0.18) % 2 === 0);
 
-        const signalHaloFade = MathUtil.clamp((w0 - 3.5) / 10, 0, 1);
-        if (blinkOn && signalHaloFade > 0.01) {
-          const gx = lampX + lampW * 0.5;
-          const gy = lampY + lampH * 0.5;
-          const hardR = Math.max(lampW * 1.45, w0 * 0.095);
-          const softR = Math.max(lampW * 3.2, w0 * 0.22);
+      leftTurnLit = hazardMode ? hazardOn : (turnSignal === -1 && signalBlinkOn);
+      rightTurnLit = hazardMode ? hazardOn : (turnSignal === 1 && signalBlinkOn);
 
-          drawLightHalo(ctx, gx, gy, hardR, 'rgba(255, 190, 11, 0.52)', softR, [
-            [0.0, 'rgba(255, 250, 215, 0.95)'],
-            [0.26, 'rgba(255, 195, 20, 0.62)'],
-            [0.58, 'rgba(255, 115, 0, 0.24)'],
-            [1.0, 'rgba(255, 90, 0, 0.0)']
-          ], signalHaloFade);
+      const drawIntegratedTurnLensBase = (lensX, lensY, lensW, lensH, isLit) => {
+        // В неактивной фазе мигания линза остаётся штатного тёмно-оранжевого цвета (не чернеет)
+        ctx.fillStyle = isLit ? '#ffbe0b' : '#7c4308';
+        ctx.fillRect(lensX, lensY, lensW, lensH);
 
-          ctx.fillStyle = '#fff9db';
-          ctx.fillRect(lampX + lampW * 0.18, lampY + lampH * 0.18, lampW * 0.64, lampH * 0.64);
+        if (!isLit) {
+          const glossAlpha = MathUtil.clamp((w0 - 14) / 14, 0, 1);
+          if (glossAlpha > 0.01) {
+            const prevAlpha = ctx.globalAlpha;
+            ctx.globalAlpha = prevAlpha * glossAlpha;
+            ctx.fillStyle = 'rgba(255, 200, 96, 0.28)';
+            ctx.fillRect(lensX, lensY, lensW, lensH * 0.28);
+            ctx.globalAlpha = prevAlpha;
+          }
         }
       };
 
-      const signalOuterX = w0 * 0.448;
-      if (!isRival && !damagedByPlayer && turnSignal !== 0) {
-        const blinkOn = Math.floor(signalElapsed / 0.18) % 2 === 0;
-        const indW = Math.max(2.0, w0 * 0.056);
-        const indH = Math.max(1.8, lightH * 1.02);
-        const indX = turnSignal === -1 ? (s0.cx - signalOuterX) : (s0.cx + signalOuterX - indW);
-        drawAmberSignalGlow(indX, leftLightY - indH * 0.02, indW, indH, blinkOn);
+      drawIntegratedTurnLensBase(leftTurnX, leftLightY, turnW, lightH, leftTurnLit);
+      drawIntegratedTurnLensBase(rightTurnX, rightLightY, turnW, lightH, rightTurnLit);
+
+      // Перегородка между основной фарой/фонарём и поворотником (пропорционально перспективе)
+      if (opticFrameStyle !== 'none') {
+        const sepW = opticFrameStyle === 'full'
+          ? Math.min(1.5, w0 * 0.0075)
+          : Math.min(0.85, w0 * 0.0042);
+        const sepAlpha = MathUtil.clamp((w0 - 10) / 14, 0, 1);
+        if (sepAlpha > 0.01 && sepW > 0.04) {
+          const prevAlpha = ctx.globalAlpha;
+          ctx.globalAlpha = prevAlpha * sepAlpha;
+          ctx.fillStyle = '#120a20';
+          ctx.fillRect(leftLightX - sepW * 0.5, leftLightY, sepW, lightH);
+          ctx.fillRect(rightTurnX - sepW * 0.5, rightLightY, sepW, lightH);
+          ctx.globalAlpha = prevAlpha;
+        }
       }
 
-      if (damagedByPlayer) {
-        const hazardOn = Math.floor(state.animClockMs / 260) % 2 === 0;
-        const hazW = Math.max(2.0, w0 * 0.055);
-        const hazH = Math.max(1.8, lightH * 1.00);
-        const hazY = leftLightY;
-        drawAmberSignalGlow(s0.cx - signalOuterX, hazY, hazW, hazH, hazardOn);
-        drawAmberSignalGlow(s0.cx + signalOuterX - hazW, hazY, hazW, hazH, hazardOn);
+      // Задний номерной знак гражданского трафика по центру между фонарями (плавный LOD без скачков)
+      if (dir === 1 && w0 >= 3.5) {
+        const plateW = w0 * 0.24;
+        const plateH = s0.h * 0.118;
+        const plateX = s0.cx - plateW * 0.5;
+        const plateY = s0.cy - s0.h * 0.525;
+        const plateVisAlpha = MathUtil.clamp((w0 - 3.5) / 5.5, 0, 1);
+        const prevAlpha = ctx.globalAlpha;
+
+        const framePad = Math.min(1.6, w0 * 0.0075);
+        const plateFrameAlpha = plateVisAlpha * MathUtil.clamp((w0 - 5.5) / 10.5, 0, 1);
+        if (plateFrameAlpha > 0.01 && framePad > 0.04) {
+          ctx.globalAlpha = prevAlpha * plateFrameAlpha;
+          ctx.fillStyle = '#130921';
+          ctx.fillRect(plateX - framePad, plateY - framePad, plateW + framePad * 2, plateH + framePad * 2);
+        }
+
+        ctx.globalAlpha = prevAlpha * plateVisAlpha;
+        ctx.fillStyle = damagedByPlayer ? '#8e889c' : '#f4f1ea';
+        ctx.fillRect(plateX, plateY, plateW, plateH);
+
+        const stripAlpha = plateVisAlpha * MathUtil.clamp((plateH - 1.0) / 1.8, 0, 1);
+        if (stripAlpha > 0.01) {
+          ctx.globalAlpha = prevAlpha * stripAlpha;
+          ctx.fillStyle = damagedByPlayer ? '#495066' : '#2563eb';
+          ctx.fillRect(plateX, plateY, plateW, plateH * 0.22);
+        }
+
+        // Плавный кроссфейд от условной тёмной полоски символов вдали к читаемому тексту номера вблизи
+        const textAlpha = MathUtil.clamp((plateH - 2.6) / 2.2, 0, 1);
+        const smudgeAlpha = plateVisAlpha * MathUtil.clamp((plateW - 4.0) / 5.0, 0, 1) * (1 - textAlpha);
+        if (smudgeAlpha > 0.01) {
+          ctx.globalAlpha = prevAlpha * smudgeAlpha * 0.65;
+          ctx.fillStyle = '#140326';
+          ctx.fillRect(plateX + plateW * 0.18, plateY + plateH * 0.54, plateW * 0.64, plateH * 0.22);
+        }
+
+        if (textAlpha > 0.01) {
+          const plateText = plate || '90X';
+          ctx.globalAlpha = prevAlpha * textAlpha;
+          ctx.fillStyle = damagedByPlayer ? '#2a2438' : '#140326';
+          ctx.font = `900 ${Math.max(4, plateH * 0.66)}px monospace`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(plateText, s0.cx, plateY + plateH * 0.62, plateW * 0.86);
+        }
+
+        ctx.globalAlpha = prevAlpha;
       }
     }
 
-    // Лип-спойлер гражданских спорткаров строго в ширине кормы
     if (!isPlayer && !isRival && type === 'sport' && dir === 1 && w0 > 16) {
-      const lipH = Math.max(1.8, s0.h * 0.055);
+      const lipH = s0.h * 0.055;
       ctx.fillStyle = MathUtil.shadeHex(secondary, 0.85);
       ctx.fillRect(s0.cx - w0 * 0.43, trunkLipY - lipH, w0 * 0.86, lipH);
     }
 
-    // Антикрыло игрока и соперников рисуется поверх оптики кормы (сломанная половина естественно нависает над фарой)
     if (isPlayer || isRival) {
       const sWingFront = sec(0.11);
       const wingH = Math.max(3, s0.h * 0.16);
@@ -2284,7 +2350,7 @@ function render3DCar(ctx, opts) {
         const stubX = s0.cx + bSign * w0 * 0.30;
         const stubTopY = trunkRearY - wingH * 0.38;
         ctx.strokeStyle = '#140326';
-        ctx.lineWidth = strutW;
+        ctx.lineWidth = Math.min(strutW, 10);
         ctx.beginPath();
         ctx.moveTo(stubX, trunkRearY);
         ctx.lineTo(stubX + bSign * strutW * 0.7, stubTopY);
@@ -2347,7 +2413,7 @@ function render3DCar(ctx, opts) {
         const rightStrutTopX = s0.cx + w0 * (bendLeft ? 0.31 : 0.33);
 
         ctx.strokeStyle = '#140326';
-        ctx.lineWidth = strutW;
+        ctx.lineWidth = Math.min(strutW, 10);
         ctx.beginPath();
         ctx.moveTo(s0.cx - w0 * 0.30, trunkRearY);
         ctx.lineTo(leftStrutTopX, leftRearY + 1);
@@ -2376,25 +2442,123 @@ function render3DCar(ctx, opts) {
       }
     }
 
-    // Бейдж соперника рисуется последним поверх всего кузова
-    if (!isPlayer && isRival && w0 > 36) {
-      const tagW = Math.max(46, w0 * 0.68);
-      const tagH = 15;
-      const tagX = s0.cx - tagW * 0.5;
-      const tagY = rearTopY - 22;
-      ctx.fillStyle = 'rgba(13, 2, 33, 0.82)';
-      ctx.strokeStyle = primary;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(tagX, tagY, tagW, tagH, 4);
-      ctx.fill();
-      ctx.stroke();
+    // --- Проход Б: световые ореолы и блики (поверх спойлера, ламп заднего хода и поворотников) ---
+    if (dir === -1) {
+      const headlightHaloFade = MathUtil.clamp((w0 - 3.5) / 14, 0, 1);
+      if (headlightHaloFade > 0.01 && !damagedByPlayer) {
+        const beamRadius = highBeamFlashing ? lightW * 2.55 : lightW * 1.25;
+        const hardBeamColor = highBeamFlashing ? 'rgba(210, 252, 255, 0.55)' : 'rgba(220, 250, 255, 0.22)';
+        const softBeamRadius = highBeamFlashing ? lightW * 3.45 : lightW * 2.1;
+        const softBeamStops = highBeamFlashing
+          ? [
+              [0.0, 'rgba(255, 255, 255, 0.95)'],
+              [0.32, 'rgba(200, 250, 255, 0.62)'],
+              [0.68, 'rgba(120, 235, 255, 0.22)'],
+              [1.0, 'rgba(120, 235, 255, 0.0)']
+            ]
+          : [
+              [0.0, 'rgba(240, 252, 255, 0.72)'],
+              [0.38, 'rgba(180, 242, 255, 0.34)'],
+              [1.0, 'rgba(140, 225, 255, 0.0)']
+            ];
+        drawLightHalo(ctx, leftLightX + lightW * 0.5, leftLightY + lightH * 0.5, beamRadius, hardBeamColor, softBeamRadius, softBeamStops, headlightHaloFade);
+        drawLightHalo(ctx, rightLightX + lightW * 0.5, rightLightY + lightH * 0.5, beamRadius, hardBeamColor, softBeamRadius, softBeamStops, headlightHaloFade);
 
-      ctx.fillStyle = '#ffffff';
-      ctx.font = '800 9.5px sans-serif';
+        const coneFade = MathUtil.clamp((w0 - 10) / 18, 0, 1);
+        if (highBeamFlashing && coneFade > 0.01) {
+          const coneTopY = leftLightY + lightH;
+          const coneBotY = s0.cy + s0.h * 0.35;
+          if (state.settings.lightStyle === 'soft') {
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha *= coneFade;
+            const coneGrad = ctx.createLinearGradient(0, coneTopY, 0, coneBotY);
+            coneGrad.addColorStop(0.0, 'rgba(215, 252, 255, 0.26)');
+            coneGrad.addColorStop(0.6, 'rgba(170, 242, 255, 0.10)');
+            coneGrad.addColorStop(1.0, 'rgba(140, 230, 255, 0.0)');
+            fillQuad(ctx, leftLightX, coneTopY, leftLightX + lightW, coneTopY, leftLightX + lightW + w0 * 0.14, coneBotY, leftLightX - w0 * 0.20, coneBotY, coneGrad);
+            fillQuad(ctx, rightLightX, coneTopY, rightLightX + lightW, coneTopY, rightLightX + lightW + w0 * 0.20, coneBotY, rightLightX - w0 * 0.14, coneBotY, coneGrad);
+            ctx.restore();
+          } else {
+            ctx.save();
+            ctx.globalAlpha *= coneFade;
+            fillQuad(ctx, leftLightX + lightW * 0.1, coneTopY, leftLightX + lightW * 0.9, coneTopY, leftLightX + lightW + w0 * 0.10, coneBotY, leftLightX - w0 * 0.14, coneBotY, 'rgba(210, 252, 255, 0.24)');
+            fillQuad(ctx, rightLightX + lightW * 0.1, coneTopY, rightLightX + lightW * 0.9, coneTopY, rightLightX + lightW + w0 * 0.14, coneBotY, rightLightX - w0 * 0.10, coneBotY, 'rgba(210, 252, 255, 0.24)');
+            ctx.restore();
+          }
+        }
+      }
+    } else {
+      const brakeHaloFade = MathUtil.clamp((w0 - 4.0) / 14, 0, 1);
+      if (braking && brakeHaloFade > 0.01 && (leftTailLit || rightTailLit)) {
+        const hardBrakeR = lightW * (isPlayer ? 1.15 : 1.05);
+        const hardBrakeColor = isPlayer ? 'rgba(255, 42, 95, 0.38)' : 'rgba(255, 42, 95, 0.36)';
+        const softBrakeR = lightW * (isPlayer ? 2.15 : 1.9);
+        const softBrakeStops = [
+          [0.0, 'rgba(255, 195, 210, 0.82)'],
+          [0.34, 'rgba(255, 42, 95, 0.50)'],
+          [1.0, 'rgba(255, 20, 75, 0.0)']
+        ];
+        if (leftTailLit) {
+          drawLightHalo(ctx, leftLightX + lightW * 0.5, leftLightY + lightH * 0.5, hardBrakeR, hardBrakeColor, softBrakeR, softBrakeStops, brakeHaloFade);
+        }
+        if (rightTailLit) {
+          drawLightHalo(ctx, rightLightX + lightW * 0.5, rightLightY + lightH * 0.5, hardBrakeR, hardBrakeColor, softBrakeR, softBrakeStops, brakeHaloFade);
+        }
+      }
+    }
+
+    if (isPlayer && reversing) {
+      const revSoftStops = [
+        [0.0, 'rgba(255, 255, 255, 0.90)'],
+        [0.35, 'rgba(200, 245, 255, 0.48)'],
+        [1.0, 'rgba(180, 240, 255, 0.0)']
+      ];
+      drawLightHalo(ctx, leftRevX + revW * 0.5, leftRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, revSoftStops);
+      drawLightHalo(ctx, rightRevX + revW * 0.5, rightRevY + revH * 0.5, revW * 1.5, 'rgba(220, 250, 255, 0.50)', revW * 2.6, revSoftStops);
+    } else if (isStreetTraffic && (leftTurnLit || rightTurnLit)) {
+      const signalHaloFade = MathUtil.clamp((w0 - 3.5) / 10, 0, 1);
+      const drawTurnSignalGlow = (lensX, lensY) => {
+        if (signalHaloFade > 0.01) {
+          const gx = lensX + turnW * 0.5;
+          const gy = lensY + lightH * 0.5;
+          const hardR = Math.max(turnW * 1.45, w0 * 0.095);
+          const softR = Math.max(turnW * 3.2, w0 * 0.22);
+
+          drawLightHalo(ctx, gx, gy, hardR, 'rgba(255, 190, 11, 0.52)', softR, [
+            [0.0, 'rgba(255, 250, 215, 0.95)'],
+            [0.26, 'rgba(255, 195, 20, 0.62)'],
+            [0.58, 'rgba(255, 115, 0, 0.24)'],
+            [1.0, 'rgba(255, 90, 0, 0.0)']
+          ], signalHaloFade);
+
+          ctx.fillStyle = '#fff9db';
+          ctx.fillRect(lensX + turnW * 0.18, lensY + lightH * 0.18, turnW * 0.64, lightH * 0.64);
+        }
+      };
+
+      if (leftTurnLit) drawTurnSignalGlow(leftTurnX, leftLightY);
+      if (rightTurnLit) drawTurnSignalGlow(rightTurnX, rightLightY);
+    }
+
+    // Чистый никнейм соперника над крышей без рамки и подложки (с плавным проявлением по дистанции)
+    if (!isPlayer && isRival && w0 > 26) {
+      const labelAlpha = MathUtil.clamp((w0 - 26) / 18, 0, 1);
+      const roofTopY = Math.min(rearTopY, sRoofRear.cy - sRoofRear.h * ROOF_TOP);
+      const labelY = roofTopY - 10;
+      const prevAlpha = ctx.globalAlpha;
+
+      ctx.globalAlpha = prevAlpha * labelAlpha;
+      ctx.font = '800 10px sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(`#${num} ${name}`, s0.cx, tagY + tagH * 0.52);
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = 2.6;
+      ctx.strokeStyle = 'rgba(9, 2, 22, 0.85)';
+      ctx.strokeText(`#${num} ${name}`, s0.cx, labelY);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`#${num} ${name}`, s0.cx, labelY);
+      ctx.globalAlpha = prevAlpha;
     }
   }
 
@@ -2429,18 +2593,20 @@ function renderTrafficCar(ctx, car) {
     turnSignal: car.turnSignal || 0,
     signalElapsed: car.signalElapsed || 0,
     name: car.name || '',
-    num: car.num || ''
+    num: car.num || '',
+    plate: car.plate || ''
   });
 }
 
 function renderPlayerCar(ctx, parkedCamZ = null) {
   const isParkedDetach = parkedCamZ !== null;
+  const isTitleDemo = state.gameState === STATE.TITLE;
   const absSpeedRatio = Math.abs(state.speed) / MAX_SPEED;
   const isOffRoad = Math.abs(state.playerX) > OFF_ROAD_THRESHOLD_X;
   const activeVisualDamage = state.gameMode !== 'circuit' ? state.visualDamage : 0;
 
-  const baseBounce = (!isParkedDetach && !state.isPaused && Math.abs(state.speed) > 15)
-    ? Math.sin(state.animClockMs * 0.045) * (0.5 + absSpeedRatio * 1.4)
+  const baseBounce = (!isParkedDetach && !state.isPaused && (Math.abs(state.speed) > 15 || isTitleDemo))
+    ? Math.sin(state.animClockMs * 0.045) * (0.5 + (isTitleDemo ? 0.26 : absSpeedRatio) * 1.4)
     : 0;
   const offRoadBounce = (!isParkedDetach && !state.isPaused && isOffRoad && Math.abs(state.speed) > 15)
     ? Math.sin(state.animClockMs * 0.16) * 2.0 * Math.min(1, absSpeedRatio * 2.5)
@@ -2463,10 +2629,15 @@ function renderPlayerCar(ctx, parkedCamZ = null) {
   const flickerPhase = Math.floor(state.animClockMs / 95);
   const input = state.input;
 
-  const isReversing = !isParkedDetach && !isTotalWreck && state.gameState === STATE.PLAYING && (state.speed < -2 || (input.down && !input.up && state.speed <= 2));
+  const isReversing =
+    !isParkedDetach &&
+    !isTotalWreck &&
+    state.gameState === STATE.PLAYING &&
+    state.raceCountdownTimer <= 0 &&
+    (state.speed < -2 || (input.down && !input.up && state.speed <= 2));
   const isBraking = isParkedDetach
     ? !isTotalWreck
-    : (!isTotalWreck && !isReversing && ((input.down && state.speed > 2) || (input.up && input.down) || Math.abs(state.speed) < 15));
+    : (!isTitleDemo && !isTotalWreck && !isReversing && ((input.down && state.speed > 2) || (input.up && input.down) || Math.abs(state.speed) < 15));
   const leftLightBroken = isTotalWreck || (hasDamageSystem && (state.leftDamage >= 3 || state.visualDamage >= 4));
   const rightLightBroken = isTotalWreck || (hasDamageSystem && (state.rightDamage >= 3 || state.visualDamage >= 4));
   const leftLightFlicker = !leftLightBroken && hasDamageSystem && state.leftDamage >= 2 && (flickerPhase % 3 === 0);
@@ -2476,6 +2647,7 @@ function renderPlayerCar(ctx, parkedCamZ = null) {
 
   render3DCar(ctx, {
     isPlayer: true,
+    isParkedDetach,
     isRival: false,
     type: 'sport',
     dir: 1,
@@ -2490,78 +2662,71 @@ function renderPlayerCar(ctx, parkedCamZ = null) {
     yaw: playerYaw,
     screenShiftX: crashShakeX,
     verticalOffset: baseBounce + offRoadBounce + damageWobble + crashShakeY,
-    useFallback: true,
+    useFallback: !isParkedDetach,
     braking: isBraking,
     reversing: isReversing,
-    isTotalWreck: isTotalWreck,
-    leftLightBroken: leftLightBroken,
-    rightLightBroken: rightLightBroken,
-    leftLightFlicker: leftLightFlicker,
-    rightLightFlicker: rightLightFlicker,
+    isTotalWreck,
+    leftLightBroken,
+    rightLightBroken,
+    leftLightFlicker,
+    rightLightFlicker,
     visualDamageLevel: activeVisualDamage,
     leftDamageLevel: hasDamageSystem ? state.leftDamage : 0,
     rightDamageLevel: hasDamageSystem ? state.rightDamage : 0,
     rearDamageLevel: hasDamageSystem ? state.rearDamage : 0,
     spoilerDamageSide: hasDamageSystem ? state.spoilerDamageSide : 0,
-    showExhaustFlame: showExhaustFlame,
+    showExhaustFlame,
     isSlipstreamingFlame: state.isSlipstreaming,
-    showBackfireFlame: showBackfireFlame
+    showBackfireFlame
   });
 }
 
 function renderParticles(ctx) {
   if (!state.settings.particlesEnabled) return;
   const particles = state.particles;
+  if (!particles.length) return;
+
   const isSoftLight = state.settings.lightStyle === 'soft';
 
-  for (let i = 0; i < particles.length; i++) {
-    const p = particles[i];
-    const alpha = MathUtil.clamp(p.life / p.maxLife, 0, 1);
-    if (alpha <= 0.01) continue;
+  ctx.save();
+  if (isSoftLight) {
+    let activeComposite = 'source-over';
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      const alpha = MathUtil.clamp(p.life / p.maxLife, 0, 1);
+      if (alpha <= 0.01) continue;
 
-    ctx.save();
-    if (isSoftLight) {
       const c = parseParticleColor(p.color);
-      if (c.isLuminous) {
-        // Мягкие светящиеся искры и прострелы выхлопа
-        const r = Math.max(2.5, p.size * 2.1);
-        ctx.globalCompositeOperation = 'screen';
-        ctx.globalAlpha = alpha;
-        const grad = ctx.createRadialGradient(p.x, p.y, r * 0.06, p.x, p.y, r);
-        grad.addColorStop(0.0, 'rgba(255, 253, 232, 0.96)');
-        grad.addColorStop(0.32, `rgba(${c.r}, ${c.g}, ${c.b}, 0.72)`);
-        grad.addColorStop(0.70, `rgba(${c.r}, ${Math.round(c.g * 0.55)}, 0, 0.22)`);
-        grad.addColorStop(1.0, `rgba(${c.r}, ${Math.round(c.g * 0.4)}, 0, 0.0)`);
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-        ctx.fill();
-      } else {
-        // Мягкие размытые клубы дыма от шин/мотора и облачка пыли на обочине
-        const r = Math.max(2.5, p.size * (p.expandRate > 0 ? 1.5 : 1.3));
-        const baseA = c.a * alpha;
-        const grad = ctx.createRadialGradient(p.x, p.y, r * 0.08, p.x, p.y, r);
-        grad.addColorStop(0.0, `rgba(${c.r}, ${c.g}, ${c.b}, ${(baseA * 0.92).toFixed(3)})`);
-        grad.addColorStop(0.45, `rgba(${c.r}, ${c.g}, ${c.b}, ${(baseA * 0.46).toFixed(3)})`);
-        grad.addColorStop(1.0, `rgba(${c.r}, ${c.g}, ${c.b}, 0.0)`);
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-        ctx.fill();
+      const targetComposite = c.isLuminous ? 'screen' : 'source-over';
+      if (targetComposite !== activeComposite) {
+        ctx.globalCompositeOperation = targetComposite;
+        activeComposite = targetComposite;
       }
-    } else {
+
+      const r = c.isLuminous
+        ? Math.max(2.5, p.size * 2.1)
+        : Math.max(2.5, p.size * (p.expandRate > 0 ? 1.5 : 1.3));
+      ctx.globalAlpha = c.isLuminous ? alpha : c.a * alpha;
+      ctx.drawImage(getSoftParticleSprite(c), p.x - r, p.y - r, r * 2, r * 2);
+    }
+  } else {
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      const alpha = MathUtil.clamp(p.life / p.maxLife, 0, 1);
+      if (alpha <= 0.01) continue;
+
       ctx.globalAlpha = alpha;
       ctx.fillStyle = p.color;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
       ctx.fill();
     }
-    ctx.restore();
   }
+  ctx.restore();
 }
 
 export function renderFrame(ctx) {
-  state.frameCounter++;
+  const frameId = ++state.frameCounter;
   const LOGICAL_WIDTH = state.logicalWidth;
   const segments = state.segments;
   const trackLength = state.trackLength;
@@ -2588,7 +2753,8 @@ export function renderFrame(ctx) {
   const playerY = MathUtil.lerp(playerSegment.p1.world.y, playerSegment.p2.world.y, playerPercent);
 
   const effectiveCamXNorm = state.playerX - state.cameraLagX;
-  let maxY = Math.max(LOGICAL_HEIGHT, LOGICAL_HEIGHT + state.cameraPitch);
+  // Запас +14px снизу исключает оголение фона в углах экрана при крене камеры (cameraRoll)
+  let maxY = LOGICAL_HEIGHT + 14 + Math.max(0, state.cameraPitch);
   let x = 0;
   let dx = -(baseSegment.curve * basePercent);
 
@@ -2626,10 +2792,8 @@ export function renderFrame(ctx) {
     dx += seg.curve;
     seg.clip = maxY;
 
-    // Отмечаем все спроецированные сегменты впереди камеры (включая скрытые за холмами),
-    // чтобы машины плавно выезжали из-за перегиба с обрезкой по seg.clip
-    if (seg.p2.camera.z > state.activeCameraDepth * 0.35) {
-      seg.projectedFrame = state.frameCounter;
+    if (seg.p2.camera.z > MIN_SAMPLE_CAM_Z) {
+      seg.projectedFrame = frameId;
     }
 
     if (
@@ -2649,85 +2813,91 @@ export function renderFrame(ctx) {
 
   renderRoadHeadlights(ctx);
 
-  const foregroundCars = [];
-  const foregroundArchBeams = [];
-  const renderedCars = new Set();
+  _foregroundCars.length = 0;
+  _foregroundArchBeams.length = 0;
   const foregroundThresholdZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
 
   // 2. Обратный проход: отбойники, спрайты, машины и арки
-  for (let n = DRAW_DISTANCE - 1; n >= -1; n--) {
-    const segIndex = (baseSegment.index + n + segments.length) % segments.length;
+  for (let n = DRAW_DISTANCE - 1; n >= 0; n--) {
+    const segIndex = (baseSegment.index + n) % segments.length;
     const seg = segments[segIndex];
-    const segArchBeams = [];
+    _segArchBeams.length = 0;
 
-    if (n >= 0 && seg.p1.camera.z > state.activeCameraDepth) {
+    if (seg.p1.camera.z > MIN_GUARDRAIL_CAM_Z) {
       if (state.gameMode === 'circuit') {
         renderGuardrail(ctx, seg);
       }
 
-      for (let i = 0; i < seg.sprites.length; i++) {
-        const sp = seg.sprites[i];
-        const spriteScale = seg.p1.screen.scale;
-        const spriteX = seg.p1.screen.x + (spriteScale * sp.offset * ROAD_WIDTH * PROJ_HALF_WIDTH);
-        const spriteY = seg.p1.screen.y;
-        const isArch = sp.type === 'start_arch' || sp.type === 'checkpoint_arch';
+      if (seg.p1.camera.z > MIN_SPRITE_CAM_Z) {
+        for (let i = 0; i < seg.sprites.length; i++) {
+          const sp = seg.sprites[i];
+          const spriteScale = seg.p1.screen.scale;
+          const spriteX = seg.p1.screen.x + (spriteScale * sp.offset * ROAD_WIDTH * PROJ_HALF_WIDTH);
+          const spriteY = seg.p1.screen.y;
+          const isArch = sp.type === 'start_arch' || sp.type === 'checkpoint_arch';
 
-        if (isArch && seg.p1.camera.z < foregroundThresholdZ) {
-          // Если арка уже между камерой и машиной игрока, откладываем и опоры, и перекладину на передний план
-          segArchBeams.push({
-            scale: spriteScale,
-            x: spriteX,
-            y: spriteY,
-            clip: seg.clip,
-            isStartFinish: sp.type === 'start_arch',
-            camZ: seg.p1.camera.z,
-            drawPillars: true
-          });
-          continue;
-        }
+          if (isArch && seg.p1.camera.z < foregroundThresholdZ) {
+            _segArchBeams.push({
+              scale: spriteScale,
+              x: spriteX,
+              y: spriteY,
+              clip: seg.clip,
+              isStartFinish: sp.type === 'start_arch',
+              camZ: seg.p1.camera.z,
+              drawPillars: true
+            });
+            continue;
+          }
 
-        renderSprite(ctx, sp, spriteScale, spriteX, spriteY, seg.clip);
+          renderSprite(ctx, sp, spriteScale, spriteX, spriteY, seg.clip);
 
-        if (isArch) {
-          segArchBeams.push({
-            scale: spriteScale,
-            x: spriteX,
-            y: spriteY,
-            clip: seg.clip,
-            isStartFinish: sp.type === 'start_arch',
-            camZ: seg.p1.camera.z,
-            drawPillars: false
-          });
+          if (isArch) {
+            _segArchBeams.push({
+              scale: spriteScale,
+              x: spriteX,
+              y: spriteY,
+              clip: seg.clip,
+              isStartFinish: sp.type === 'start_arch',
+              camZ: seg.p1.camera.z,
+              drawPillars: false
+            });
+          }
         }
       }
     }
 
     if (seg.cars.length > 0) {
-      const segCars = seg.cars.length > 1
-        ? seg.cars.slice().sort((a, b) => getShortestTrackDz(state.position, b.z, trackLength) - getShortestTrackDz(state.position, a.z, trackLength))
-        : seg.cars;
+      let segCars = seg.cars;
+      if (segCars.length > 1) {
+        _segCarsScratch.length = 0;
+        for (let i = 0; i < segCars.length; i++) _segCarsScratch.push(segCars[i]);
+        _segCarsScratch.sort(
+          (a, b) => getShortestTrackDz(state.position, b.z, trackLength) - getShortestTrackDz(state.position, a.z, trackLength)
+        );
+        segCars = _segCarsScratch;
+      }
 
       for (let i = 0; i < segCars.length; i++) {
         const car = segCars[i];
-        if (renderedCars.has(car)) continue;
-        renderedCars.add(car);
+        if (car._renderedFrame === frameId) continue;
+        car._renderedFrame = frameId;
 
         const carCamZ = getShortestTrackDz(state.position, car.z, trackLength);
         const halfCarLen = (car.lenZ || SEGMENT_LENGTH * 1.3) * 0.5;
-        if (carCamZ + halfCarLen <= state.activeCameraDepth * 0.75) continue;
+        if (carCamZ + halfCarLen <= MIN_CAR_CAM_Z) continue;
 
         if (carCamZ < foregroundThresholdZ) {
-          foregroundCars.push({ car, carCamZ });
+          _foregroundCars.push({ car, carCamZ });
         } else {
           renderTrafficCar(ctx, car);
         }
       }
     }
 
-    for (let b = 0; b < segArchBeams.length; b++) {
-      const beam = segArchBeams[b];
+    for (let b = 0; b < _segArchBeams.length; b++) {
+      const beam = _segArchBeams[b];
       if (beam.drawPillars || beam.camZ < foregroundThresholdZ + 220) {
-        foregroundArchBeams.push(beam);
+        _foregroundArchBeams.push(beam);
       } else {
         renderOverheadArchBeam(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
       }
@@ -2745,18 +2915,18 @@ export function renderFrame(ctx) {
     renderPlayerCar(ctx);
   } else if (!state.playerCarPassedByCamera) {
     const parkedCamZ = getShortestTrackDz(state.position, state.stoppedPlayerZ, trackLength);
-    if (parkedCamZ + PLAYER_LEN_Z * 0.5 <= state.activeCameraDepth * 0.75) {
+    if (parkedCamZ + PLAYER_LEN_Z * 0.5 <= MIN_CAR_CAM_Z) {
       state.playerCarPassedByCamera = true;
     } else {
-      foregroundCars.push({ isParkedPlayer: true, carCamZ: parkedCamZ });
+      _foregroundCars.push({ isParkedPlayer: true, carCamZ: parkedCamZ });
     }
   }
 
   // 4. Машины на переднем плане
-  if (foregroundCars.length > 0) {
-    foregroundCars.sort((a, b) => b.carCamZ - a.carCamZ);
-    for (let i = 0; i < foregroundCars.length; i++) {
-      const item = foregroundCars[i];
+  if (_foregroundCars.length > 0) {
+    _foregroundCars.sort((a, b) => b.carCamZ - a.carCamZ);
+    for (let i = 0; i < _foregroundCars.length; i++) {
+      const item = _foregroundCars[i];
       if (item.isParkedPlayer) {
         renderPlayerCar(ctx, item.carCamZ);
       } else {
@@ -2766,10 +2936,10 @@ export function renderFrame(ctx) {
   }
 
   // 5. Ближние арки (перекладины и опоры, оказавшиеся ближе машины игрока)
-  if (foregroundArchBeams.length > 0) {
-    foregroundArchBeams.sort((a, b) => b.camZ - a.camZ);
-    for (let b = 0; b < foregroundArchBeams.length; b++) {
-      const beam = foregroundArchBeams[b];
+  if (_foregroundArchBeams.length > 0) {
+    _foregroundArchBeams.sort((a, b) => b.camZ - a.camZ);
+    for (let b = 0; b < _foregroundArchBeams.length; b++) {
+      const beam = _foregroundArchBeams[b];
       if (beam.drawPillars) {
         renderOverheadArchPillarsClipped(ctx, beam.scale, beam.x, beam.y, beam.clip, beam.isStartFinish);
       }

@@ -1,6 +1,21 @@
 import { MathUtil } from './utils.js';
 
 /**
+ * Безопасное авто-отключение одноразовых аудио-нод по завершении проигрывания
+ */
+function attachAutoDisconnect(sourceNode, ...nodesToDisconnect) {
+  sourceNode.onended = () => {
+    for (let i = 0; i < nodesToDisconnect.length; i++) {
+      const node = nodesToDisconnect[i];
+      if (!node) continue;
+      try {
+        node.disconnect();
+      } catch (e) {}
+    }
+  };
+}
+
+/**
  * Процедурный аудио-синтезатор (Web Audio API)
  */
 export class RetroAudioEngine {
@@ -32,107 +47,99 @@ export class RetroAudioEngine {
     this.noiseGain = null;
   }
 
+  /**
+   * Создаёт, настраивает и запускает постоянный осциллятор с подключением к целевому узлу
+   */
+  _createContinuousOsc(type, freq, destination) {
+    const osc = this.ctx.createOscillator();
+    osc.type = type;
+    osc.frequency.value = freq;
+    osc.connect(destination);
+    osc.start();
+    return osc;
+  }
+
+  /**
+   * Возобновляет контекст только если он приостановлен политикой автозапуска или iOS-прерыванием
+   */
+  _resumeIfNeeded() {
+    if (this.ctx && (this.ctx.state === 'suspended' || this.ctx.state === 'interrupted')) {
+      this.ctx.resume().catch(() => {});
+    }
+  }
+
+  /**
+   * Плавно уводит громкость всех непрерывных каналов в ноль
+   */
+  _silenceContinuousChannels(now, timeConstant = 0.05, resetFilterQ = false) {
+    if (this.engineGain) this.engineGain.gain.setTargetAtTime(0, now, timeConstant);
+    if (resetFilterQ && this.engineFilter) this.engineFilter.Q.setTargetAtTime(1.0, now, timeConstant);
+    if (this.damageRattleGain) this.damageRattleGain.gain.setTargetAtTime(0, now, timeConstant);
+    if (this.brakeGain) this.brakeGain.gain.setTargetAtTime(0, now, timeConstant);
+    if (this.noiseGain) this.noiseGain.gain.setTargetAtTime(0, now, timeConstant);
+  }
+
   init() {
     if (this.initialized) {
-      if (this.ctx && this.ctx.state !== 'running') {
-        this.ctx.resume().catch(() => {});
-      }
+      this._resumeIfNeeded();
       return;
     }
+
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return;
       this.ctx = new AudioCtx();
-      if (this.ctx.state !== 'running') {
-        this.ctx.resume().catch(() => {});
-      }
+      this._resumeIfNeeded();
 
-      // Основной двигатель
-      this.engineOsc = this.ctx.createOscillator();
-      this.engineSubOsc = this.ctx.createOscillator();
+      // 1. Основной двигатель
       this.engineFilter = this.ctx.createBiquadFilter();
-      this.engineGain = this.ctx.createGain();
-
-      this.engineOsc.type = 'sawtooth';
-      this.engineSubOsc.type = 'triangle';
-      this.engineOsc.frequency.value = 55;
-      this.engineSubOsc.frequency.value = 27.5;
-
       this.engineFilter.type = 'lowpass';
       this.engineFilter.frequency.value = 280;
       this.engineFilter.Q.value = 1.0;
-      this.engineGain.gain.value = 0.0;
 
-      this.engineOsc.connect(this.engineFilter);
-      this.engineSubOsc.connect(this.engineFilter);
+      this.engineGain = this.ctx.createGain();
+      this.engineGain.gain.value = 0.0;
       this.engineFilter.connect(this.engineGain);
       this.engineGain.connect(this.ctx.destination);
 
-      this.engineOsc.start();
-      this.engineSubOsc.start();
+      this.engineOsc = this._createContinuousOsc('sawtooth', 55, this.engineFilter);
+      this.engineSubOsc = this._createContinuousOsc('triangle', 27.5, this.engineFilter);
 
-      // Слой повреждённого мотора
-      this.damageRattleOsc = this.ctx.createOscillator();
-      this.damageKnockOsc = this.ctx.createOscillator();
+      // 2. Слой повреждённого мотора
       this.damageBandpass = this.ctx.createBiquadFilter();
-      this.damageRattleGain = this.ctx.createGain();
-
-      this.damageRattleOsc.type = 'sawtooth';
-      this.damageKnockOsc.type = 'square';
-      this.damageRattleOsc.frequency.value = 28;
-      this.damageKnockOsc.frequency.value = 82;
-
       this.damageBandpass.type = 'bandpass';
       this.damageBandpass.frequency.value = 640;
       this.damageBandpass.Q.value = 3.2;
 
+      this.damageRattleGain = this.ctx.createGain();
       this.damageRattleGain.gain.value = 0.0;
-
-      this.damageRattleOsc.connect(this.damageBandpass);
-      this.damageKnockOsc.connect(this.damageBandpass);
       this.damageBandpass.connect(this.damageRattleGain);
       this.damageRattleGain.connect(this.ctx.destination);
 
-      this.damageRattleOsc.start();
-      this.damageKnockOsc.start();
+      this.damageRattleOsc = this._createContinuousOsc('sawtooth', 28, this.damageBandpass);
+      this.damageKnockOsc = this._createContinuousOsc('square', 82, this.damageBandpass);
 
-      // 8-битный аркадный визг шин при торможении
-      this.brakeOsc1 = this.ctx.createOscillator();
-      this.brakeOsc2 = this.ctx.createOscillator();
-      this.brakeLfo = this.ctx.createOscillator();
-      this.brakeLfoGain = this.ctx.createGain();
+      // 3. 8-битный аркадный визг шин при торможении
       this.brakeFilter = this.ctx.createBiquadFilter();
-      this.brakeGain = this.ctx.createGain();
-
-      this.brakeOsc1.type = 'square';
-      this.brakeOsc2.type = 'sawtooth';
-      this.brakeOsc1.frequency.value = 380;
-      this.brakeOsc2.frequency.value = 406;
-
-      this.brakeLfo.type = 'triangle';
-      this.brakeLfo.frequency.value = 34;
-      this.brakeLfoGain.gain.value = 16;
-
       this.brakeFilter.type = 'lowpass';
       this.brakeFilter.frequency.value = 880;
       this.brakeFilter.Q.value = 2.4;
 
+      this.brakeGain = this.ctx.createGain();
       this.brakeGain.gain.value = 0.0;
-
-      this.brakeLfo.connect(this.brakeLfoGain);
-      this.brakeLfoGain.connect(this.brakeOsc1.frequency);
-      this.brakeLfoGain.connect(this.brakeOsc2.frequency);
-
-      this.brakeOsc1.connect(this.brakeFilter);
-      this.brakeOsc2.connect(this.brakeFilter);
       this.brakeFilter.connect(this.brakeGain);
       this.brakeGain.connect(this.ctx.destination);
 
-      this.brakeOsc1.start();
-      this.brakeOsc2.start();
-      this.brakeLfo.start();
+      this.brakeOsc1 = this._createContinuousOsc('square', 380, this.brakeFilter);
+      this.brakeOsc2 = this._createContinuousOsc('sawtooth', 406, this.brakeFilter);
 
-      // Генератор шума для гравия на обочине и хлопков выхлопа
+      this.brakeLfoGain = this.ctx.createGain();
+      this.brakeLfoGain.gain.value = 16;
+      this.brakeLfoGain.connect(this.brakeOsc1.frequency);
+      this.brakeLfoGain.connect(this.brakeOsc2.frequency);
+      this.brakeLfo = this._createContinuousOsc('triangle', 34, this.brakeLfoGain);
+
+      // 4. Генератор белого шума для гравия на обочине и хлопков выхлопа
       const bufferSize = this.ctx.sampleRate * 2;
       const noiseBuffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
       const data = noiseBuffer.getChannelData(0);
@@ -140,10 +147,6 @@ export class RetroAudioEngine {
         data[i] = Math.random() * 2 - 1;
       }
       this.noiseBuffer = noiseBuffer;
-
-      this.noiseNode = this.ctx.createBufferSource();
-      this.noiseNode.buffer = noiseBuffer;
-      this.noiseNode.loop = true;
 
       this.noiseFilter = this.ctx.createBiquadFilter();
       this.noiseFilter.type = 'bandpass';
@@ -153,13 +156,18 @@ export class RetroAudioEngine {
       this.noiseGain = this.ctx.createGain();
       this.noiseGain.gain.value = 0.0;
 
+      this.noiseNode = this.ctx.createBufferSource();
+      this.noiseNode.buffer = noiseBuffer;
+      this.noiseNode.loop = true;
       this.noiseNode.connect(this.noiseFilter);
       this.noiseFilter.connect(this.noiseGain);
       this.noiseGain.connect(this.ctx.destination);
       this.noiseNode.start();
 
       this.initialized = true;
-    } catch (e) {}
+    } catch (e) {
+      this.initialized = false;
+    }
   }
 
   toggleMute() {
@@ -167,11 +175,7 @@ export class RetroAudioEngine {
     if (!this.muted) {
       this.init();
     } else if (this.initialized && this.ctx) {
-      const now = this.ctx.currentTime;
-      this.engineGain.gain.setTargetAtTime(0, now, 0.03);
-      if (this.damageRattleGain) this.damageRattleGain.gain.setTargetAtTime(0, now, 0.03);
-      this.brakeGain.gain.setTargetAtTime(0, now, 0.03);
-      this.noiseGain.gain.setTargetAtTime(0, now, 0.03);
+      this._silenceContinuousChannels(this.ctx.currentTime, 0.03, false);
     }
     return this.muted;
   }
@@ -180,33 +184,32 @@ export class RetroAudioEngine {
     if (this.muted) return;
     this.init();
     if (!this.initialized || !this.ctx) return;
+
     try {
-      const safeDuration = Math.max(0.01, duration);
+      const safeDuration = Math.max(0.01, Number.isFinite(duration) ? duration : 0.1);
       // Защита огибающей: время атаки не превышает четверти общей длительности звука
       const attack = Math.min(0.015, safeDuration * 0.25);
-      const safeFreq = Math.max(20, freq);
-      const safeVolume = Math.max(0.001, volume);
+      const safeFreq = Math.max(20, Number.isFinite(freq) ? freq : 440);
+      const safeVolume = Math.max(0.001, Number.isFinite(volume) ? volume : 0.14);
+      const safeDelay = Math.max(0, Number.isFinite(delay) ? delay : 0);
 
-      const startTime = this.ctx.currentTime + Math.max(0, delay);
+      const startTime = this.ctx.currentTime + safeDelay;
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.type = type;
       osc.frequency.setValueAtTime(safeFreq, startTime);
-      if (slideTo !== null) {
+      if (slideTo !== null && Number.isFinite(slideTo)) {
         osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), startTime + safeDuration);
       }
+
       gain.gain.setValueAtTime(0.001, startTime);
       gain.gain.linearRampToValueAtTime(safeVolume, startTime + attack);
       gain.gain.exponentialRampToValueAtTime(0.0001, startTime + safeDuration);
 
       osc.connect(gain);
       gain.connect(this.ctx.destination);
-      osc.onended = () => {
-        try {
-          osc.disconnect();
-          gain.disconnect();
-        } catch (e) {}
-      };
+      attachAutoDisconnect(osc, osc, gain);
+
       osc.start(startTime);
       osc.stop(startTime + safeDuration + 0.02);
     } catch (e) {}
@@ -216,30 +219,30 @@ export class RetroAudioEngine {
     if (this.muted) return;
     this.init();
     if (!this.initialized || !this.ctx) return;
+
     this.playTone(125, 0.13, 'sawtooth', 0.11, 36, 0);
     this.playTone(72, 0.16, 'triangle', 0.12, 28, 0.01);
+
     try {
       if (this.noiseBuffer) {
         const now = this.ctx.currentTime;
         const src = this.ctx.createBufferSource();
         src.buffer = this.noiseBuffer;
+
         const filter = this.ctx.createBiquadFilter();
         filter.type = 'lowpass';
         filter.frequency.setValueAtTime(620, now);
         filter.frequency.exponentialRampToValueAtTime(140, now + 0.14);
+
         const gain = this.ctx.createGain();
         gain.gain.setValueAtTime(0.09, now);
         gain.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
+
         src.connect(filter);
         filter.connect(gain);
         gain.connect(this.ctx.destination);
-        src.onended = () => {
-          try {
-            src.disconnect();
-            filter.disconnect();
-            gain.disconnect();
-          } catch (e) {}
-        };
+        attachAutoDisconnect(src, src, filter, gain);
+
         src.start(now, Math.random() * 1.2, 0.15);
       }
     } catch (e) {}
@@ -261,7 +264,8 @@ export class RetroAudioEngine {
   }
 
   playCrash(intensity = 1) {
-    const vol = MathUtil.clamp(0.14 * intensity, 0.08, 0.28);
+    const safeIntensity = Number.isFinite(intensity) ? intensity : 1;
+    const vol = MathUtil.clamp(0.14 * safeIntensity, 0.08, 0.28);
     this.playTone(135, 0.24, 'sawtooth', vol, 32, 0);
     this.playTone(75, 0.32, 'square', vol * 0.9, 24, 0.02);
   }
@@ -302,35 +306,35 @@ export class RetroAudioEngine {
     const now = this.ctx.currentTime;
 
     if (this.muted || !isPlaying) {
-      this.engineGain.gain.setTargetAtTime(0, now, 0.05);
-      this.engineFilter.Q.setTargetAtTime(1.0, now, 0.05);
-      if (this.damageRattleGain) this.damageRattleGain.gain.setTargetAtTime(0, now, 0.05);
-      this.brakeGain.gain.setTargetAtTime(0, now, 0.05);
-      this.noiseGain.gain.setTargetAtTime(0, now, 0.05);
+      this._silenceContinuousChannels(now, 0.05, true);
       return;
     }
 
+    const safeSpeed = Number.isFinite(speedRatio) ? speedRatio : 0;
+    const safeDamage = Number.isFinite(damageRatio) ? damageRatio : 0;
+
     if (revOnly) {
-      const baseFreq = 58 + speedRatio * 145;
+      const revClamped = MathUtil.clamp(safeSpeed, 0, 1);
+      const baseFreq = 58 + revClamped * 145;
       this.engineOsc.frequency.setTargetAtTime(baseFreq, now, 0.05);
       this.engineSubOsc.frequency.setTargetAtTime(baseFreq * 0.5, now, 0.05);
-      this.engineFilter.frequency.setTargetAtTime(240 + speedRatio * 360, now, 0.05);
+      this.engineFilter.frequency.setTargetAtTime(240 + revClamped * 360, now, 0.05);
       // Сбрасываем резонанс фильтра, чтобы после заезда на разбитой машине прогазовка звучала чисто
       this.engineFilter.Q.setTargetAtTime(1.0, now, 0.05);
-      this.engineGain.gain.setTargetAtTime(0.045 + speedRatio * 0.04, now, 0.05);
+      this.engineGain.gain.setTargetAtTime(0.045 + revClamped * 0.04, now, 0.05);
       if (this.damageRattleGain) this.damageRattleGain.gain.setTargetAtTime(0, now, 0.05);
       this.brakeGain.gain.setTargetAtTime(0, now, 0.04);
       this.noiseGain.gain.setTargetAtTime(0, now, 0.04);
       return;
     }
 
-    const absRatio = MathUtil.clamp(Math.abs(speedRatio), 0, 1);
+    const absRatio = MathUtil.clamp(Math.abs(safeSpeed), 0, 1);
     const gearCount = 5;
     const scaled = absRatio * gearCount;
     const gearFraction = scaled - Math.floor(scaled);
     const rpm = absRatio >= 0.96 ? 0.92 : (0.28 + gearFraction * 0.68);
 
-    const dmgSeverity = MathUtil.clamp((damageRatio - 0.35) / 0.65, 0, 1);
+    const dmgSeverity = MathUtil.clamp((safeDamage - 0.35) / 0.65, 0, 1);
     let roughPitchMult = 1.0;
     let roughGainMult = 1.0;
 
@@ -342,11 +346,11 @@ export class RetroAudioEngine {
       roughGainMult = sputterPulse ? (1.0 - 0.38 * dmgSeverity) : 1.0;
     }
 
-    const baseFreq = (48 + rpm * 125 + absRatio * 35) * roughPitchMult;
+    const baseFreq = Math.max(20, (48 + rpm * 125 + absRatio * 35) * roughPitchMult);
     this.engineOsc.frequency.setTargetAtTime(baseFreq, now, 0.03);
     this.engineSubOsc.frequency.setTargetAtTime(baseFreq * 0.5, now, 0.03);
 
-    const filterFreq = (220 + rpm * 340) * (1.0 - dmgSeverity * 0.26);
+    const filterFreq = Math.max(60, (220 + rpm * 340) * (1.0 - dmgSeverity * 0.26));
     this.engineFilter.frequency.setTargetAtTime(filterFreq, now, 0.04);
     this.engineFilter.Q.setTargetAtTime(1.0 + dmgSeverity * 2.8, now, 0.05);
 
@@ -366,11 +370,17 @@ export class RetroAudioEngine {
       }
     }
 
+    // Шум гравия на обочине с тактильным усилением при торможении на грунте
     let targetNoise = 0;
+    let targetNoiseFreq = 460;
     if (isOffRoad && absRatio > 0.03) {
-      targetNoise = 0.06 * Math.min(1, absRatio * 2.2);
+      const gravelBrakeBoost = isBraking && absRatio > 0.05 ? 1.28 : 1.0;
+      targetNoise = Math.min(0.082, 0.06 * Math.min(1, absRatio * 2.2) * gravelBrakeBoost);
+      if (isBraking && absRatio > 0.05) {
+        targetNoiseFreq = 520;
+      }
     }
-    this.noiseFilter.frequency.setTargetAtTime(460, now, 0.05);
+    this.noiseFilter.frequency.setTargetAtTime(targetNoiseFreq, now, 0.05);
     this.noiseGain.gain.setTargetAtTime(targetNoise, now, 0.05);
 
     let targetBrakeGain = 0;
