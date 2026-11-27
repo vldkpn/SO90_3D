@@ -13,7 +13,13 @@ import { state, findSegment } from './state.js';
 const MAX_CIRCUIT_CURVE = 7.6;
 const SHARP_CURVE_THRESHOLD = 5.8;
 
-// Переиспользуемые неизменяемые палитры сегментов (убирают 1660 аллокаций объектов при построении трассы)
+// Параметры геометрии защитных отбойников в кольцевом режиме:
+// расширенный запас до/после пика кривизны и склейка коротких разрывов устраняют внезапное появление секций
+const GUARDRAIL_LEAD_PAD_SEGS = 6;
+const GUARDRAIL_BRIDGE_GAP_SEGS = 4;
+const GUARDRAIL_TAPER_SCALES = Object.freeze([0.38, 0.72, 0.90]);
+
+// Переиспользуемые неизменяемые палитры сегментов (убирают лишние аллокации объектов при построении трассы)
 const PALETTE_DARK = Object.freeze({
   road: '#252a42',
   grass: '#100624',
@@ -38,7 +44,23 @@ const PALETTE_LIGHT_SHARP_PINK = Object.freeze({ ...PALETTE_LIGHT, rumble: '#ff2
 let skidWriteIdx = 0;
 
 /**
- * Запись следов торможения для игрока (sampleOwner = null) или соперника
+ * Обновляет сохранённую точку предыдущего сэмпла тормозного следа на месте без создания нового объекта в куче
+ */
+function updatePrevSkidSample(sampleOwner, prev, z, x) {
+  if (prev) {
+    prev.z = z;
+    prev.x = x;
+    return prev;
+  }
+  const created = { z, x };
+  if (sampleOwner) sampleOwner.prevSkidSample = created;
+  else state.prevSkidSample = created;
+  return created;
+}
+
+/**
+ * Запись следов торможения для игрока (sampleOwner = null) или ИИ-соперника.
+ * Использует кольцевой пул объектов: после заполнения буфера MAX_SKID_MARKS новые аллокации равны 0.
  */
 export function recordSkidMarks(currZ, currX, alpha, fallbackBackDist = 0, sampleOwner = null) {
   const trackLength = state.trackLength;
@@ -50,25 +72,20 @@ export function recordSkidMarks(currZ, currX, alpha, fallbackBackDist = 0, sampl
   }
 
   let prev = sampleOwner ? sampleOwner.prevSkidSample : state.prevSkidSample;
-  const setPrev = (val) => {
-    if (sampleOwner) sampleOwner.prevSkidSample = val;
-    else state.prevSkidSample = val;
-  };
 
   if (!prev) {
     if (fallbackBackDist > 1) {
       const startZ = (((currZ - fallbackBackDist) % trackLength) + trackLength) % trackLength;
-      prev = { z: startZ, x: currX };
-      setPrev(prev);
+      prev = updatePrevSkidSample(sampleOwner, null, startZ, currX);
     } else {
-      setPrev({ z: currZ, x: currX });
+      updatePrevSkidSample(sampleOwner, null, currZ, currX);
       return;
     }
   }
 
   const dz = getShortestTrackDz(prev.z, currZ, trackLength);
   if (dz <= 0.5 || dz > SEGMENT_LENGTH * 6) {
-    setPrev({ z: currZ, x: currX });
+    updatePrevSkidSample(sampleOwner, prev, currZ, currX);
     return;
   }
 
@@ -97,18 +114,31 @@ export function recordSkidMarks(currZ, currX, alpha, fallbackBackDist = 0, sampl
       const x1 = MathUtil.lerp(prev.x, currX, frac1);
       const x2 = MathUtil.lerp(prev.x, currX, frac2);
 
-      const mark = { seg, t1, x1, t2, x2, alpha };
-      seg.skidMarks.push(mark);
-
       if (state.skidMarksList.length < MAX_SKID_MARKS) {
+        const mark = { seg, t1, x1, t2, x2, alpha };
+        seg.skidMarks.push(mark);
         state.skidMarksList.push(mark);
       } else {
-        const oldest = state.skidMarksList[skidWriteIdx];
-        if (oldest && oldest.seg) {
-          const idx = oldest.seg.skidMarks.indexOf(oldest);
-          if (idx !== -1) oldest.seg.skidMarks.splice(idx, 1);
+        // Переиспользуем старейший объект следа из кольцевого буфера без нагрузки на сборщик мусора (GC)
+        const reused = state.skidMarksList[skidWriteIdx];
+        if (reused && reused.seg) {
+          const idx = reused.seg.skidMarks.indexOf(reused);
+          if (idx !== -1) reused.seg.skidMarks.splice(idx, 1);
         }
-        state.skidMarksList[skidWriteIdx] = mark;
+        if (reused) {
+          reused.seg = seg;
+          reused.t1 = t1;
+          reused.x1 = x1;
+          reused.t2 = t2;
+          reused.x2 = x2;
+          reused.alpha = alpha;
+          reused.color = undefined;
+          seg.skidMarks.push(reused);
+        } else {
+          const fallbackMark = { seg, t1, x1, t2, x2, alpha };
+          seg.skidMarks.push(fallbackMark);
+          state.skidMarksList[skidWriteIdx] = fallbackMark;
+        }
         skidWriteIdx = (skidWriteIdx + 1) % MAX_SKID_MARKS;
       }
     }
@@ -122,7 +152,7 @@ export function recordSkidMarks(currZ, currX, alpha, fallbackBackDist = 0, sampl
     rem -= step;
   }
 
-  setPrev({ z: currZ, x: currX });
+  updatePrevSkidSample(sampleOwner, prev, currZ, currX);
 }
 
 function lastY() {
@@ -131,14 +161,21 @@ function lastY() {
     : state.segments[state.segments.length - 1].p2.world.y;
 }
 
+/**
+ * Создаёт новый сегмент дорожного полотна с предрасчитанным продольным уклоном (slope)
+ * и коэффициентами плавного скоса высоты боковых ограждений (guardrailLeftScale / guardrailRightScale).
+ */
 function addSegment(curve, y) {
   const n = state.segments.length;
+  const prevY = lastY();
   const isDark = Math.floor(n / RUMBLE_LENGTH) % 2 === 1;
   state.segments.push({
     index: n,
-    p1: { world: { x: 0, y: lastY(), z: n * SEGMENT_LENGTH }, camera: {}, screen: {} },
+    p1: { world: { x: 0, y: prevY, z: n * SEGMENT_LENGTH }, camera: {}, screen: {} },
     p2: { world: { x: 0, y: y, z: (n + 1) * SEGMENT_LENGTH }, camera: {}, screen: {} },
     curve: curve,
+    // Предрасчитанный тангенс продольного уклона для бесшовной интерполяции наклона камеры (pitch)
+    slope: (y - prevY) / SEGMENT_LENGTH,
     sprites: [],
     cars: [],
     skidMarks: [],
@@ -146,6 +183,8 @@ function addSegment(curve, y) {
     isStartFinish: false,
     guardrailLeft: false,
     guardrailRight: false,
+    guardrailLeftScale: 0,
+    guardrailRightScale: 0,
     mapX: 0.5,
     mapY: 0.5,
     mapHeading: 0,
@@ -153,6 +192,17 @@ function addSegment(curve, y) {
     projectedFrame: -1,
     color: isDark ? PALETTE_DARK : PALETTE_LIGHT
   });
+}
+
+/**
+ * Смыкает высоту последнего сегмента петли с нулевым сегментом и актуализирует его уклон (slope)
+ */
+function closeTrackElevationLoop(segments) {
+  const totalSegs = segments.length;
+  if (totalSegs === 0) return;
+  const lastSeg = segments[totalSegs - 1];
+  lastSeg.p2.world.y = segments[0].p1.world.y;
+  lastSeg.slope = (lastSeg.p2.world.y - lastSeg.p1.world.y) / SEGMENT_LENGTH;
 }
 
 function addRoad(enter, hold, leave, curve, yDelta) {
@@ -184,6 +234,80 @@ function addSprite(segIndex, type, offset) {
   state.segments[segIndex].sprites.push({ type, offset });
 }
 
+/**
+ * Склеивает короткие разрывы между соседними секциями отбойника на одной стороне дороги,
+ * чтобы ограждение не дробилось на мелкие куски внутри составного виража.
+ */
+function bridgeShortGuardrailGaps(segments, propName, maxGap) {
+  const total = segments.length;
+  for (let i = 0; i < total; i++) {
+    if (!segments[i][propName]) continue;
+    for (let gap = 1; gap <= maxGap; gap++) {
+      const nextIdx = (i + gap + 1) % total;
+      if (segments[nextIdx][propName]) {
+        for (let fill = 1; fill <= gap; fill++) {
+          segments[(i + fill) % total][propName] = true;
+        }
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Вычисляет плавный скос высоты (0.38 -> 0.72 -> 0.90 -> 1.0) на входных и выходных концах каждой
+ * непрерывной ленты отбойника и синхронизирует поперечный отступ знаков шевронов с наличием барьера.
+ */
+function computeGuardrailScalesAndSyncChevrons(segments) {
+  const total = segments.length;
+  const taperLen = GUARDRAIL_TAPER_SCALES.length;
+
+  for (let i = 0; i < total; i++) {
+    const seg = segments[i];
+
+    if (!seg.guardrailLeft) {
+      seg.guardrailLeftScale = 0;
+    } else {
+      let scaleL = 1.0;
+      for (let d = 1; d <= taperLen; d++) {
+        if (!segments[(i - d + total) % total].guardrailLeft || !segments[(i + d) % total].guardrailLeft) {
+          scaleL = GUARDRAIL_TAPER_SCALES[d - 1];
+          break;
+        }
+      }
+      seg.guardrailLeftScale = scaleL;
+    }
+
+    if (!seg.guardrailRight) {
+      seg.guardrailRightScale = 0;
+    } else {
+      let scaleR = 1.0;
+      for (let d = 1; d <= taperLen; d++) {
+        if (!segments[(i - d + total) % total].guardrailRight || !segments[(i + d) % total].guardrailRight) {
+          scaleR = GUARDRAIL_TAPER_SCALES[d - 1];
+          break;
+        }
+      }
+      seg.guardrailRightScale = scaleR;
+    }
+
+    // Синхронизируем позицию знаков опасного поворота при переключении сложности в меню без пересборки трека
+    if (seg.sprites.length > 0) {
+      for (let s = 0; s < seg.sprites.length; s++) {
+        const sp = seg.sprites[s];
+        if (sp.type === 'chevron_right' || sp.type === 'chevron_left') {
+          const signSide = sp.offset < 0 ? -1 : 1;
+          const sideHasRail = signSide < 0 ? seg.guardrailLeft : seg.guardrailRight;
+          sp.offset = signSide * (sideHasRail ? 1.38 : 1.30);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Расставляет внешние защитные отбойники на крутых виражах кольцевой трассы в режиме «Легко»
+ */
 export function applySharpTurnGuardrails(curveThreshold) {
   const segments = state.segments;
   if (!segments.length) return;
@@ -192,15 +316,20 @@ export function applySharpTurnGuardrails(curveThreshold) {
   for (let i = 0; i < total; i++) {
     segments[i].guardrailLeft = false;
     segments[i].guardrailRight = false;
+    segments[i].guardrailLeftScale = 0;
+    segments[i].guardrailRightScale = 0;
   }
 
-  if (state.gameMode !== 'circuit' || state.difficulty !== 'arcade') return;
+  if (state.gameMode !== 'circuit' || state.difficulty !== 'arcade') {
+    computeGuardrailScalesAndSyncChevrons(segments);
+    return;
+  }
 
   for (let n = 0; n < total; n++) {
     const seg = segments[n];
     if (Math.abs(seg.curve) >= curveThreshold) {
       const isRightTurn = seg.curve > 0;
-      for (let pad = -2; pad <= 2; pad++) {
+      for (let pad = -GUARDRAIL_LEAD_PAD_SEGS; pad <= GUARDRAIL_LEAD_PAD_SEGS; pad++) {
         const idx = (n + pad + total) % total;
         if (isRightTurn) {
           segments[idx].guardrailLeft = true;
@@ -210,10 +339,14 @@ export function applySharpTurnGuardrails(curveThreshold) {
       }
     }
   }
+
+  bridgeShortGuardrailGaps(segments, 'guardrailLeft', GUARDRAIL_BRIDGE_GAP_SEGS);
+  bridgeShortGuardrailGaps(segments, 'guardrailRight', GUARDRAIL_BRIDGE_GAP_SEGS);
+  computeGuardrailScalesAndSyncChevrons(segments);
 }
 
 /**
- * Классическая бесконечная шоссейная петля для режимов свободного заезда
+ * Классическая бесконечная шоссейная петля для режимов свободного заезда ('oneway' и 'oncoming')
  */
 export function buildTrack() {
   state.segments = [];
@@ -235,9 +368,7 @@ export function buildTrack() {
 
   const segments = state.segments;
   const totalSegs = segments.length;
-  if (totalSegs > 0) {
-    segments[totalSegs - 1].p2.world.y = segments[0].p1.world.y;
-  }
+  closeTrackElevationLoop(segments);
 
   state.trackLength = totalSegs * SEGMENT_LENGTH;
 
@@ -332,7 +463,7 @@ function computeClosedLoopTurnAnglesFlat(ptsX, ptsY, n, headingsOut, dThetasOut)
 }
 
 /**
- * Рандомная генерация замкнутого кольцевого трека
+ * Процедурная генерация замкнутого кольцевого трека с гладким профилем высот и кривизны
  */
 export function buildCircuitTrack() {
   state.segments = [];
@@ -440,8 +571,7 @@ export function buildCircuitTrack() {
   let maxAbsTurn = computeClosedLoopTurnAnglesFlat(loopX, loopY, numSegments, headings, dThetas);
   let smoothPasses = 0;
 
-  // Равномерное 7-точечное сглаживание [1, 3, 6, 8, 6, 3, 1]/28 сходится в 4 раза быстрее
-  // и гарантированно доводит углы контура до maxAllowedTurnRad без клиппинга и изломов у старта
+  // Равномерное 7-точечное сглаживание [1, 3, 6, 8, 6, 3, 1]/28 быстро доводит углы контура до maxAllowedTurnRad
   while (maxAbsTurn > maxAllowedTurnRad && smoothPasses < 140) {
     smoothPasses++;
     for (let i = 0; i < numSegments; i++) {
@@ -516,9 +646,7 @@ export function buildCircuitTrack() {
   }
 
   const segments = state.segments;
-  if (segments.length > 0) {
-    segments[segments.length - 1].p2.world.y = segments[0].p1.world.y;
-  }
+  closeTrackElevationLoop(segments);
 
   state.trackLength = segments.length * SEGMENT_LENGTH;
   applySharpTurnGuardrails(GAME_CONFIG.circuit.guardrailCurveThreshold);
@@ -532,10 +660,10 @@ export function buildCircuitTrack() {
     const nearStartFinish = n <= 3 || n >= segments.length - 3;
 
     if (!nearStartFinish && Math.abs(seg.curve) > 5.6 && n % 5 === 0) {
-      const hasRail = seg.guardrailLeft || seg.guardrailRight;
-      const signOffset = hasRail ? 1.38 : 1.30;
-      const outerSide = seg.curve > 0 ? -signOffset : signOffset;
-      addSprite(n, seg.curve > 0 ? 'chevron_right' : 'chevron_left', outerSide);
+      const signSide = seg.curve > 0 ? -1 : 1;
+      const sideHasRail = signSide < 0 ? seg.guardrailLeft : seg.guardrailRight;
+      const signOffset = sideHasRail ? 1.38 : 1.30;
+      addSprite(n, seg.curve > 0 ? 'chevron_right' : 'chevron_left', signSide * signOffset);
     }
 
     if (!nearStartFinish && n % 20 === 7) {

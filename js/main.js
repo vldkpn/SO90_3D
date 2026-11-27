@@ -2,7 +2,6 @@ import {
   GAME_CONFIG,
   STATE,
   LOGICAL_HEIGHT,
-  SEGMENT_LENGTH,
   PLAYER_Z,
   PLAYER_CENTER_OFFSET_Z,
   INITIAL_TRAFFIC_COUNT
@@ -45,9 +44,12 @@ loadSettings();
 const canvas = document.getElementById('gameCanvas');
 canvas.width = state.logicalWidth;
 canvas.height = LOGICAL_HEIGHT;
-const ctx = canvas.getContext('2d');
+// Отключение альфа-канала холста активирует быстрый непрозрачный композитинг на мобильных GPU (Adreno/Mali/Apple)
+const ctx = canvas.getContext('2d', { alpha: false }) || canvas.getContext('2d');
 
 const wrapper = document.getElementById('game-wrapper');
+// На сенсорных экранах отключаем полноэкранный сканлайн-слой .crt-overlay, экономя проход композитора браузера
+const crtOverlay = wrapper ? wrapper.querySelector('.crt-overlay') : null;
 const topBar = document.getElementById('top-bar');
 const startScreen = document.getElementById('start-screen');
 const settingsScreen = document.getElementById('settings-screen');
@@ -78,7 +80,7 @@ const gameoverEls = {
 };
 
 // Таблица клавиш управления движением
-const DIR_KEYS = {
+const DIR_KEYS = Object.freeze({
   ArrowUp: 'up',
   KeyW: 'up',
   ArrowDown: 'down',
@@ -87,38 +89,83 @@ const DIR_KEYS = {
   KeyA: 'left',
   ArrowRight: 'right',
   KeyD: 'right'
-};
+});
+
+const INPUT_DIRECTIONS = Object.freeze(['up', 'down', 'left', 'right']);
 
 // Раздельные буферы ввода исключают сброс зажатых клавиш клавиатуры при касании экрана или мыши
 const kbInput = { up: false, down: false, left: false, right: false };
 const pointerInput = { up: false, down: false, left: false, right: false };
 const touchInput = { up: false, down: false, left: false, right: false };
 
+// Кэш DOM-кнопок педалей/руля с отслеживанием состояния pressed (исключает лишние мутации classList)
 const touchButtonMap = [
-  { id: 'btn-left', key: 'left', el: document.getElementById('btn-left'), rect: null },
-  { id: 'btn-right', key: 'right', el: document.getElementById('btn-right'), rect: null },
-  { id: 'btn-gas', key: 'up', el: document.getElementById('btn-gas'), rect: null },
-  { id: 'btn-brake', key: 'down', el: document.getElementById('btn-brake'), rect: null }
+  { id: 'btn-left', key: 'left', el: document.getElementById('btn-left'), rect: null, pressed: false },
+  { id: 'btn-right', key: 'right', el: document.getElementById('btn-right'), rect: null, pressed: false },
+  { id: 'btn-gas', key: 'up', el: document.getElementById('btn-gas'), rect: null, pressed: false },
+  { id: 'btn-brake', key: 'down', el: document.getElementById('btn-brake'), rect: null, pressed: false }
 ];
 
 let lastTimestamp = performance.now();
+// Сглаженный шаг симуляции устраняет микрорывки движения от джиттера таймстемпов requestAnimationFrame
+let smoothedDt = 1 / 60;
 let fpsFrameCount = 0;
 let fpsSampleStart = lastTimestamp;
 // Флаг однократной отрисовки сцены на паузе (экономит CPU/GPU без потери кадра при ресайзе)
 let needsPausedRedraw = false;
+// Флаг устаревания геометрии тач-кнопок (обновляем getBoundingClientRect только после реального изменения раскладки)
+let touchRectsDirty = true;
+let resizeRafId = 0;
 
 /**
- * Кэширование экранных прямоугольников тач-педалей (предотвращает принудительный reflow на каждом touchmove)
+ * Сбрасывает таймеры кадра и фильтр dt при выходе из паузы или старте заезда,
+ * чтобы время сборки трассы не вызывало скачок первого кадра симуляции.
+ */
+function resetLoopTiming(now = performance.now()) {
+  lastTimestamp = now;
+  smoothedDt = 1 / 60;
+  fpsSampleStart = now;
+  fpsFrameCount = 0;
+}
+
+/**
+ * Помечает координаты сенсорных кнопок требующими пересчёта (при скролле/сдвиге мобильного viewport)
+ */
+function markTouchRectsDirty() {
+  touchRectsDirty = true;
+}
+
+/**
+ * Кэширование экранных прямоугольников тач-педалей (вызывается только при изменении размеров/раскладки)
  */
 function refreshTouchButtonRects() {
   for (let i = 0; i < touchButtonMap.length; i++) {
     const item = touchButtonMap[i];
     item.rect = item.el ? item.el.getBoundingClientRect() : null;
   }
+  touchRectsDirty = false;
 }
 
 /**
- * Объединяет состояние клавиатуры, мыши и мультитача в единый state.input
+ * Гарантирует актуальность прямоугольников тач-кнопок без принудительного reflow на каждом касании
+ */
+function ensureTouchButtonRects() {
+  if (touchRectsDirty) {
+    refreshTouchButtonRects();
+    return;
+  }
+  for (let i = 0; i < touchButtonMap.length; i++) {
+    const item = touchButtonMap[i];
+    if (item.el && (!item.rect || item.rect.width <= 0)) {
+      refreshTouchButtonRects();
+      return;
+    }
+  }
+}
+
+/**
+ * Объединяет состояние клавиатуры, мыши и мультитача в единый state.input.
+ * Трогает DOM-классы кнопок только при фактическом изменении состояния нажатия.
  */
 function syncCombinedInput() {
   const allowActiveInput = state.gameState === STATE.PLAYING && !state.isPaused;
@@ -127,22 +174,27 @@ function syncCombinedInput() {
     const k = item.key;
     const btnActive = allowActiveInput && (pointerInput[k] || touchInput[k]);
     state.input[k] = allowActiveInput && (kbInput[k] || btnActive);
-    if (item.el) {
+    if (item.el && item.pressed !== btnActive) {
+      item.pressed = btnActive;
       item.el.classList.toggle('pressed', btnActive);
     }
   }
 }
 
 function clearInputs() {
-  for (const k of ['up', 'down', 'left', 'right']) {
+  for (let i = 0; i < INPUT_DIRECTIONS.length; i++) {
+    const k = INPUT_DIRECTIONS[i];
     kbInput[k] = false;
     pointerInput[k] = false;
     touchInput[k] = false;
     state.input[k] = false;
   }
   for (let i = 0; i < touchButtonMap.length; i++) {
-    const btn = touchButtonMap[i].el;
-    if (btn) btn.classList.remove('pressed');
+    const item = touchButtonMap[i];
+    if (item.pressed) {
+      item.pressed = false;
+      if (item.el) item.el.classList.remove('pressed');
+    }
   }
 }
 
@@ -304,8 +356,21 @@ function updateStartSubtitle() {
   }
 }
 
+/**
+ * Пересчёт размеров игрового окна и кэша координат тач-панели
+ */
 function resizeCanvas() {
+  if (resizeRafId !== 0) {
+    cancelAnimationFrame(resizeRafId);
+    resizeRafId = 0;
+  }
+
   state.cachedIsTouch = queryTouchDevice();
+
+  // На сенсорных устройствах убираем DOM-оверлей ЭЛТ-полос поверх канваса для снижения нагрузки на композитор
+  if (crtOverlay) {
+    crtOverlay.style.display = state.cachedIsTouch ? 'none' : '';
+  }
 
   const aspect = getActiveAspectRatio();
   const targetLogicalWidth = Math.round(LOGICAL_HEIGHT * aspect);
@@ -365,6 +430,18 @@ function resizeCanvas() {
   needsPausedRedraw = true;
 }
 
+/**
+ * Коалесценция частых событий resize (например, анимация адресной строки на мобильных) до 1 раза за кадр
+ */
+function scheduleResize() {
+  touchRectsDirty = true;
+  if (resizeRafId !== 0) return;
+  resizeRafId = requestAnimationFrame(() => {
+    resizeRafId = 0;
+    resizeCanvas();
+  });
+}
+
 function pauseGame() {
   if (state.gameState !== STATE.PLAYING || state.isPaused) return;
   blurActiveElement();
@@ -382,9 +459,7 @@ function resumeGame() {
   audio.init();
   state.isPaused = false;
   needsPausedRedraw = false;
-  lastTimestamp = performance.now();
-  fpsSampleStart = lastTimestamp;
-  fpsFrameCount = 0;
+  resetLoopTiming();
   updateMobileTopBarState();
   if (pauseScreen) pauseScreen.classList.add('hidden');
 }
@@ -413,7 +488,7 @@ function startGame() {
 
     const { gridCol, backFromStartLine } = getCircuitGridSlotPose(playerGridSlot);
     state.playerX = gridCol;
-    // Позиционируем камеру с учётом смещения PLAYER_Z + PLAYER_CENTER_OFFSET_Z, чтобы сама машина игрока встала ровно в свой слот
+    // Позиционируем камеру с учётом смещения PLAYER_Z + PLAYER_CENTER_OFFSET_Z, чтобы машина игрока встала ровно в свой слот
     state.position = MathUtil.wrap(
       -backFromStartLine - (PLAYER_Z + PLAYER_CENTER_OFFSET_Z),
       state.trackLength
@@ -423,6 +498,9 @@ function startGame() {
     state.raceCountdownTimer = GAME_CONFIG.circuit.countdownSec;
     state.lastCountdownDigit = 0;
   } else {
+    if (!state.segments.length) {
+      buildTrack();
+    }
     state.position = 0;
     resetTraffic(INITIAL_TRAFFIC_COUNT);
   }
@@ -440,6 +518,9 @@ function startGame() {
     const modeLabel = state.gameMode === 'oncoming' ? t('modeTagOncoming') : t('modeTagOneway');
     showBanner(t('bannerStartHighway', { mode: modeLabel }), '#00f0ff', 1.8);
   }
+
+  // Сбрасываем эталон времени после генерации трассы и раскладки DOM, исключая скачок dt в первом кадре гонки
+  resetLoopTiming();
 }
 
 function triggerGameOver(reasonTitle = null) {
@@ -559,6 +640,7 @@ function triggerGameOver(reasonTitle = null) {
   }
 
   gameoverScreen.classList.remove('hidden');
+  resetLoopTiming();
 }
 
 function returnToMenu() {
@@ -580,6 +662,7 @@ function returnToMenu() {
   initWorldForCurrentMode();
   updateStartSubtitle();
   resizeCanvas();
+  resetLoopTiming();
 }
 
 function handleToggleMute() {
@@ -589,9 +672,11 @@ function handleToggleMute() {
 // Подключаем обработчик завершения игры для physics.js
 state.onGameOver = triggerGameOver;
 
-window.addEventListener('resize', resizeCanvas);
+window.addEventListener('resize', scheduleResize, { passive: true });
+window.addEventListener('orientationchange', scheduleResize, { passive: true });
 if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', resizeCanvas);
+  window.visualViewport.addEventListener('resize', scheduleResize, { passive: true });
+  window.visualViewport.addEventListener('scroll', markTouchRectsDirty, { passive: true });
 }
 
 // Переключатели режима трассы, сложности и графических/звуковых настроек
@@ -605,6 +690,7 @@ bindPillGroup('#track-mode-group', 'mode', (nextMode, buttons, activeBtn) => {
   clearSkidMarks();
   initWorldForCurrentMode();
   updateStartSubtitle();
+  resetLoopTiming();
 });
 
 bindPillGroup('#difficulty-group', 'diff', (nextDiff, buttons, activeBtn) => {
@@ -748,7 +834,7 @@ window.addEventListener('blur', () => {
   pauseGame();
 });
 
-// Мультитач-управление по предварительно закэшированным прямоугольникам кнопок (без getBoundingClientRect в touchmove)
+// Мультитач-управление по предварительно закэшированным прямоугольникам кнопок (0 вызовов getBoundingClientRect в процессе руления)
 function updateTouchesFromList(touchList) {
   if (state.isPaused || state.gameState !== STATE.PLAYING) {
     clearInputs();
@@ -763,9 +849,9 @@ function updateTouchesFromList(touchList) {
   const hitSlopPx = 5;
 
   for (let i = 0; i < touchList.length; i++) {
-    const t = touchList[i];
-    const tx = t.clientX;
-    const ty = t.clientY;
+    const touch = touchList[i];
+    const tx = touch.clientX;
+    const ty = touch.clientY;
 
     let bestKey = null;
     let bestDistSq = Infinity;
@@ -805,7 +891,7 @@ if (touchControls) {
       return;
     }
     audio.init();
-    refreshTouchButtonRects();
+    ensureTouchButtonRects();
     updateTouchesFromList(e.touches);
   }, { passive: false });
 
@@ -849,7 +935,8 @@ for (let i = 0; i < touchButtonMap.length; i++) {
 
 window.addEventListener('mouseup', () => {
   let changed = false;
-  for (const k of ['up', 'down', 'left', 'right']) {
+  for (let i = 0; i < INPUT_DIRECTIONS.length; i++) {
+    const k = INPUT_DIRECTIONS[i];
     if (pointerInput[k]) {
       pointerInput[k] = false;
       changed = true;
@@ -858,7 +945,9 @@ window.addEventListener('mouseup', () => {
   if (changed) syncCombinedInput();
 });
 
-// Главный игровой цикл
+/**
+ * Главный игровой цикл с подавлением джиттера интервалов requestAnimationFrame
+ */
 function gameLoop(now) {
   // На паузе не крутим холостую перерисовку 3D-сцены в 60–240 FPS (перерисовываем только при входе или ресайзе)
   if (state.gameState === STATE.PLAYING && state.isPaused) {
@@ -872,8 +961,19 @@ function gameLoop(now) {
     return;
   }
 
-  const dt = Math.min(GAME_CONFIG.screen.maxFrameDeltaSec, Math.max(0.001, (now - lastTimestamp) / 1000));
+  const maxDelta = GAME_CONFIG.screen.maxFrameDeltaSec;
+  const rawDt = (now - lastTimestamp) * 0.001;
   lastTimestamp = now;
+
+  const clampedDt = Math.min(maxDelta, Math.max(0.001, rawDt));
+  // Если отклонение кадра укладывается в обычный фазовый шум VSync (< 40%), мягко фильтруем шаг симуляции;
+  // при реальной просадке FPS или смене частоты экрана мгновенно принимаем фактический clampedDt.
+  if (Math.abs(clampedDt - smoothedDt) < smoothedDt * 0.40) {
+    smoothedDt += (clampedDt - smoothedDt) * 0.25;
+  } else {
+    smoothedDt = clampedDt;
+  }
+  const dt = smoothedDt;
 
   fpsFrameCount++;
   const fpsElapsed = now - fpsSampleStart;
@@ -898,4 +998,5 @@ initWorldForCurrentMode();
 updateStartSubtitle();
 updateMobileTopBarState();
 resizeCanvas();
+resetLoopTiming();
 requestAnimationFrame(gameLoop);

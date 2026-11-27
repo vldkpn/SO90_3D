@@ -43,26 +43,127 @@ import { recordSkidMarks } from './track.js';
 import { maintainTrafficDensity, updateTrafficOnly } from './traffic.js';
 import { t, formatPlaceText } from './i18n.js';
 
-// Смещение опор арок синхронизировано с js/renderer.js (ARCH_TOWER_OFFSET_NORM)
+// Смещение опор арок синхронизировано с модулями рендера (ARCH_TOWER_OFFSET_NORM)
 const ARCH_PILLAR_HITBOX_OFFSET = 1.28;
 
 // Константная таблица ширин хитбоксов придорожных спрайтов (без аллокаций на кадр)
-const SPRITE_HITBOX_WIDTHS = {
+const SPRITE_HITBOX_WIDTHS = Object.freeze({
   billboard: 0.24,
   chevron_left: 0.12,
   chevron_right: 0.12,
   palm: 0.08,
   lamp: 0.06
-};
+});
 
-const ARCH_HIT_TARGETS = [
-  { offset: -ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 },
-  { offset:  ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 }
-];
+const ARCH_HIT_TARGETS = Object.freeze([
+  Object.freeze({ offset: -ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 }),
+  Object.freeze({ offset:  ARCH_PILLAR_HITBOX_OFFSET, width: 0.11 })
+]);
+
+// Предрасчитанные таблицы вероятности дыма повреждений и палитры дыма шин (0 строковых аллокаций в кадре)
+const DAMAGE_SMOKE_CHANCE = Object.freeze([0, 0.14, 0.26, 0.44, 0.66, 0.85]);
+const SMOKE_ALPHA_STEPS = 32;
+const TIRE_SMOKE_LIGHT_COLORS = Object.freeze(
+  Array.from({ length: SMOKE_ALPHA_STEPS + 1 }, (_, i) => {
+    const r = i / SMOKE_ALPHA_STEPS;
+    return `rgba(238, 240, 248, ${(0.24 + r * 0.34).toFixed(2)})`;
+  })
+);
+const TIRE_SMOKE_MID_COLORS = Object.freeze(
+  Array.from({ length: SMOKE_ALPHA_STEPS + 1 }, (_, i) => {
+    const r = i / SMOKE_ALPHA_STEPS;
+    return `rgba(212, 216, 230, ${(0.20 + r * 0.28).toFixed(2)})`;
+  })
+);
+
+// Постоянные диапазоны параметров частиц и переиспользуемые кортежи (исключают создание массивов [a, b] на каждый спавн)
+const RANGE_WRECK_SMOKE_SIZE = Object.freeze([7, 16]);
+const RANGE_WRECK_SMOKE_LIFE = Object.freeze([0.6, 1.3]);
+const RANGE_WRECK_SPARK_SIZE = Object.freeze([2, 4]);
+const RANGE_WRECK_SPARK_LIFE = Object.freeze([0.2, 0.45]);
+const RANGE_DAMAGE_SMOKE_LIFE = Object.freeze([0.45, 0.95]);
+const RANGE_BACKFIRE_SIZE = Object.freeze([3, 6]);
+const RANGE_BACKFIRE_LIFE = Object.freeze([0.14, 0.28]);
+const RANGE_OFFROAD_DUST_SIZE = Object.freeze([3, 7]);
+const RANGE_OFFROAD_DUST_LIFE = Object.freeze([0.25, 0.5]);
+const RANGE_RAIL_SPARK_SIZE = Object.freeze([2, 4]);
+const RANGE_RAIL_SPARK_LIFE = Object.freeze([0.15, 0.32]);
+const RANGE_RIVAL_SPARK_SIZE = Object.freeze([2, 4.5]);
+const RANGE_RIVAL_SPARK_LIFE = Object.freeze([0.2, 0.45]);
+const RANGE_CRASH_SPARK_SIZE = Object.freeze([2, 5]);
+const RANGE_CRASH_SPARK_LIFE = Object.freeze([0.25, 0.55]);
+
+const _dynSizeRange = [0, 0];
+const _dynLifeRange = [0, 0];
+const _hitContext = { side: 'center', zone: 'front' };
+
+// Коэффициенты экспоненциального затухания (заменяют вызовы Math.pow в горячем цикле)
+const PLAYER_VX_DECAY_RATE = -Math.log(0.035);
+const GUARDRAIL_SPEED_DECAY_RATE = -6 * Math.log(0.84);
 
 const _checkedCars = new Set();
 const _visitedSegs = new Set();
 const _segIndicesToCheck = [];
+
+/**
+ * Частотно-независимый коэффициент экспоненциального сглаживания.
+ * Гарантирует одинаковую плавность камеры и руля на экранах 60/90/120 Гц и при плавающем dt на мобильных.
+ */
+function expSmoothing(rate, dt) {
+  return 1 - Math.exp(-rate * dt);
+}
+
+/**
+ * Непрерывная интерполяция кривизны дороги внутри сегмента по мировому Z.
+ * Убирает ступенчатые скачки центробежной силы, параллакса и крена камеры на стыках сегментов.
+ */
+function sampleTrackCurve(worldZ) {
+  const segments = state.segments;
+  const len = segments.length;
+  if (!len || !Number.isFinite(worldZ)) return 0;
+
+  const wrappedZ = MathUtil.wrap(worldZ, state.trackLength);
+  const exactIdx = wrappedZ / SEGMENT_LENGTH;
+  const idx0 = Math.floor(exactIdx) % len;
+  const idx1 = (idx0 + 1) % len;
+  const t = exactIdx - Math.floor(exactIdx);
+
+  return MathUtil.lerp(segments[idx0].curve, segments[idx1].curve, t);
+}
+
+/**
+ * Непрерывная интерполяция продольного уклона рельефа (slope) по мировому Z.
+ * Предотвращает вертикальное подрагивание наклона камеры (cameraPitch) на холмах при скорости > 100 км/ч.
+ */
+function sampleTrackSlope(worldZ) {
+  const segments = state.segments;
+  const len = segments.length;
+  if (!len || !Number.isFinite(worldZ)) return 0;
+
+  const wrappedZ = MathUtil.wrap(worldZ, state.trackLength);
+  const exactIdx = wrappedZ / SEGMENT_LENGTH;
+  const idx0 = Math.floor(exactIdx) % len;
+  const idx1 = (idx0 + 1) % len;
+  const t = exactIdx - Math.floor(exactIdx);
+
+  const s0 = segments[idx0];
+  const s1 = segments[idx1];
+  const slope0 = s0.slope !== undefined ? s0.slope : (s0.p2.world.y - s0.p1.world.y) / SEGMENT_LENGTH;
+  const slope1 = s1.slope !== undefined ? s1.slope : (s1.p2.world.y - s1.p1.world.y) / SEGMENT_LENGTH;
+
+  return MathUtil.lerp(slope0, slope1, t);
+}
+
+/**
+ * Добавляет уникальный индекс сегмента в список кандидатов для проверки столкновений со спрайтами
+ */
+function addCandidateSpriteSeg(idx, totalSegs) {
+  const wrapped = ((idx % totalSegs) + totalSegs) % totalSegs;
+  if (!_visitedSegs.has(wrapped)) {
+    _visitedSegs.add(wrapped);
+    _segIndicesToCheck.push(wrapped);
+  }
+}
 
 /**
  * Однопроходное обновление и уплотнение массива частиц за O(N) без splice()
@@ -104,7 +205,7 @@ function applyCollisionTimePenalty(seconds = COLLISION_TIME_PENALTY) {
 }
 
 /**
- * Синхронный продольный сдвиг позиции игрока при разрешении коллизий
+ * Синхронный продольный сдвиг позиции игрока при перемещении и разрешении коллизий
  */
 function shiftPlayerZ(delta, trackLength) {
   state.position = (((state.position + delta) % trackLength) + trackLength) % trackLength;
@@ -114,7 +215,7 @@ function shiftPlayerZ(delta, trackLength) {
   }
 }
 
-function registerCollision(damagePoints = 1, fatalReason = null, hitContext = {}) {
+function registerCollision(damagePoints = 1, fatalReason = null, hitContext = _hitContext) {
   if (state.gameMode === 'circuit') {
     return false;
   }
@@ -164,24 +265,25 @@ function registerCollision(damagePoints = 1, fatalReason = null, hitContext = {}
   }
 
   // Однократная фиксация стороны повреждения спойлера
-  const lockSpoilerSide = () => {
-    if (state.spoilerDamageSide !== 0) return;
-    if (side === 'left') {
-      state.spoilerDamageSide = -1;
-    } else if (side === 'right') {
-      state.spoilerDamageSide = 1;
-    } else if (state.leftDamage !== state.rightDamage) {
-      state.spoilerDamageSide = state.leftDamage > state.rightDamage ? -1 : 1;
-    } else {
-      state.spoilerDamageSide = Math.random() < 0.5 ? -1 : 1;
+  if (state.spoilerDamageSide === 0) {
+    const nextVisDmg = state.difficulty !== 'hardcore'
+      ? Math.min(4, Math.max(state.visualDamage, Math.ceil(state.collisionCount * 0.85)))
+      : MAX_HARDCORE_COLLISIONS - Math.max(0, state.collisionsLeft - dmg);
+    if (nextVisDmg >= 2) {
+      if (side === 'left') {
+        state.spoilerDamageSide = -1;
+      } else if (side === 'right') {
+        state.spoilerDamageSide = 1;
+      } else if (state.leftDamage !== state.rightDamage) {
+        state.spoilerDamageSide = state.leftDamage > state.rightDamage ? -1 : 1;
+      } else {
+        state.spoilerDamageSide = Math.random() < 0.5 ? -1 : 1;
+      }
     }
-  };
+  }
 
   if (state.difficulty !== 'hardcore') {
     state.visualDamage = Math.min(4, Math.max(state.visualDamage, Math.ceil(state.collisionCount * 0.85)));
-    if (state.visualDamage >= 2) {
-      lockSpoilerSide();
-    }
     if (applyCollisionTimePenalty(COLLISION_TIME_PENALTY)) return true;
     const engineWarn = state.visualDamage >= 3 ? t('bannerEngineDamagedSuffix') : '';
     showBanner(
@@ -194,9 +296,6 @@ function registerCollision(damagePoints = 1, fatalReason = null, hitContext = {}
 
   state.collisionsLeft = Math.max(0, state.collisionsLeft - dmg);
   state.visualDamage = MAX_HARDCORE_COLLISIONS - state.collisionsLeft;
-  if (state.visualDamage >= 2) {
-    lockSpoilerSide();
-  }
   if (state.collisionsLeft <= 0) {
     state.leftDamage = 3;
     state.rightDamage = 3;
@@ -233,26 +332,41 @@ export function computeCircuitRank() {
   state.playerRank = rank;
 }
 
-function updateCameraDynamics(dt, currentSeg) {
+/**
+ * Плавная кинематика 3D-камеры (FOV, наклон на рельефе, поперечное запаздывание и крен в виражах).
+ * Использует непрерывную интерполяцию рельефа/кривизны и экспоненциальный фильтр без dt-зависимых рывков.
+ */
+function updateCameraDynamics(dt) {
   const forwardRatio = MathUtil.clamp(state.speed / MAX_SPEED, 0, 1.05);
 
   const targetFov = (BASE_FOV - 4) + forwardRatio * 16;
-  state.currentFov = MathUtil.lerp(state.currentFov, targetFov, Math.min(1, dt * 5.5));
-  state.activeCameraDepth = 1 / Math.tan((state.currentFov / 2) * Math.PI / 180);
+  if (Math.abs(targetFov - state.currentFov) < 1e-4) {
+    state.currentFov = targetFov;
+  } else {
+    state.currentFov = MathUtil.lerp(state.currentFov, targetFov, expSmoothing(5.5, dt));
+  }
+  state.activeCameraDepth = 1 / Math.tan((state.currentFov * 0.5) * Math.PI / 180);
 
-  const roadSlope = currentSeg
-    ? (currentSeg.p2.world.y - currentSeg.p1.world.y) / SEGMENT_LENGTH
+  // Смешиваем уклон непосредственно под камерой и в точке машины игрока для бесшовного прохождения перегибов холмов
+  const camZ = state.position;
+  const lookZ = state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
+  const blendedSlope = state.segments.length > 0
+    ? sampleTrackSlope(camZ) * 0.45 + sampleTrackSlope(lookZ) * 0.55
     : 0;
-  const targetPitch = MathUtil.clamp(roadSlope * 185, -42, 24);
-  state.cameraPitch = MathUtil.lerp(state.cameraPitch, targetPitch, Math.min(1, dt * 6.5));
+  const targetPitch = MathUtil.clamp(blendedSlope * 185, -42, 24);
+  state.cameraPitch = MathUtil.lerp(state.cameraPitch, targetPitch, expSmoothing(6.5, dt));
 
   const targetLagX = state.gameState === STATE.PLAYING ? state.steerVisual * 0.085 : 0;
-  state.cameraLagX = MathUtil.lerp(state.cameraLagX, targetLagX, Math.min(1, dt * 8.0));
+  state.cameraLagX = MathUtil.lerp(state.cameraLagX, targetLagX, expSmoothing(8.0, dt));
 
-  const targetRoll = (state.gameState === STATE.PLAYING && currentSeg)
-    ? MathUtil.clamp(-currentSeg.curve * forwardRatio * 0.0042, -0.022, 0.022)
+  const smoothCurve = (state.gameState === STATE.PLAYING && state.segments.length > 0)
+    ? sampleTrackCurve(lookZ)
     : 0;
-  state.cameraRoll = MathUtil.lerp(state.cameraRoll, targetRoll, Math.min(1, dt * 6.0));
+  const targetRoll = MathUtil.clamp(-smoothCurve * forwardRatio * 0.0042, -0.022, 0.022);
+  state.cameraRoll = MathUtil.lerp(state.cameraRoll, targetRoll, expSmoothing(6.0, dt));
+  if (Math.abs(state.cameraRoll) < 1e-6 && Math.abs(targetRoll) < 1e-6) {
+    state.cameraRoll = 0;
+  }
 }
 
 export function updateSimulation(dt) {
@@ -261,7 +375,7 @@ export function updateSimulation(dt) {
     return;
   }
 
-  // Нормированный коэффициент частоты кадров (1.0 при 60 FPS) для независимости частиц от Гц монитора
+  // Нормированный коэффициент частоты кадров (1.0 при 60 FPS) для независимости частиц от Гц экрана
   const step60 = dt * 60;
   state.animClockMs += dt * 1000;
 
@@ -291,8 +405,8 @@ export function updateSimulation(dt) {
           Math.random() < 0.7 ? 'rgba(32, 30, 40, 0.85)' : 'rgba(95, 90, 108, 0.75)',
           70,
           115,
-          [7, 16],
-          [0.6, 1.3],
+          RANGE_WRECK_SMOKE_SIZE,
+          RANGE_WRECK_SMOKE_LIFE,
           -25,
           12
         );
@@ -305,34 +419,33 @@ export function updateSimulation(dt) {
           '#ffbe0b',
           135,
           95,
-          [2, 4],
-          [0.2, 0.45]
+          RANGE_WRECK_SPARK_SIZE,
+          RANGE_WRECK_SPARK_LIFE
         );
       }
       // Разбитая машина реально стоит на полосе, поэтому трафик реагирует на неё
       updateTrafficOnly(dt, true);
-      updateCameraDynamics(dt, findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z));
+      updateCameraDynamics(dt);
       audio.update(0, false, false, false);
       return;
     }
 
     const demoSpeedRatio = 0.26;
-    state.position = (state.position + MAX_SPEED * demoSpeedRatio * dt) % trackLength;
+    state.position = trackLength > 0 ? (state.position + MAX_SPEED * demoSpeedRatio * dt) % trackLength : 0;
     if (state.gameState === STATE.GAMEOVER) {
       // Камера плавно возвращается к центру трассы, пока машина игрока остаётся стоять на месте
-      state.playerX = MathUtil.lerp(state.playerX, 0, Math.min(1, dt * 1.4));
+      state.playerX = MathUtil.lerp(state.playerX, 0, expSmoothing(1.4, dt));
     }
-    const demoSeg = findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z);
-    if (demoSeg) {
-      // Параллакс в демо-режиме синхронизирован с dt и реальной кривизной трассы
-      const demoCurveScroll = demoSeg.curve * demoSpeedRatio * dt;
-      state.skyOffset = (state.skyOffset + demoCurveScroll * 0.08) % 2;
-      state.hillOffset = (state.hillOffset + demoCurveScroll * 0.22) % 1;
-      state.cityOffset = (state.cityOffset + demoCurveScroll * 0.44) % 1;
+    if (segments.length > 0) {
+      const demoCurve = sampleTrackCurve(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z);
+      const demoCurveScroll = demoCurve * demoSpeedRatio * dt;
+      state.skyOffset = MathUtil.wrap(state.skyOffset + demoCurveScroll * 0.08, 2);
+      state.hillOffset = MathUtil.wrap(state.hillOffset + demoCurveScroll * 0.22, 1);
+      state.cityOffset = MathUtil.wrap(state.cityOffset + demoCurveScroll * 0.44, 1);
     }
     maintainTrafficDensity();
     updateTrafficOnly(dt, false);
-    updateCameraDynamics(dt, demoSeg);
+    updateCameraDynamics(dt);
     audio.update(0, false, false, false);
     return;
   }
@@ -349,7 +462,7 @@ export function updateSimulation(dt) {
       audio.playStartBeep();
       showBanner(t('bannerRaceStart'), '#39ff14', 1.4);
     }
-    updateCameraDynamics(dt, findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z));
+    updateCameraDynamics(dt);
     audio.update(input.up ? 0.55 : 0.08, false, false, true, true);
     return;
   }
@@ -374,7 +487,9 @@ export function updateSimulation(dt) {
     }
   }
 
-  const currentSeg = findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z);
+  const playerFocusZBeforeMove = state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z;
+  const currentSeg = findSegment(playerFocusZBeforeMove);
+  const smoothCurrentCurve = sampleTrackCurve(playerFocusZBeforeMove);
   const forwardSpeedRatio = Math.max(0, state.speed) / MAX_SPEED;
   const absSpeedRatio = Math.abs(state.speed) / MAX_SPEED;
   const isOffRoad = Math.abs(state.playerX) > OFF_ROAD_THRESHOLD_X;
@@ -404,12 +519,14 @@ export function updateSimulation(dt) {
   if (state.gameMode !== 'circuit' && state.visualDamage > 0) {
     const showDamageSmoke = state.difficulty === 'hardcore' || state.visualDamage >= 3;
     if (showDamageSmoke) {
-      const smokeChance = [0, 0.14, 0.26, 0.44, 0.66, 0.85][Math.min(5, state.visualDamage)];
+      const smokeChance = DAMAGE_SMOKE_CHANCE[Math.min(5, state.visualDamage)];
       if (Math.random() < smokeChance * step60) {
         const isHeavy = state.visualDamage >= 3;
         const smokeColor = isHeavy
           ? (Math.random() < 0.68 ? 'rgba(34, 31, 44, 0.80)' : 'rgba(92, 88, 106, 0.70)')
           : 'rgba(180, 180, 196, 0.52)';
+        _dynSizeRange[0] = 4 + state.visualDamage;
+        _dynSizeRange[1] = 9 + state.visualDamage * 1.5;
         spawnParticles(
           anchors.centerX + (Math.random() - 0.5) * anchors.carW * 0.28,
           anchors.hoodY,
@@ -417,8 +534,8 @@ export function updateSimulation(dt) {
           smokeColor,
           55 + absSpeedRatio * 40,
           75 + (1 - absSpeedRatio) * 40,
-          [4 + state.visualDamage, 9 + state.visualDamage * 1.5],
-          [0.45, 0.95],
+          _dynSizeRange,
+          RANGE_DAMAGE_SMOKE_LIFE,
           -20,
           8
         );
@@ -439,7 +556,7 @@ export function updateSimulation(dt) {
         if (state.visualDamage >= 4 && input.up && !input.down && Math.random() < 0.55) {
           audio.playBackfire();
           const pipeX = Math.random() < 0.5 ? anchors.exhaustLeftX : anchors.exhaustRightX;
-          spawnParticles(pipeX, anchors.exhaustY, 3, '#ff7b00', 65, 45, [3, 6], [0.14, 0.28], 20);
+          spawnParticles(pipeX, anchors.exhaustY, 3, '#ff7b00', 65, 45, RANGE_BACKFIRE_SIZE, RANGE_BACKFIRE_LIFE, 20);
         }
       }
     }
@@ -526,10 +643,9 @@ export function updateSimulation(dt) {
   if (isOffRoad) {
     const isCornerCut =
       state.gameMode === 'circuit' &&
-      currentSeg &&
-      Math.abs(currentSeg.curve) > 3.5 &&
+      Math.abs(smoothCurrentCurve) > 3.5 &&
       Math.abs(state.playerX) > 1.48 &&
-      Math.sign(state.playerX) === Math.sign(currentSeg.curve);
+      Math.sign(state.playerX) === Math.sign(smoothCurrentCurve);
     const isDeepCornerCut = state.gameMode === 'circuit' && Math.abs(state.playerX) > 1.38;
     const activeOffRoadLimit = isCornerCut
       ? OFF_ROAD_LIMIT * 0.36
@@ -553,8 +669,8 @@ export function updateSimulation(dt) {
         '#c98a5b',
         130,
         75,
-        [3, 7],
-        [0.25, 0.5]
+        RANGE_OFFROAD_DUST_SIZE,
+        RANGE_OFFROAD_DUST_LIFE
       );
     }
   }
@@ -562,7 +678,7 @@ export function updateSimulation(dt) {
   const absoluteMaxForwardSpeed = MAX_SPEED * GAME_CONFIG.circuit.slipstreamBoostRatio;
   state.speed = MathUtil.clamp(state.speed, -MAX_REVERSE_SPEED, absoluteMaxForwardSpeed);
 
-  // Руление
+  // Руление и поперечные силы
   const prevPlayerX = state.playerX;
   let steerDir = 0;
   if (input.left) steerDir -= 1;
@@ -584,42 +700,86 @@ export function updateSimulation(dt) {
     }
   }
 
-  if (currentSeg && state.speed > 0) {
+  // Центробежный снос вычисляется по интерполированной кривизне в средней точке шага движения
+  const deltaZ = state.speed * dt;
+  const midStepCurve = segments.length > 0
+    ? sampleTrackCurve(playerFocusZBeforeMove + deltaZ * 0.5)
+    : 0;
+
+  if (state.speed > 0 && segments.length > 0) {
     let effectiveCentrifugal = CENTRIFUGAL_FORCE;
     if (state.gameMode === 'circuit') {
       effectiveCentrifugal = state.difficulty === 'hardcore' ? 0.64 : 0.54;
     }
     const steerGripResistance = steerDir === 0 ? 1.0 : 0.92;
-    state.playerX -= steerGripResistance * forwardSpeedRatio * forwardSpeedRatio * currentSeg.curve * effectiveCentrifugal * dt;
+    state.playerX -= steerGripResistance * forwardSpeedRatio * forwardSpeedRatio * midStepCurve * effectiveCentrifugal * dt;
   }
 
   if (Math.abs(state.playerVX) > 0.001) {
     state.playerX += state.playerVX * dt;
-    state.playerVX *= Math.pow(0.035, dt);
+    state.playerVX *= Math.exp(-PLAYER_VX_DECAY_RATE * dt);
     if (Math.abs(state.playerVX) < 0.01) state.playerVX = 0;
   }
 
-  // Физика защитных отбойников на крутых поворотах (односторонний удерживатель без запирания снаружи)
-  if (state.gameMode === 'circuit' && state.difficulty === 'arcade' && currentSeg) {
+  // 4. Продольное перемещение по трассе (выполняем до проверки отбойника, чтобы учитывать новый сегмент)
+  const prevNetForwardZ = state.netForwardZ;
+  const prevProgressZ = state.playerProgressZ;
+  const oldPlayerSeg = currentSeg;
+
+  shiftPlayerZ(deltaZ, trackLength);
+
+  const activeRailSeg = findSegment(state.position + PLAYER_Z + PLAYER_CENTER_OFFSET_Z) || currentSeg;
+
+  // Двусторонняя физика защитных отбойников без 1-кадрового рывка камеры на скошенных заходах
+  if (state.gameMode === 'circuit' && state.difficulty === 'arcade' && activeRailSeg) {
     const railInnerEdge = 1.15;
     const railOuterEdge = 1.21;
-    const railCenter = (railInnerEdge + railOuterEdge) * 0.5;
     const visualHalfCarW = PLAYER_WIDTH_NORM * 0.5;
+    const innerLimit = railInnerEdge - visualHalfCarW;
+    const outerLimit = railOuterEdge + visualHalfCarW * 0.7;
+    const rampCaptureLimit = railOuterEdge + visualHalfCarW * 0.45;
     const carHalfScreenW = anchors.carW * 0.50;
 
-    for (const side of [-1, 1]) {
-      const hasRail = side < 0 ? currentSeg.guardrailLeft : currentSeg.guardrailRight;
+    for (let side = -1; side <= 1; side += 2) {
+      const hasRail = side < 0 ? activeRailSeg.guardrailLeft : activeRailSeg.guardrailRight;
       if (!hasRail) continue;
 
-      const wasInside = side * prevPlayerX <= railCenter;
-      if (wasInside && side * state.playerX + visualHalfCarW > railInnerEdge) {
-        state.playerX = side * (railInnerEdge - visualHalfCarW);
-        if (side * state.playerVX > 0) {
+      const prevSideX = side * prevPlayerX;
+      const currSideX = side * state.playerX;
+      let hitRail = false;
+
+      if (prevSideX <= innerLimit + 0.02) {
+        // Штатное удержание внутри полотна без проникновения сквозь внутреннюю грань барьера
+        if (currSideX > innerLimit) {
+          state.playerX = side * innerLimit;
+          hitRail = true;
+        }
+      } else if (prevSideX <= rampCaptureLimit) {
+        // Плавный сгон со скошенного начала барьера внутрь полосы без мгновенного скачка камеры
+        const maxSlideStep = 2.4 * dt;
+        const targetSideX = Math.max(innerLimit, prevSideX - maxSlideStep);
+        if (currSideX > targetSideX) {
+          state.playerX = side * targetSideX;
+          hitRail = true;
+        }
+      } else {
+        // Игрок оказался глубоко за пределами трассы до начала барьера: держим внешнюю грань без телепортации внутрь
+        if (currSideX < outerLimit) {
+          state.playerX = side * outerLimit;
+          if (side * state.playerVX < 0) {
+            state.playerVX = side * Math.abs(state.playerVX) * 0.30;
+          }
+          hitRail = true;
+        }
+      }
+
+      if (hitRail) {
+        if (prevSideX <= rampCaptureLimit && side * state.playerVX > 0) {
           state.playerVX = -side * Math.abs(state.playerVX) * 0.35;
         }
-        state.speed *= Math.pow(0.84, dt * 6);
+        state.speed *= Math.exp(-GUARDRAIL_SPEED_DECAY_RATE * dt);
         const scrapeIntensity = MathUtil.clamp(Math.abs(state.speed) / (MAX_SPEED * 0.5), 0, 1);
-        state.impactShake = Math.max(state.impactShake, 0.22 * scrapeIntensity);
+        state.impactShake = Math.max(state.impactShake, 0.16 * scrapeIntensity);
         if (Math.abs(state.speed) > 35) {
           if (Math.random() < Math.min(1, 0.9 * step60)) {
             spawnParticles(
@@ -629,8 +789,8 @@ export function updateSimulation(dt) {
               '#ffbe0b',
               110,
               70,
-              [2, 4],
-              [0.15, 0.32]
+              RANGE_RAIL_SPARK_SIZE,
+              RANGE_RAIL_SPARK_LIFE
             );
           }
           if (state.guardrailSoundCooldown <= 0) {
@@ -646,17 +806,9 @@ export function updateSimulation(dt) {
 
   const steerVisualScale = state.speed < 0 ? 0.4 : 1.0;
   const targetSteerVisual = Math.abs(state.speed) > 15 ? steerDir * steerVisualScale : 0;
-  state.steerVisual = MathUtil.lerp(state.steerVisual, targetSteerVisual, Math.min(1, dt * 11));
+  state.steerVisual = MathUtil.lerp(state.steerVisual, targetSteerVisual, expSmoothing(11.0, dt));
 
-  // 4. Перемещение по трассе, следы торможения и дым из-под колёс
-  const deltaZ = state.speed * dt;
-  const prevNetForwardZ = state.netForwardZ;
-  const prevProgressZ = state.playerProgressZ;
-  const oldPlayerSeg = currentSeg;
-
-  shiftPlayerZ(deltaZ, trackLength);
-
-  // Привязываем следы непосредственно к пятну контакта задних шин 3D-модели
+  // Следы торможения и дым из-под задних шин 3D-модели
   const rearAxleCamZ = PLAYER_Z + PLAYER_CENTER_OFFSET_Z - PLAYER_LEN_Z * 0.38;
   const rearTireWorldZ = (((state.position + rearAxleCamZ) % trackLength) + trackLength) % trackLength;
   const isHardBrakingOnRoad = !isOffRoad && input.down && state.speed > MAX_SPEED * 0.035;
@@ -675,22 +827,19 @@ export function updateSimulation(dt) {
         1
       );
 
-      // Частотно-независимая генерация дыма (идентично 60 FPS на любых экранах)
+      // Частотно-независимая генерация дыма с предрасчитанной палитрой цветов (0 аллокаций строк и массивов)
       const exactPuffs = (0.35 + smokeRatio * 3.15) * step60;
       const basePuffs = Math.floor(exactPuffs);
       const extraPuffChance = exactPuffs - basePuffs;
 
-      const baseAlpha = (0.24 + smokeRatio * 0.34).toFixed(2);
-      const midAlpha = (0.20 + smokeRatio * 0.28).toFixed(2);
-      const smokePalette = [
-        `rgba(238, 240, 248, ${baseAlpha})`,
-        `rgba(212, 216, 230, ${midAlpha})`
-      ];
+      const paletteIdx = Math.round(smokeRatio * SMOKE_ALPHA_STEPS);
+      const lightSmokeColor = TIRE_SMOKE_LIGHT_COLORS[paletteIdx];
+      const midSmokeColor = TIRE_SMOKE_MID_COLORS[paletteIdx];
 
-      const minSize = 4 + smokeRatio * 4;
-      const maxSize = 7 + smokeRatio * 12;
-      const minLife = 0.24 + smokeRatio * 0.14;
-      const maxLife = 0.42 + smokeRatio * 0.34;
+      _dynSizeRange[0] = 4 + smokeRatio * 4;
+      _dynSizeRange[1] = 7 + smokeRatio * 12;
+      _dynLifeRange[0] = 0.24 + smokeRatio * 0.14;
+      _dynLifeRange[1] = 0.42 + smokeRatio * 0.34;
       const vxSpread = 45 + smokeRatio * 85;
       const vyBase = 32 + smokeRatio * 60;
       const expandRate = 8 + smokeRatio * 10;
@@ -702,7 +851,7 @@ export function updateSimulation(dt) {
         const wx = sideIdx === 0 ? anchors.leftWheelX : anchors.rightWheelX;
         const wy = sideIdx === 0 ? anchors.leftWheelY : anchors.rightWheelY;
         const outwardBias = sideIdx === 0 ? -18 : 18;
-        const chosenColor = smokePalette[(sideIdx + Math.floor(Math.random() * 2)) % smokePalette.length];
+        const chosenColor = ((sideIdx + (Math.random() < 0.5 ? 0 : 1)) & 1) === 0 ? lightSmokeColor : midSmokeColor;
 
         spawnParticles(
           wx + outwardBias * (0.25 + smokeRatio * 0.25),
@@ -711,8 +860,8 @@ export function updateSimulation(dt) {
           chosenColor,
           vxSpread,
           vyBase,
-          [minSize, maxSize],
-          [minLife, maxLife],
+          _dynSizeRange,
+          _dynLifeRange,
           -28,
           expandRate
         );
@@ -722,13 +871,13 @@ export function updateSimulation(dt) {
     state.prevSkidSample = null;
   }
 
-  if (currentSeg && state.speed !== 0) {
+  if (segments.length > 0 && state.speed !== 0) {
     const signedSpeedRatio = state.speed / MAX_SPEED;
-    const curveScroll = currentSeg.curve * signedSpeedRatio * dt;
+    const curveScroll = midStepCurve * signedSpeedRatio * dt;
     // Период 2 для skyOffset обеспечивает бесшовный цикл и для солнца (период 1), и для звёзд (0.5x -> период 2)
-    state.skyOffset = (state.skyOffset + curveScroll * 0.08) % 2;
-    state.hillOffset = (state.hillOffset + curveScroll * 0.22) % 1;
-    state.cityOffset = (state.cityOffset + curveScroll * 0.44) % 1;
+    state.skyOffset = MathUtil.wrap(state.skyOffset + curveScroll * 0.08, 2);
+    state.hillOffset = MathUtil.wrap(state.hillOffset + curveScroll * 0.22, 1);
+    state.cityOffset = MathUtil.wrap(state.cityOffset + curveScroll * 0.44, 1);
   }
 
   const currentKmh = Math.round((Math.abs(state.speed) / MAX_SPEED) * BASE_MAX_KMH);
@@ -825,8 +974,8 @@ export function updateSimulation(dt) {
                     '#ffbe0b',
                     190,
                     120,
-                    [2, 4.5],
-                    [0.2, 0.45]
+                    RANGE_RIVAL_SPARK_SIZE,
+                    RANGE_RIVAL_SPARK_LIFE
                   );
                 }
               }
@@ -919,16 +1068,17 @@ export function updateSimulation(dt) {
                   '#ffbe0b',
                   220,
                   140,
-                  [2, 5],
-                  [0.25, 0.55]
+                  RANGE_CRASH_SPARK_SIZE,
+                  RANGE_CRASH_SPARK_LIFE
                 );
               }
 
-              const hitContext = { side: hitSide, zone: hitZone };
+              _hitContext.side = hitSide;
+              _hitContext.zone = hitZone;
               const isOncomingCar = car.dir === -1;
               if (isOncomingCar) {
                 if (!isHeadOn) {
-                  if (registerCollision(1, t('goCarWrecked'), hitContext)) return;
+                  if (registerCollision(1, t('goCarWrecked'), _hitContext)) return;
                 } else {
                   const instantWreckKmh = GAME_CONFIG.gameplay.headOnInstantWreckKmh;
                   const oncomingDmg = impactSpeedKmh >= instantWreckKmh
@@ -937,10 +1087,10 @@ export function updateSimulation(dt) {
                   const fatalMsg = impactSpeedKmh >= instantWreckKmh
                     ? t('goHeadOnWreck', { kmh: impactSpeedKmh })
                     : t('goCarWrecked');
-                  if (registerCollision(oncomingDmg, fatalMsg, hitContext)) return;
+                  if (registerCollision(oncomingDmg, fatalMsg, _hitContext)) return;
                 }
               } else {
-                if (registerCollision(1, t('goCarWrecked'), hitContext)) return;
+                if (registerCollision(1, t('goCarWrecked'), _hitContext)) return;
               }
             }
           }
@@ -1056,30 +1206,22 @@ export function updateSimulation(dt) {
     _segIndicesToCheck.length = 0;
     _visitedSegs.clear();
 
-    const addCandidateSeg = (idx) => {
-      const wrapped = ((idx % totalSegs) + totalSegs) % totalSegs;
-      if (!_visitedSegs.has(wrapped)) {
-        _visitedSegs.add(wrapped);
-        _segIndicesToCheck.push(wrapped);
-      }
-    };
-
     if (oldPlayerSeg && netFrameDz !== 0) {
       const dirStep = netFrameDz > 0 ? 1 : -1;
       let idx = oldPlayerSeg.index;
       let safety = 0;
       while (safety < 15) {
-        addCandidateSeg(idx);
+        addCandidateSpriteSeg(idx, totalSegs);
         if (idx === newPlayerSeg.index) break;
         idx = (idx + dirStep + totalSegs) % totalSegs;
         safety++;
       }
     } else {
-      addCandidateSeg(newPlayerSeg.index);
+      addCandidateSpriteSeg(newPlayerSeg.index, totalSegs);
     }
 
-    addCandidateSeg(newPlayerSeg.index - 1);
-    addCandidateSeg(newPlayerSeg.index + 1);
+    addCandidateSpriteSeg(newPlayerSeg.index - 1, totalSegs);
+    addCandidateSpriteSeg(newPlayerSeg.index + 1, totalSegs);
 
     const spriteHalfZ = PLAYER_LEN_Z * 0.45;
     let hitResolved = false;
@@ -1100,8 +1242,8 @@ export function updateSimulation(dt) {
         let collidedWidth = 0;
 
         if (sp.type === 'start_arch' || sp.type === 'checkpoint_arch') {
-          for (let t = 0; t < ARCH_HIT_TARGETS.length; t++) {
-            const target = ARCH_HIT_TARGETS[t];
+          for (let k = 0; k < ARCH_HIT_TARGETS.length; k++) {
+            const target = ARCH_HIT_TARGETS[k];
             if (MathUtil.overlap(state.playerX, PLAYER_WIDTH_NORM, target.offset, target.width, 0.90)) {
               collidedOffset = target.offset;
               collidedWidth = target.width;
@@ -1130,7 +1272,16 @@ export function updateSimulation(dt) {
 
           const sparkCount = Math.round(14 * MathUtil.clamp(obsBounce, 0, 1));
           if (sparkCount > 0) {
-            spawnParticles(anchors.centerX, anchors.centerY, sparkCount, '#ffbe0b', 220, 140, [2, 5], [0.25, 0.55]);
+            spawnParticles(
+              anchors.centerX,
+              anchors.centerY,
+              sparkCount,
+              '#ffbe0b',
+              220,
+              140,
+              RANGE_CRASH_SPARK_SIZE,
+              RANGE_CRASH_SPARK_LIFE
+            );
           }
 
           if (state.gameMode === 'circuit') {
@@ -1151,11 +1302,9 @@ export function updateSimulation(dt) {
             const fatalReason = impactKmh >= instantObstacleKmh
               ? t('goObstacleWreck', { kmh: impactKmh })
               : t('goCarWrecked');
-            const obstacleHitContext = {
-              side: pushSign > 0 ? 'left' : 'right',
-              zone: netFrameDz < 0 ? 'rear' : 'front'
-            };
-            if (registerCollision(obstacleDmg, fatalReason, obstacleHitContext)) return;
+            _hitContext.side = pushSign > 0 ? 'left' : 'right';
+            _hitContext.zone = netFrameDz < 0 ? 'rear' : 'front';
+            if (registerCollision(obstacleDmg, fatalReason, _hitContext)) return;
           }
           break;
         }
@@ -1164,7 +1313,7 @@ export function updateSimulation(dt) {
   }
 
   // 9. Камера и звук
-  updateCameraDynamics(dt, newPlayerSeg);
+  updateCameraDynamics(dt);
   audio.update(
     Math.abs(state.speed) / MAX_SPEED,
     input.down && state.speed > MAX_SPEED * 0.035,
